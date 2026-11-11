@@ -170,7 +170,7 @@ namespace KDEConnect {
         m_renderTarget->CreateSolidColorBrush(colors.bubbleInbound, &m_brushBubbleInbound);
         m_renderTarget->CreateSolidColorBrush(colors.bubbleInboundText, &m_brushBubbleInboundText);
         m_renderTarget->CreateSolidColorBrush(colors.bubbleInboundBorder, &m_brushBubbleInboundBorder);
-        m_renderTarget->CreateSolidColorBrush(colors.bubbleOutbound, &m_brushOutbound);
+        m_renderTarget->CreateSolidColorBrush(colors.bubbleOutbound, &m_brushBubbleOutbound);
         m_renderTarget->CreateSolidColorBrush(colors.bubbleOutboundText, &m_brushBubbleOutboundText);
         m_renderTarget->CreateSolidColorBrush(colors.accent, &m_brushAccent);
     }
