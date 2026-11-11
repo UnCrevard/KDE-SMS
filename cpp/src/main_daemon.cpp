@@ -35,3 +35,9 @@ int wmain(int argc, wchar_t* argv[]) {
     CoUninitialize();
     return 0;
 }
+
+// Fallback entry point for MinGW-w64 when -municode is omitted
+int main(int /*argc*/, char* /*argv*/[]) {
+    return wmain(0, nullptr);
+}
+

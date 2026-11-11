@@ -43,7 +43,7 @@ namespace KDEConnect {
         if (idPos != std::string::npos) {
             size_t idEnd = raw.find_first_of(",}\r\n", idPos + 5);
             std::string idStr = raw.substr(idPos + 5, idEnd - (idPos + 5));
-            outPacket.id = _strtoi64(idStr.c_str(), nullptr, 10);
+            outPacket.id = std::strtoll(idStr.c_str(), nullptr, 10);
         }
 
         size_t typePos = raw.find("\"type\":");

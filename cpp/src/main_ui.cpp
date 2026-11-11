@@ -236,7 +236,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_MOUSEWHEEL: {
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-            g_threadScroll = max(0.0f, g_threadScroll - (delta / 2.0f));
+            g_threadScroll = std::max(0.0f, g_threadScroll - (delta / 2.0f));
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -369,3 +369,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR /*pC
     CoUninitialize();
     return static_cast<int>(msg.wParam);
 }
+
+// Fallback entry point for MinGW-w64 when -municode is omitted
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR /*lpCmdLine*/, int nCmdShow) {
+    return wWinMain(hInstance, hPrevInstance, GetCommandLineW(), nCmdShow);
+}
+

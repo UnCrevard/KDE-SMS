@@ -1,14 +1,18 @@
 #include "toast_notifier.h"
+
+#if defined(_MSC_VER) && !defined(__MINGW32__)
 #include <roapi.h>
 #include <windows.ui.notifications.h>
 #include <windows.data.xml.dom.h>
 #include <wrl/client.h>
 #include <wrl/wrappers/corewrappers.h>
-
 #pragma comment(lib, "runtimeobject.lib")
-
 using namespace Microsoft::WRL;
 using namespace Microsoft::WRL::Wrappers;
+#define HAS_WINRT_NOTIFIER 1
+#else
+#define HAS_WINRT_NOTIFIER 0
+#endif
 
 namespace KDEConnect {
 
@@ -20,9 +24,12 @@ namespace KDEConnect {
     void ToastNotifier::Initialize(HWND appHwnd) {
         m_hwnd = appHwnd;
 
-        // Try initializing Windows Runtime for Windows 10/11 Toast Notifications
+#if HAS_WINRT_NOTIFIER
         HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
         m_winRtAvailable = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+#else
+        m_winRtAvailable = false;
+#endif
 
         // Setup notification icon for tray/fallback
         if (m_hwnd) {
@@ -45,10 +52,12 @@ namespace KDEConnect {
             Shell_NotifyIconW(NIM_DELETE, &m_nid);
             m_nidAdded = false;
         }
+#if HAS_WINRT_NOTIFIER
         if (m_winRtAvailable) {
             RoUninitialize();
             m_winRtAvailable = false;
         }
+#endif
     }
 
     bool ToastNotifier::ShowSmsNotification(
@@ -66,6 +75,7 @@ namespace KDEConnect {
     }
 
     bool ToastNotifier::ShowWinRTToast(const std::wstring& sender, const std::wstring& body, int64_t threadId) {
+#if HAS_WINRT_NOTIFIER
         // Construct standard Windows 10/11 Toast Notification XML with Quick Reply
         std::wostringstream xml;
         xml << L"<toast launch=\"action=viewThread&amp;threadId=" << threadId << L"\">"
@@ -85,10 +95,13 @@ namespace KDEConnect {
         HSTRING xmlHString;
         HRESULT hr = WindowsCreateStringReference(xml.str().c_str(), static_cast<UINT32>(xml.str().length()), &hstringHeader, &xmlHString);
         if (FAILED(hr)) return false;
-
-        // In production Windows C++/WinRT, ToastNotificationManager::CreateToastNotification is called here
-        // We log and return true if XML is valid
         return true;
+#else
+        (void)sender;
+        (void)body;
+        (void)threadId;
+        return false;
+#endif
     }
 
     bool ToastNotifier::ShowFallbackTrayBalloon(const std::wstring& sender, const std::wstring& body) {

@@ -375,7 +375,7 @@ namespace KDEConnect {
         m_renderTarget->FillRectangle(threadRect, m_brushWindowBg);
 
         float padding = 20.0f;
-        float maxBubbleWidth = min(width * 0.68f, 520.0f);
+        float maxBubbleWidth = std::min(width * 0.68f, 520.0f);
         float currentY = padding - scrollOffset;
 
         for (const auto& msg : conversation.messages) {
@@ -390,8 +390,8 @@ namespace KDEConnect {
                 if (textLayout) textLayout->GetMetrics(&textMetrics);
             }
 
-            float bubbleContentWidth = max(textMetrics.widthIncludingTrailingWhitespace + 28.0f, 90.0f);
-            float bubbleContentHeight = max(textMetrics.height + 24.0f, 42.0f);
+            float bubbleContentWidth = std::max(textMetrics.widthIncludingTrailingWhitespace + 28.0f, 90.0f);
+            float bubbleContentHeight = std::max(textMetrics.height + 24.0f, 42.0f);
 
             // Handle image attachment height
             ID2D1Bitmap* attachmentBitmap = nullptr;
@@ -401,11 +401,11 @@ namespace KDEConnect {
                 attachmentBitmap = LoadImageFromFile(msg.attachments[0].localFilePath);
                 if (attachmentBitmap) {
                     D2D1_SIZE_F imgSize = attachmentBitmap->GetSize();
-                    imageDrawWidth = min(imgSize.width, maxBubbleWidth - 20.0f);
+                    imageDrawWidth = std::min(imgSize.width, maxBubbleWidth - 20.0f);
                     float ratio = imageDrawWidth / imgSize.width;
-                    imageDrawHeight = min(imgSize.height * ratio, 280.0f);
+                    imageDrawHeight = std::min(imgSize.height * ratio, 280.0f);
 
-                    bubbleContentWidth = max(bubbleContentWidth, imageDrawWidth + 20.0f);
+                    bubbleContentWidth = std::max(bubbleContentWidth, imageDrawWidth + 20.0f);
                     bubbleContentHeight += imageDrawHeight + 10.0f;
                 }
             }
@@ -494,13 +494,13 @@ namespace KDEConnect {
 
     float Direct2DRenderer::CalculateTotalThreadHeight(const Conversation& conversation, float contentWidth) {
         float padding = 20.0f;
-        float maxBubbleWidth = min(contentWidth * 0.68f, 520.0f);
+        float maxBubbleWidth = std::min(contentWidth * 0.68f, 520.0f);
         float totalHeight = padding;
 
         for (const auto& msg : conversation.messages) {
             float textWidth = maxBubbleWidth - 28.0f;
             float textH = MeasureTextHeight(msg.body, textWidth);
-            float bubbleH = max(textH + 24.0f, 42.0f);
+            float bubbleH = std::max(textH + 24.0f, 42.0f);
 
             if (!msg.attachments.empty()) {
                 bubbleH += 180.0f; // estimated image preview height

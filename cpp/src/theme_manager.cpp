@@ -41,10 +41,10 @@ namespace KDEConnect {
     std::wstring Message::GetFormattedTime() const {
         if (timestamp <= 0) return L"";
         time_t rawTime = static_cast<time_t>(timestamp / 1000);
-        struct tm tmInfo;
-        localtime_s(&tmInfo, &rawTime);
+        struct tm* tmInfo = std::localtime(&rawTime);
+        if (!tmInfo) return L"";
         wchar_t buffer[64];
-        wcsftime(buffer, sizeof(buffer)/sizeof(wchar_t), L"%H:%M", &tmInfo);
+        wcsftime(buffer, sizeof(buffer)/sizeof(wchar_t), L"%H:%M", tmInfo);
         return buffer;
     }
 
