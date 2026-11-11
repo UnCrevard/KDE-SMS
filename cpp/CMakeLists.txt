@@ -65,6 +65,8 @@ target_link_libraries(kdeconnect_sms_ui PRIVATE
     windowsapp
     ole32
     shell32
+    comdlg32
+    advapi32
 )
 
 set_target_properties(kdeconnect_sms_ui PROPERTIES

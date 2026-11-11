@@ -17,6 +17,8 @@
 #include <dwrite_2.h>
 #include <wincodec.h>
 #include <commctrl.h>
+#include <commdlg.h>
+#include <shellapi.h>
 #include <shlobj.h>
 #include <shlwapi.h>
 
@@ -38,6 +40,8 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 namespace KDEConnect {
 
