@@ -172,6 +172,7 @@ namespace KDEConnect {
            << "\"deviceName\":\"" << WideToUtf8(m_localIdentity.deviceName) << "\","
            << "\"deviceType\":\"desktop\","
            << "\"protocolVersion\":7,"
+           << "\"tcpPort\":" << m_port << ","
            << "\"incomingCapabilities\":[\"kdeconnect.telephony\",\"kdeconnect.sms\",\"kdeconnect.battery\"],"
            << "\"outgoingCapabilities\":[\"kdeconnect.sms.request\",\"kdeconnect.sms.request_conversations\"]"
            << "}";
@@ -226,8 +227,35 @@ namespace KDEConnect {
                         }
                     }
 
+                    // Extract custom tcpPort advertised by phone
+                    size_t pPort = pkt.bodyJson.find("\"tcpPort\":");
+                    if (pPort != std::string::npos) {
+                        size_t portEnd = pkt.bodyJson.find_first_of(",}\r\n", pPort + 10);
+                        std::string portStr = pkt.bodyJson.substr(pPort + 10, portEnd - (pPort + 10));
+                        int parsedPort = std::atoi(portStr.c_str());
+                        if (parsedPort > 0) dev.port = static_cast<uint16_t>(parsedPort);
+                    }
+
                     // Ignore self broadcasts
                     if (dev.deviceId != m_localIdentity.deviceId) {
+                        // Immediately respond directly to phone's IP so phone instantly shows our PC
+                        KDEPacket myPkt;
+                        myPkt.id = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                        myPkt.type = "kdeconnect.identity";
+                        std::ostringstream respSs;
+                        respSs << "{"
+                               << "\"deviceId\":\"" << WideToUtf8(m_localIdentity.deviceId) << "\","
+                               << "\"deviceName\":\"" << WideToUtf8(m_localIdentity.deviceName) << "\","
+                               << "\"deviceType\":\"desktop\","
+                               << "\"protocolVersion\":7,"
+                               << "\"tcpPort\":" << m_port << ","
+                               << "\"incomingCapabilities\":[\"kdeconnect.telephony\",\"kdeconnect.sms\",\"kdeconnect.battery\"],"
+                               << "\"outgoingCapabilities\":[\"kdeconnect.sms.request\",\"kdeconnect.sms.request_conversations\"]"
+                               << "}";
+                        myPkt.bodyJson = respSs.str();
+                        std::string rawResp = myPkt.Serialize();
+                        sendto(m_udpSocket, rawResp.c_str(), static_cast<int>(rawResp.length()), 0, (sockaddr*)&senderAddr, sizeof(senderAddr));
+
                         std::lock_guard<std::mutex> lock(m_devicesMutex);
                         auto it = std::find_if(m_knownDevices.begin(), m_knownDevices.end(), [&](const DeviceInfo& d) {
                             return d.deviceId == dev.deviceId;
@@ -273,6 +301,16 @@ namespace KDEConnect {
 
                 KDEPacket pkt;
                 if (KDEPacket::Deserialize(packetLine, pkt)) {
+                    if (pkt.type == "kdeconnect.pair") {
+                        // Confirm pairing handshake back to phone
+                        KDEPacket pairReply;
+                        pairReply.id = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+                        pairReply.type = "kdeconnect.pair";
+                        pairReply.bodyJson = "{\"pair\":true}";
+                        std::string rawReply = pairReply.Serialize();
+                        send(clientSocket, rawReply.c_str(), static_cast<int>(rawReply.length()), 0);
+                    }
+
                     DeviceInfo dev;
                     if (m_onPacketReceived) {
                         m_onPacketReceived(dev, pkt);
