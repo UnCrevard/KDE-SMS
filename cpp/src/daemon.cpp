@@ -1,6 +1,7 @@
 #include "daemon.h"
 #include <fstream>
 #include <iostream>
+#include <filesystem>
 
 namespace KDEConnect {
 
@@ -201,7 +202,7 @@ namespace KDEConnect {
         conv.messages.push_back(msg);
 
         // Serialize to disk (triggers ReadDirectoryChangesW for any other watching process)
-        std::ofstream file(filePath, std::ios::out | std::ios::trunc);
+        std::ofstream file(std::filesystem::path(filePath), std::ios::out | std::ios::trunc);
         if (file.is_open()) {
             file << "{\n"
                  << "  \"threadId\": " << conv.threadId << ",\n"
