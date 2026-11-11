@@ -28,7 +28,7 @@ cl.exe /nologo /O2 /W4 /utf-8 /EHsc /std:c++20 /DUNICODE /D_UNICODE /Iinclude ^
     src\theme_manager.cpp src\kdeconnect_protocol.cpp src\toast_notifier.cpp src\daemon.cpp src\main_daemon.cpp ^
     bin\obj\app.res ^
     /link /OUT:bin\KDEConnectDaemon.exe ^
-    ws2_32.lib crypt32.lib secur32.lib shlwapi.lib ole32.lib shell32.lib advapi32.lib runtimeobject.lib
+    ws2_32.lib crypt32.lib secur32.lib shlwapi.lib ole32.lib shell32.lib advapi32.lib dwmapi.lib runtimeobject.lib
 
 if %errorlevel% neq 0 (
     echo [ERROR] Failed to compile Daemon!

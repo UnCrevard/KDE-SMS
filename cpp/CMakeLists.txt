@@ -44,6 +44,10 @@ target_link_libraries(kdeconnect_daemon PRIVATE
     secur32
     shlwapi
     windowsapp
+    ole32
+    shell32
+    dwmapi
+    advapi32
 )
 
 # UI executable (Direct2D / DirectWrite native Win32 window)
