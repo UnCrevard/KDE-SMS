@@ -1,0 +1,41 @@
+#include <windows.h>
+
+#define IDI_APP_ICON      101
+#define IDR_MANIFEST      1
+
+// Manifest resource
+IDR_MANIFEST RT_MANIFEST "app.manifest"
+
+// Version info
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+FILEFLAGS       VS_FF_DEBUG
+#else
+FILEFLAGS       0x0L
+#endif
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "Open Source Community\0"
+            VALUE "FileDescription",  "KDE Connect SMS Native Win32 Client\0"
+            VALUE "FileVersion",      "1.0.0.0\0"
+            VALUE "InternalName",     "KDEConnectSMS\0"
+            VALUE "LegalCopyright",   "GPL-3.0 / Apache-2.0\0"
+            VALUE "OriginalFilename", "KDEConnectSMS.exe\0"
+            VALUE "ProductName",      "KDE Connect SMS Win32\0"
+            VALUE "ProductVersion",   "1.0.0.0\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
