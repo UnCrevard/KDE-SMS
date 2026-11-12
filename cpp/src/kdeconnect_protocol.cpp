@@ -87,9 +87,28 @@ namespace KDEConnect {
         // Generate local identity
         wchar_t computerName[MAX_COMPUTERNAME_LENGTH + 1];
         DWORD size = MAX_COMPUTERNAME_LENGTH + 1;
-        GetComputerNameW(computerName, &size);
+        if (!GetComputerNameW(computerName, &size)) {
+            wcscpy_s(computerName, L"WindowsPC");
+        }
 
-        m_localIdentity.deviceId = L"win32-kdeconnect-sms-client";
+        // Generate a standard 32-character hexadecimal deviceId derived from computer and user name
+        wchar_t userName[256];
+        DWORD userSize = 256;
+        if (!GetUserNameW(userName, &userSize)) {
+            wcscpy_s(userName, L"User");
+        }
+
+        std::string seed = WideToUtf8(computerName) + "_" + WideToUtf8(userName);
+        uint64_t h1 = 0xcbf29ce484222325ULL;
+        uint64_t h2 = 0x100000001b3ULL;
+        for (char c : seed) {
+            h1 = (h1 ^ static_cast<uint8_t>(c)) * 0x100000001b3ULL;
+            h2 = (h2 + static_cast<uint8_t>(c)) * 0xcbf29ce484222325ULL;
+        }
+        std::ostringstream hexId;
+        hexId << std::hex << std::setfill('0') << std::setw(16) << h1 << std::setw(16) << h2;
+
+        m_localIdentity.deviceId = Utf8ToWide(hexId.str());
         m_localIdentity.deviceName = computerName;
         m_localIdentity.deviceType = L"desktop";
         m_localIdentity.isPaired = true;
@@ -133,30 +152,34 @@ namespace KDEConnect {
 
         // Create UDP Discovery Socket
         m_udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        if (m_udpSocket == INVALID_SOCKET) return false;
+        if (m_udpSocket == INVALID_SOCKET) {
+            std::wcerr << L"[ERREUR UDP] Impossible de creer le socket UDP (code " << WSAGetLastError() << L")" << std::endl;
+            return false;
+        }
 
         BOOL opt = TRUE;
         setsockopt(m_udpSocket, SOL_SOCKET, SO_BROADCAST, (char*)&opt, sizeof(opt));
         setsockopt(m_udpSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
 
+        // CRITICAL WINSOCK RULE:
+        // On Windows, the receiving socket MUST be bound to INADDR_ANY (0.0.0.0).
+        // If bound to a specific IP, Windows rejects all incoming packets sent to 255.255.255.255!
         sockaddr_in bindAddr{};
         bindAddr.sin_family = AF_INET;
         bindAddr.sin_port = htons(m_port);
-
-        if (!m_bindIp.empty()) {
-            std::string ipUtf8 = WideToUtf8(m_bindIp);
-            inet_pton(AF_INET, ipUtf8.c_str(), &bindAddr.sin_addr);
-        } else {
-            bindAddr.sin_addr.s_addr = INADDR_ANY;
-        }
+        bindAddr.sin_addr.s_addr = INADDR_ANY;
 
         if (bind(m_udpSocket, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
-            bindAddr.sin_addr.s_addr = INADDR_ANY;
-            if (bind(m_udpSocket, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
-                closesocket(m_udpSocket);
-                m_udpSocket = INVALID_SOCKET;
-                return false;
+            int err = WSAGetLastError();
+            std::wcerr << L"[ERREUR UDP] Echec bind sur 0.0.0.0:" << m_port << L" (code " << err << L")" << std::endl;
+            if (err == 10048) {
+                std::wcerr << L"             -> Le port 1716 est deja utilise ! Fermez l'application KDE Connect officielle." << std::endl;
             }
+            closesocket(m_udpSocket);
+            m_udpSocket = INVALID_SOCKET;
+            return false;
+        } else {
+            std::wcout << L"[UDP Serveur] Ecoute active sur 0.0.0.0:" << m_port << L" (Reception diffusions OK)" << std::endl;
         }
 
         // Create TCP Listening Socket
@@ -166,17 +189,14 @@ namespace KDEConnect {
             sockaddr_in tcpBindAddr{};
             tcpBindAddr.sin_family = AF_INET;
             tcpBindAddr.sin_port = htons(m_port);
-            if (!m_bindIp.empty()) {
-                std::string ipUtf8 = WideToUtf8(m_bindIp);
-                inet_pton(AF_INET, ipUtf8.c_str(), &tcpBindAddr.sin_addr);
-            } else {
-                tcpBindAddr.sin_addr.s_addr = INADDR_ANY;
-            }
+            tcpBindAddr.sin_addr.s_addr = INADDR_ANY;
+
             if (bind(m_tcpListenSocket, (sockaddr*)&tcpBindAddr, sizeof(tcpBindAddr)) == SOCKET_ERROR) {
-                tcpBindAddr.sin_addr.s_addr = INADDR_ANY;
-                bind(m_tcpListenSocket, (sockaddr*)&tcpBindAddr, sizeof(tcpBindAddr));
+                std::wcerr << L"[ERREUR TCP] Echec bind sur port " << m_port << L" (code " << WSAGetLastError() << L")" << std::endl;
+            } else {
+                listen(m_tcpListenSocket, SOMAXCONN);
+                std::wcout << L"[TCP Serveur] Ecoute active sur 0.0.0.0:" << m_port << L" (Pret pour appairage et donnees)" << std::endl;
             }
-            listen(m_tcpListenSocket, SOMAXCONN);
         }
 
         // Start worker threads
@@ -228,7 +248,7 @@ namespace KDEConnect {
            << "\"deviceId\":\"" << WideToUtf8(m_localIdentity.deviceId) << "\","
            << "\"deviceName\":\"" << WideToUtf8(m_localIdentity.deviceName) << "\","
            << "\"deviceType\":\"desktop\","
-           << "\"protocolVersion\":7,"
+           << "\"protocolVersion\":8,"
            << "\"tcpPort\":" << m_port << ","
            << "\"incomingCapabilities\":[\"kdeconnect.telephony\",\"kdeconnect.sms\",\"kdeconnect.battery\"],"
            << "\"outgoingCapabilities\":[\"kdeconnect.sms.request\",\"kdeconnect.sms.request_conversations\"]"
@@ -237,34 +257,73 @@ namespace KDEConnect {
 
         std::string raw = pkt.Serialize();
 
-        // 1. Broadcast to global 255.255.255.255
-        sockaddr_in bcastAddr{};
-        bcastAddr.sin_family = AF_INET;
-        bcastAddr.sin_port = htons(m_port);
-        bcastAddr.sin_addr.s_addr = INADDR_BROADCAST;
-        sendto(m_udpSocket, raw.c_str(), static_cast<int>(raw.length()), 0, (sockaddr*)&bcastAddr, sizeof(bcastAddr));
-
-        // 2. Broadcast to directed subnet broadcast(s)
-        std::vector<std::wstring> targets;
+        // Target interfaces
+        std::vector<std::string> targetIps;
         if (!m_bindIp.empty()) {
-            targets.push_back(m_bindIp);
+            targetIps.push_back(WideToUtf8(m_bindIp));
         } else {
-            targets = GetLocalIpAddresses();
+            auto ips = GetLocalIpAddresses();
+            for (const auto& w : ips) targetIps.push_back(WideToUtf8(w));
         }
 
-        for (const auto& ip : targets) {
-            std::string ipUtf8 = WideToUtf8(ip);
+        // 1. Send via dedicated ephemeral sender sockets bound to specific interface(s)
+        for (const auto& ipUtf8 : targetIps) {
             in_addr localInAddr{};
             if (inet_pton(AF_INET, ipUtf8.c_str(), &localInAddr) == 1) {
                 uint32_t hostOrderIp = ntohl(localInAddr.s_addr);
                 uint32_t subnetBcast = (hostOrderIp & 0xFFFFFF00) | 0x000000FF;
-                sockaddr_in subnetAddr{};
-                subnetAddr.sin_family = AF_INET;
-                subnetAddr.sin_port = htons(m_port);
-                subnetAddr.sin_addr.s_addr = htonl(subnetBcast);
-                sendto(m_udpSocket, raw.c_str(), static_cast<int>(raw.length()), 0, (sockaddr*)&subnetAddr, sizeof(subnetAddr));
+
+                in_addr bcastAddrIn{};
+                bcastAddrIn.s_addr = htonl(subnetBcast);
+                char bcastIpStr[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &bcastAddrIn, bcastIpStr, sizeof(bcastIpStr));
+
+                SOCKET senderSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+                if (senderSock != INVALID_SOCKET) {
+                    BOOL opt = TRUE;
+                    setsockopt(senderSock, SOL_SOCKET, SO_BROADCAST, (char*)&opt, sizeof(opt));
+
+                    sockaddr_in ifAddr{};
+                    ifAddr.sin_family = AF_INET;
+                    ifAddr.sin_port = 0; // ephemeral port
+                    ifAddr.sin_addr = localInAddr;
+
+                    if (bind(senderSock, (sockaddr*)&ifAddr, sizeof(ifAddr)) != SOCKET_ERROR) {
+                        sockaddr_in destSubnet{};
+                        destSubnet.sin_family = AF_INET;
+                        destSubnet.sin_port = htons(m_port);
+                        destSubnet.sin_addr.s_addr = htonl(subnetBcast);
+
+                        int res = sendto(senderSock, raw.c_str(), static_cast<int>(raw.length()), 0,
+                                         (sockaddr*)&destSubnet, sizeof(destSubnet));
+                        if (res != SOCKET_ERROR) {
+                            std::wcout << L"[UDP Annonce] Envoyee sur " << Utf8ToWide(bcastIpStr) 
+                                       << L":" << m_port << L" (via " << Utf8ToWide(ipUtf8) << L") [OK]" << std::endl;
+                        } else {
+                            std::wcout << L"[UDP Annonce] Echec sur " << Utf8ToWide(bcastIpStr) 
+                                       << L" (code " << WSAGetLastError() << L")" << std::endl;
+                        }
+
+                        // Also send global broadcast from this interface
+                        sockaddr_in destGlobal{};
+                        destGlobal.sin_family = AF_INET;
+                        destGlobal.sin_port = htons(m_port);
+                        destGlobal.sin_addr.s_addr = INADDR_BROADCAST;
+                        sendto(senderSock, raw.c_str(), static_cast<int>(raw.length()), 0,
+                               (sockaddr*)&destGlobal, sizeof(destGlobal));
+                    }
+                    closesocket(senderSock);
+                }
             }
         }
+
+        // 2. Global broadcast fallback from listener socket
+        sockaddr_in globalAddr{};
+        globalAddr.sin_family = AF_INET;
+        globalAddr.sin_port = htons(m_port);
+        globalAddr.sin_addr.s_addr = INADDR_BROADCAST;
+        sendto(m_udpSocket, raw.c_str(), static_cast<int>(raw.length()), 0,
+               (sockaddr*)&globalAddr, sizeof(globalAddr));
     }
 
     void ProtocolHandler::UdpDiscoveryThread() {
@@ -274,17 +333,21 @@ namespace KDEConnect {
 
         while (m_running) {
             int received = recvfrom(m_udpSocket, buffer, sizeof(buffer) - 1, 0, (sockaddr*)&senderAddr, &senderLen);
-            if (received <= 0) break;
+            if (received <= 0) {
+                if (!m_running) break;
+                continue;
+            }
 
             buffer[received] = '\0';
             KDEPacket pkt;
             if (KDEPacket::Deserialize(buffer, pkt)) {
-                if (pkt.type == "kdeconnect.identity") {
-                    char senderIp[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &senderAddr.sin_addr, senderIp, sizeof(senderIp));
+                char senderIp[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &senderAddr.sin_addr, senderIp, sizeof(senderIp));
+                std::string ipStr(senderIp);
 
+                if (pkt.type == "kdeconnect.identity") {
                     DeviceInfo dev;
-                    dev.ipAddress = Utf8ToWide(senderIp);
+                    dev.ipAddress = Utf8ToWide(ipStr);
                     dev.port = ntohs(senderAddr.sin_port);
 
                     // Extract deviceId and deviceName from bodyJson
@@ -317,6 +380,11 @@ namespace KDEConnect {
 
                     // Ignore self broadcasts
                     if (dev.deviceId != m_localIdentity.deviceId) {
+                        std::wcout << L"\n[UDP Recu] Paquet decouvert de " << dev.ipAddress 
+                                   << L":" << ntohs(senderAddr.sin_port) 
+                                   << L" | Appareil: " << (dev.deviceName.empty() ? L"Telephone" : dev.deviceName) 
+                                   << L" (ID: " << dev.deviceId << L")" << std::endl;
+
                         // Immediately respond directly to phone's IP so phone instantly shows our PC
                         KDEPacket myPkt;
                         myPkt.id = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -326,14 +394,22 @@ namespace KDEConnect {
                                << "\"deviceId\":\"" << WideToUtf8(m_localIdentity.deviceId) << "\","
                                << "\"deviceName\":\"" << WideToUtf8(m_localIdentity.deviceName) << "\","
                                << "\"deviceType\":\"desktop\","
-                               << "\"protocolVersion\":7,"
+                               << "\"protocolVersion\":8,"
                                << "\"tcpPort\":" << m_port << ","
                                << "\"incomingCapabilities\":[\"kdeconnect.telephony\",\"kdeconnect.sms\",\"kdeconnect.battery\"],"
                                << "\"outgoingCapabilities\":[\"kdeconnect.sms.request\",\"kdeconnect.sms.request_conversations\"]"
                                << "}";
                         myPkt.bodyJson = respSs.str();
                         std::string rawResp = myPkt.Serialize();
-                        sendto(m_udpSocket, rawResp.c_str(), static_cast<int>(rawResp.length()), 0, (sockaddr*)&senderAddr, sizeof(senderAddr));
+
+                        int r1 = sendto(m_udpSocket, rawResp.c_str(), static_cast<int>(rawResp.length()), 0, (sockaddr*)&senderAddr, sizeof(senderAddr));
+                        sockaddr_in target1716 = senderAddr;
+                        target1716.sin_port = htons(m_port);
+                        int r2 = sendto(m_udpSocket, rawResp.c_str(), static_cast<int>(rawResp.length()), 0, (sockaddr*)&target1716, sizeof(target1716));
+
+                        std::wcout << L"[UDP Reponse] Identite du PC envoyee directement vers " << dev.ipAddress 
+                                   << L":" << ntohs(senderAddr.sin_port) << L" et :" << m_port 
+                                   << L" (Statut: " << (r1 != SOCKET_ERROR || r2 != SOCKET_ERROR ? L"OK" : L"Echec") << L")" << std::endl;
 
                         std::lock_guard<std::mutex> lock(m_devicesMutex);
                         auto it = std::find_if(m_knownDevices.begin(), m_knownDevices.end(), [&](const DeviceInfo& d) {
@@ -341,6 +417,8 @@ namespace KDEConnect {
                         });
                         if (it == m_knownDevices.end()) {
                             m_knownDevices.push_back(dev);
+                            std::wcout << L"[+] Nouvel appareil KDE Connect enregistre: " << dev.deviceName 
+                                       << L" (" << dev.ipAddress << L")" << std::endl;
                             if (m_onDeviceDiscovered) m_onDeviceDiscovered(dev);
                         }
                     }
@@ -354,7 +432,10 @@ namespace KDEConnect {
             sockaddr_in clientAddr{};
             int clientLen = sizeof(clientAddr);
             SOCKET clientSocket = accept(m_tcpListenSocket, (sockaddr*)&clientAddr, &clientLen);
-            if (clientSocket == INVALID_SOCKET) break;
+            if (clientSocket == INVALID_SOCKET) {
+                if (!m_running) break;
+                continue;
+            }
 
             // Handle client packet reading in detached worker
             std::thread(&ProtocolHandler::HandleClientConnection, this, clientSocket).detach();
@@ -362,6 +443,16 @@ namespace KDEConnect {
     }
 
     void ProtocolHandler::HandleClientConnection(SOCKET clientSocket) {
+        sockaddr_in clientAddr{};
+        int addrLen = sizeof(clientAddr);
+        getpeername(clientSocket, (sockaddr*)&clientAddr, &addrLen);
+        char peerIp[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &clientAddr.sin_addr, peerIp, sizeof(peerIp));
+        std::wstring peerIpW = Utf8ToWide(peerIp);
+
+        std::wcout << L"[TCP Client] Connexion entrante etablie depuis " << peerIpW 
+                   << L":" << ntohs(clientAddr.sin_port) << std::endl;
+
         std::string bufferAccumulator;
         char buffer[4096];
 
@@ -380,7 +471,11 @@ namespace KDEConnect {
 
                 KDEPacket pkt;
                 if (KDEPacket::Deserialize(packetLine, pkt)) {
+                    std::wcout << L"[TCP Paquet] Type: " << Utf8ToWide(pkt.type) 
+                               << L" recu de " << peerIpW << std::endl;
+
                     if (pkt.type == "kdeconnect.pair") {
+                        std::wcout << L"[Appairage] Demande d'appairage reçue du telephone ! Validation automatique..." << std::endl;
                         // Confirm pairing handshake back to phone
                         KDEPacket pairReply;
                         pairReply.id = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -388,9 +483,11 @@ namespace KDEConnect {
                         pairReply.bodyJson = "{\"pair\":true}";
                         std::string rawReply = pairReply.Serialize();
                         send(clientSocket, rawReply.c_str(), static_cast<int>(rawReply.length()), 0);
+                        std::wcout << L"[Appairage] Confirmation envoyee au telephone avec succes !" << std::endl;
                     }
 
                     DeviceInfo dev;
+                    dev.ipAddress = peerIpW;
                     if (m_onPacketReceived) {
                         m_onPacketReceived(dev, pkt);
                     }
