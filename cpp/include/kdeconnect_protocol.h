@@ -24,11 +24,14 @@ namespace KDEConnect {
         ProtocolHandler();
         ~ProtocolHandler();
 
-        bool Start(uint16_t port = 1716);
+        bool Start(const std::wstring& bindIp = L"", uint16_t port = 1716);
         void Stop();
 
         // Broadcast presence on UDP
         void BroadcastIdentity();
+
+        // Enumerate local IPv4 addresses
+        static std::vector<std::wstring> GetLocalIpAddresses();
 
         // Send packet to paired device over TCP
         bool SendPacket(const DeviceInfo& device, const KDEPacket& packet);
@@ -42,20 +45,24 @@ namespace KDEConnect {
         void SetOnDeviceDiscovered(DeviceDiscoveredCallback cb) { m_onDeviceDiscovered = cb; }
 
         const DeviceInfo& GetLocalIdentity() const { return m_localIdentity; }
+        const std::wstring& GetBindIp() const { return m_bindIp; }
 
     private:
         void UdpDiscoveryThread();
         void TcpServerThread();
         void HandleClientConnection(SOCKET clientSocket);
+        void PeriodicBroadcastThread();
 
         std::atomic<bool> m_running{false};
         uint16_t m_port = 1716;
+        std::wstring m_bindIp;
 
         SOCKET m_udpSocket = INVALID_SOCKET;
         SOCKET m_tcpListenSocket = INVALID_SOCKET;
 
         std::thread m_udpThread;
         std::thread m_tcpThread;
+        std::thread m_broadcastThread;
 
         DeviceInfo m_localIdentity;
         PacketCallback m_onPacketReceived;

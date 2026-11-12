@@ -18,7 +18,7 @@ namespace KDEConnect {
         Stop();
     }
 
-    bool SmsDaemon::Start() {
+    bool SmsDaemon::Start(const std::wstring& bindIp) {
         if (m_running) return true;
 
         m_running = true;
@@ -43,7 +43,7 @@ namespace KDEConnect {
             HandleIncomingKdePacket(dev, pkt);
         });
 
-        m_protocol.Start();
+        m_protocol.Start(bindIp);
 
         // Start worker threads
         m_watcherThread = std::thread(&SmsDaemon::DirectoryWatcherThread, this);

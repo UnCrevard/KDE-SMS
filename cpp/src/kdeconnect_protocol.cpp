@@ -101,7 +101,33 @@ namespace KDEConnect {
         WSACleanup();
     }
 
-    bool ProtocolHandler::Start(uint16_t port) {
+    std::vector<std::wstring> ProtocolHandler::GetLocalIpAddresses() {
+        std::vector<std::wstring> ips;
+        char hostname[256];
+        if (gethostname(hostname, sizeof(hostname)) == 0) {
+            addrinfo hints{};
+            hints.ai_family = AF_INET;
+            hints.ai_socktype = SOCK_STREAM;
+            addrinfo* res = nullptr;
+            if (getaddrinfo(hostname, nullptr, &hints, &res) == 0) {
+                for (addrinfo* ptr = res; ptr != nullptr; ptr = ptr->ai_next) {
+                    sockaddr_in* s = reinterpret_cast<sockaddr_in*>(ptr->ai_addr);
+                    char ipStr[INET_ADDRSTRLEN];
+                    if (inet_ntop(AF_INET, &s->sin_addr, ipStr, sizeof(ipStr))) {
+                        std::string str(ipStr);
+                        if (str != "127.0.0.1") {
+                            ips.push_back(Utf8ToWide(str));
+                        }
+                    }
+                }
+                freeaddrinfo(res);
+            }
+        }
+        return ips;
+    }
+
+    bool ProtocolHandler::Start(const std::wstring& bindIp, uint16_t port) {
+        m_bindIp = bindIp;
         m_port = port;
         m_running = true;
 
@@ -116,26 +142,47 @@ namespace KDEConnect {
         sockaddr_in bindAddr{};
         bindAddr.sin_family = AF_INET;
         bindAddr.sin_port = htons(m_port);
-        bindAddr.sin_addr.s_addr = INADDR_ANY;
+
+        if (!m_bindIp.empty()) {
+            std::string ipUtf8 = WideToUtf8(m_bindIp);
+            inet_pton(AF_INET, ipUtf8.c_str(), &bindAddr.sin_addr);
+        } else {
+            bindAddr.sin_addr.s_addr = INADDR_ANY;
+        }
 
         if (bind(m_udpSocket, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
-            closesocket(m_udpSocket);
-            m_udpSocket = INVALID_SOCKET;
-            return false;
+            bindAddr.sin_addr.s_addr = INADDR_ANY;
+            if (bind(m_udpSocket, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
+                closesocket(m_udpSocket);
+                m_udpSocket = INVALID_SOCKET;
+                return false;
+            }
         }
 
         // Create TCP Listening Socket
         m_tcpListenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (m_tcpListenSocket != INVALID_SOCKET) {
             setsockopt(m_tcpListenSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
-            if (bind(m_tcpListenSocket, (sockaddr*)&bindAddr, sizeof(bindAddr)) != SOCKET_ERROR) {
-                listen(m_tcpListenSocket, SOMAXCONN);
+            sockaddr_in tcpBindAddr{};
+            tcpBindAddr.sin_family = AF_INET;
+            tcpBindAddr.sin_port = htons(m_port);
+            if (!m_bindIp.empty()) {
+                std::string ipUtf8 = WideToUtf8(m_bindIp);
+                inet_pton(AF_INET, ipUtf8.c_str(), &tcpBindAddr.sin_addr);
+            } else {
+                tcpBindAddr.sin_addr.s_addr = INADDR_ANY;
             }
+            if (bind(m_tcpListenSocket, (sockaddr*)&tcpBindAddr, sizeof(tcpBindAddr)) == SOCKET_ERROR) {
+                tcpBindAddr.sin_addr.s_addr = INADDR_ANY;
+                bind(m_tcpListenSocket, (sockaddr*)&tcpBindAddr, sizeof(tcpBindAddr));
+            }
+            listen(m_tcpListenSocket, SOMAXCONN);
         }
 
         // Start worker threads
         m_udpThread = std::thread(&ProtocolHandler::UdpDiscoveryThread, this);
         m_tcpThread = std::thread(&ProtocolHandler::TcpServerThread, this);
+        m_broadcastThread = std::thread(&ProtocolHandler::PeriodicBroadcastThread, this);
 
         // Broadcast initial presence
         BroadcastIdentity();
@@ -155,8 +202,18 @@ namespace KDEConnect {
             m_tcpListenSocket = INVALID_SOCKET;
         }
 
+        if (m_broadcastThread.joinable()) m_broadcastThread.join();
         if (m_udpThread.joinable()) m_udpThread.join();
         if (m_tcpThread.joinable()) m_tcpThread.join();
+    }
+
+    void ProtocolHandler::PeriodicBroadcastThread() {
+        while (m_running) {
+            BroadcastIdentity();
+            for (int i = 0; i < 8 && m_running; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        }
     }
 
     void ProtocolHandler::BroadcastIdentity() {
@@ -180,12 +237,34 @@ namespace KDEConnect {
 
         std::string raw = pkt.Serialize();
 
+        // 1. Broadcast to global 255.255.255.255
         sockaddr_in bcastAddr{};
         bcastAddr.sin_family = AF_INET;
         bcastAddr.sin_port = htons(m_port);
         bcastAddr.sin_addr.s_addr = INADDR_BROADCAST;
-
         sendto(m_udpSocket, raw.c_str(), static_cast<int>(raw.length()), 0, (sockaddr*)&bcastAddr, sizeof(bcastAddr));
+
+        // 2. Broadcast to directed subnet broadcast(s)
+        std::vector<std::wstring> targets;
+        if (!m_bindIp.empty()) {
+            targets.push_back(m_bindIp);
+        } else {
+            targets = GetLocalIpAddresses();
+        }
+
+        for (const auto& ip : targets) {
+            std::string ipUtf8 = WideToUtf8(ip);
+            in_addr localInAddr{};
+            if (inet_pton(AF_INET, ipUtf8.c_str(), &localInAddr) == 1) {
+                uint32_t hostOrderIp = ntohl(localInAddr.s_addr);
+                uint32_t subnetBcast = (hostOrderIp & 0xFFFFFF00) | 0x000000FF;
+                sockaddr_in subnetAddr{};
+                subnetAddr.sin_family = AF_INET;
+                subnetAddr.sin_port = htons(m_port);
+                subnetAddr.sin_addr.s_addr = htonl(subnetBcast);
+                sendto(m_udpSocket, raw.c_str(), static_cast<int>(raw.length()), 0, (sockaddr*)&subnetAddr, sizeof(subnetAddr));
+            }
+        }
     }
 
     void ProtocolHandler::UdpDiscoveryThread() {

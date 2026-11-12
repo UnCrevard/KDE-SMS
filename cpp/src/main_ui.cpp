@@ -17,6 +17,9 @@ static float g_sidebarScroll = 0.0f;
 static float g_threadScroll = 0.0f;
 static std::vector<BubbleLayout> g_currentBubbleLayouts;
 
+// Network bind IP
+static std::wstring g_bindIp = L"";
+
 // Child controls
 static HWND g_hwndMain = nullptr;
 static HWND g_hwndSearchEdit = nullptr;
@@ -115,7 +118,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ToastNotifier::Instance().Initialize(hwnd);
 
             // Start background sync daemon
-            SmsDaemon::Instance().Start();
+            SmsDaemon::Instance().Start(g_bindIp);
             g_conversations = SmsDaemon::Instance().LoadAllConversations();
 
             // Create UI font
@@ -322,7 +325,29 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 }
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR /*pCmdLine*/, int nCmdShow) {
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR pCmdLine, int nCmdShow) {
+    if (pCmdLine && wcslen(pCmdLine) > 0) {
+        std::wstring cmd(pCmdLine);
+        size_t ipPos = cmd.find(L"--ip");
+        if (ipPos == std::string::npos) ipPos = cmd.find(L"--bind");
+        if (ipPos != std::string::npos) {
+            size_t space = cmd.find_first_of(L" \t", ipPos);
+            if (space != std::string::npos) {
+                size_t valStart = cmd.find_first_not_of(L" \t", space);
+                if (valStart != std::string::npos) {
+                    size_t valEnd = cmd.find_first_of(L" \t\r\n", valStart);
+                    g_bindIp = cmd.substr(valStart, valEnd - valStart);
+                }
+            }
+        } else {
+            size_t start = cmd.find_first_not_of(L" \t");
+            if (start != std::string::npos && cmd[start] != L'-') {
+                size_t end = cmd.find_first_of(L" \t\r\n", start);
+                g_bindIp = cmd.substr(start, end - start);
+            }
+        }
+    }
+
     // Initialize COM for WIC and Shell
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 

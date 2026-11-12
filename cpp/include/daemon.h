@@ -13,7 +13,7 @@ namespace KDEConnect {
     public:
         static SmsDaemon& Instance();
 
-        bool Start();
+        bool Start(const std::wstring& bindIp = L"");
         void Stop();
         bool IsRunning() const { return m_running; }
 
