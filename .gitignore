@@ -2,3 +2,5 @@
 
 !/cpp
 !.gitignore
+!Makefile
+!/build
