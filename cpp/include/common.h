@@ -138,6 +138,14 @@ namespace KDEConnect {
     std::wstring GetDefaultConversationsDirectory();
     void SetConversationsDirectory(const std::wstring& dirPath);
 
+    std::wstring GetDefaultReceivedFilesDirectory();
+    std::wstring GetReceivedFilesDirectory();
+    void SetReceivedFilesDirectory(const std::wstring& dirPath);
+
+    std::wstring GetDefaultDeviceName();
+    std::wstring GetConfiguredDeviceName();
+    void SetConfiguredDeviceName(const std::wstring& deviceName);
+
     std::wstring GetAppDataDirectory();
     std::wstring GetMessagesDirectory();
     std::wstring Utf8ToWide(const std::string& utf8);

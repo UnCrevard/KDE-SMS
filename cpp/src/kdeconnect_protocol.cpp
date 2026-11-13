@@ -295,7 +295,7 @@ namespace KDEConnect {
                       static_cast<unsigned long long>(h2));
 
         m_localIdentity.deviceId = Utf8ToWide(hexBuf);
-        m_localIdentity.deviceName = computerName;
+        m_localIdentity.deviceName = GetConfiguredDeviceName();
         m_localIdentity.deviceType = L"desktop";
         m_localIdentity.isPaired = true;
         m_localIdentity.isReachable = true;
@@ -911,7 +911,35 @@ namespace KDEConnect {
         return false;
     }
 
+    void ProtocolHandler::UpdateDeviceName(const std::wstring& deviceName) {
+        std::wstring clean = deviceName;
+        while (!clean.empty() && (clean.front() == L' ' || clean.front() == L'\t')) clean.erase(clean.begin());
+        while (!clean.empty() && (clean.back() == L' ' || clean.back() == L'\t')) clean.pop_back();
+        if (clean.empty()) {
+            clean = GetDefaultDeviceName();
+        }
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> lock(m_identityMutex);
+            if (m_localIdentity.deviceName != clean) {
+                m_localIdentity.deviceName = clean;
+                changed = true;
+            }
+        }
+        if (changed && m_running) {
+            BroadcastIdentity();
+        }
+    }
+
     std::string ProtocolHandler::BuildIdentityPacket() const {
+        std::wstring localId;
+        std::wstring localName;
+        {
+            std::lock_guard<std::mutex> lock(m_identityMutex);
+            localId = m_localIdentity.deviceId;
+            localName = m_localIdentity.deviceName;
+        }
+
         KDEPacket pkt;
         pkt.id = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::system_clock::now().time_since_epoch()).count();
@@ -919,8 +947,8 @@ namespace KDEConnect {
 
         std::ostringstream ss;
         ss << "{"
-           << "\"deviceId\":\"" << EscapeJsonString(WideToUtf8(m_localIdentity.deviceId)) << "\","
-           << "\"deviceName\":\"" << EscapeJsonString(WideToUtf8(m_localIdentity.deviceName)) << "\","
+           << "\"deviceId\":\"" << EscapeJsonString(WideToUtf8(localId)) << "\","
+           << "\"deviceName\":\"" << EscapeJsonString(WideToUtf8(localName)) << "\","
            << "\"deviceType\":\"desktop\","
            << "\"protocolVersion\":8,"
            << "\"tcpPort\":" << m_port << ","
@@ -964,7 +992,10 @@ namespace KDEConnect {
                     if (inet_ntop(AF_INET, &s->sin_addr, ipStr, sizeof(ipStr))) {
                         std::string str(ipStr);
                         if (str != "127.0.0.1") {
-                            ips.push_back(Utf8ToWide(str));
+                            std::wstring wIp = Utf8ToWide(str);
+                            if (std::find(ips.begin(), ips.end(), wIp) == ips.end()) {
+                                ips.push_back(std::move(wIp));
+                            }
                         }
                     }
                 }

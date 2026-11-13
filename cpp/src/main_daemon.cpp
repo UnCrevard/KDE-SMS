@@ -97,7 +97,9 @@ int wmain(int argc, wchar_t* argv[]) {
 
     SmsDaemon& daemon = SmsDaemon::Instance();
     std::wcout << L"[*] INI Settings: " << GetSettingsIniPath() << std::endl;
+    std::wcout << L"[*] Device name : " << GetConfiguredDeviceName() << std::endl;
     std::wcout << L"[*] Monitoring folder: " << GetMessagesDirectory() << std::endl;
+    std::wcout << L"[*] Received files   : " << GetReceivedFilesDirectory() << std::endl;
     std::wcout << L"[*] Listening on UDP 1716 (Discovery) & TCP 1716 (Data)..." << std::endl;
     std::wcout << L"[*] Periodic identity broadcast active (every 4s)..." << std::endl;
 

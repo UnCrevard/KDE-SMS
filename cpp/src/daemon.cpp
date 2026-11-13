@@ -324,6 +324,53 @@ namespace KDEConnect {
             return L"application/octet-stream";
         }
 
+        std::wstring ExtensionFromMimeWide(const std::wstring& mime) {
+            std::wstring m = mime;
+            for (auto& ch : m) ch = static_cast<wchar_t>(::towlower(ch));
+            if (m.find(L"png") != std::wstring::npos) return L".png";
+            if (m.find(L"gif") != std::wstring::npos) return L".gif";
+            if (m.find(L"webp") != std::wstring::npos) return L".webp";
+            if (m.find(L"bmp") != std::wstring::npos) return L".bmp";
+            return L".jpg";
+        }
+
+        std::vector<uint8_t> Base64DecodeBytes(const std::string& b64) {
+            static const int kLookup[256] = {
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
+                52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
+                -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
+                15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
+                -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
+                41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+                -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1
+            };
+            std::vector<uint8_t> out;
+            out.reserve((b64.size() * 3) / 4);
+            uint32_t val = 0;
+            int valb = -8;
+            for (unsigned char c : b64) {
+                if (c == '=') break;
+                int d = kLookup[c];
+                if (d == -1) continue;
+                val = (val << 6) + static_cast<uint32_t>(d);
+                valb += 6;
+                if (valb >= 0) {
+                    out.push_back(static_cast<uint8_t>((val >> valb) & 0xFF));
+                    valb -= 8;
+                }
+            }
+            return out;
+        }
+
         std::string DecodeQuotedPrintable(const std::string& raw) {
             std::string out;
             out.reserve(raw.size());
@@ -493,16 +540,20 @@ namespace KDEConnect {
 
     void SmsDaemon::ReloadStorageDirectory() {
         std::wstring newDir = GetMessagesDirectory();
+        bool dirChanged = false;
         {
             std::lock_guard<std::mutex> lock(m_storageMutex);
-            m_watchDir = newDir;
-            m_requestedThreads.clear();
-            LoadContactsCacheLocked();
-            LoadDeletedThreadsLocked();
-            LoadAllConversationsFromDiskLocked();
-            ApplyContactsToConversationsLocked();
+            dirChanged = (newDir != m_watchDir);
+            if (dirChanged) {
+                m_watchDir = newDir;
+                m_requestedThreads.clear();
+                LoadContactsCacheLocked();
+                LoadDeletedThreadsLocked();
+                LoadAllConversationsFromDiskLocked();
+                ApplyContactsToConversationsLocked();
+            }
         }
-        if (m_running) {
+        if (dirChanged && m_running) {
             if (m_dirHandle != INVALID_HANDLE_VALUE) {
                 CancelIoEx(m_dirHandle, nullptr);
                 CloseHandle(m_dirHandle);
@@ -522,7 +573,25 @@ namespace KDEConnect {
             );
             m_watcherThread = std::thread(&SmsDaemon::DirectoryWatcherThread, this);
         }
-        NotifyConversationsUpdated();
+        if (dirChanged) {
+            NotifyConversationsUpdated();
+        }
+    }
+
+    bool SmsDaemon::ApplySettingsReload(const std::wstring& newBindIp, const std::wstring& newDeviceName) {
+        GetReceivedFilesDirectory();
+        ReloadStorageDirectory();
+
+        if (m_isClientMode) {
+            return SendIpcCommand("RELOAD_CONFIG\n");
+        }
+
+        m_protocol.UpdateDeviceName(newDeviceName);
+        if (m_running && newBindIp != m_protocol.GetBindIp()) {
+            m_protocol.Stop();
+            return m_protocol.Start(newBindIp);
+        }
+        return true;
     }
 
     bool SmsDaemon::Start(const std::wstring& bindIp) {
@@ -740,9 +809,13 @@ namespace KDEConnect {
 
                     std::string response = "{\"status\":\"ok\"}\n";
 
+                    bool triggerReload = false;
                     if (cmd == "SYNC") {
                         bool ok = RequestConversationsSync();
                         response = ok ? "{\"status\":\"ok\"}\n" : "{\"status\":\"no_device\"}\n";
+                    } else if (cmd == "RELOAD_CONFIG") {
+                        triggerReload = true;
+                        response = "{\"status\":\"ok\"}\n";
                     } else if (cmd.rfind("SYNC_THREAD:", 0) == 0) {
                         int64_t tid = std::strtoll(cmd.substr(12).c_str(), nullptr, 10);
                         bool ok = RequestThreadSync(tid);
@@ -793,10 +866,23 @@ namespace KDEConnect {
 
                     DWORD bytesWritten = 0;
                     WriteFile(pipe, response.c_str(), static_cast<DWORD>(response.length()), &bytesWritten, nullptr);
+                    DisconnectNamedPipe(pipe);
+                    CloseHandle(pipe);
+                    pipe = INVALID_HANDLE_VALUE;
+
+                    if (triggerReload) {
+                        ApplySettingsReload(
+                            ReadIniString(L"Network", L"BindIp", L""),
+                            GetConfiguredDeviceName()
+                        );
+                    }
+                    continue;
                 }
                 DisconnectNamedPipe(pipe);
             }
-            CloseHandle(pipe);
+            if (pipe != INVALID_HANDLE_VALUE) {
+                CloseHandle(pipe);
+            }
         }
     }
 
@@ -854,6 +940,7 @@ namespace KDEConnect {
                 Message msg;
                 int smsType = 1;
                 bool hasAttachments = false;
+                std::string rawAttachmentsJson;
 
                 ForEachJsonObjectField(msgObj, [&](const std::string& key, const std::string& val, bool) {
                     if (key == "_id") {
@@ -887,14 +974,12 @@ namespace KDEConnect {
                     } else if (key == "attachments") {
                         if (val.size() > 2 && val.find('{') != std::string::npos) {
                             hasAttachments = true;
+                            rawAttachmentsJson = val;
                         }
                     }
                 });
 
                 msg.isOutgoing = (smsType == 2 || smsType == 4 || smsType == 5 || smsType == 6);
-                if (msg.body.empty() && hasAttachments) {
-                    msg.body = L"[Piece jointe MMS]";
-                }
                 if (msg.threadId <= 0 && !msg.address.empty()) {
                     msg.threadId = static_cast<int64_t>(std::hash<std::wstring>{}(msg.address) % 1000000) + 1;
                 }
@@ -902,7 +987,50 @@ namespace KDEConnect {
                     msg.id = msg.timestamp ^ (msg.threadId << 16);
                 }
 
-                if (msg.threadId > 0 && (!msg.body.empty() || !msg.address.empty())) {
+                if (hasAttachments && !rawAttachmentsJson.empty()) {
+                    std::wstring recvDir = GetReceivedFilesDirectory();
+                    int attIndex = 0;
+                    ForEachJsonArrayObject(rawAttachmentsJson, [&](const std::string& attObj) {
+                        std::wstring mimeType = L"image/jpeg";
+                        std::string encodedThumb;
+                        ForEachJsonObjectField(attObj, [&](const std::string& aKey, const std::string& aVal, bool) {
+                            if (aKey == "mime_type" || aKey == "mimeType") {
+                                mimeType = Utf8ToWide(UnescapeJsonString(aVal));
+                            } else if (aKey == "encoded_thumbnail" && !aVal.empty()) {
+                                encodedThumb = UnescapeJsonString(aVal);
+                            }
+                        });
+
+                        if (!encodedThumb.empty()) {
+                            std::vector<uint8_t> bytes = Base64DecodeBytes(encodedThumb);
+                            if (!bytes.empty()) {
+                                std::wstring ext = ExtensionFromMimeWide(mimeType);
+                                std::wstring fileName = L"mms_" + std::to_wstring(msg.id) + L"_" + std::to_wstring(attIndex) + ext;
+                                std::wstring destPath = recvDir + L"\\" + fileName;
+                                std::filesystem::path fsDest(destPath);
+                                if (!std::filesystem::exists(fsDest)) {
+                                    std::ofstream outFile(fsDest, std::ios::out | std::ios::binary | std::ios::trunc);
+                                    if (outFile.is_open()) {
+                                        outFile.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+                                    }
+                                }
+                                Attachment att;
+                                att.fileName = fileName;
+                                att.mimeType = mimeType;
+                                att.localFilePath = destPath;
+                                att.fileSize = bytes.size();
+                                msg.attachments.push_back(std::move(att));
+                            }
+                        }
+                        ++attIndex;
+                    });
+                }
+
+                if (msg.body.empty() && hasAttachments && msg.attachments.empty()) {
+                    msg.body = L"[Piece jointe MMS]";
+                }
+
+                if (msg.threadId > 0 && (!msg.body.empty() || !msg.address.empty() || !msg.attachments.empty())) {
                     threadsInPacket.insert(msg.threadId);
                     parsedMessages.push_back(std::move(msg));
                 }

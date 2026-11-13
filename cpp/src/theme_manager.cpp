@@ -125,6 +125,62 @@ namespace KDEConnect {
         return path;
     }
 
+    std::wstring GetDefaultReceivedFilesDirectory() {
+        return GetAppDataDirectory() + L"\\FichiersRecus";
+    }
+
+    std::wstring GetReceivedFilesDirectory() {
+        std::wstring path = ReadIniString(L"Storage", L"ReceivedFilesDir", L"");
+        if (path.empty()) {
+            path = GetDefaultReceivedFilesDirectory();
+        }
+        EnsureDirectoryExistsRecursive(path);
+        return path;
+    }
+
+    void SetReceivedFilesDirectory(const std::wstring& dirPath) {
+        std::wstring clean = dirPath;
+        while (clean.size() > 3 && (clean.back() == L'\\' || clean.back() == L'/')) {
+            clean.pop_back();
+        }
+        if (clean.empty()) {
+            clean = GetDefaultReceivedFilesDirectory();
+        }
+        EnsureDirectoryExistsRecursive(clean);
+        WriteIniString(L"Storage", L"ReceivedFilesDir", clean.c_str());
+    }
+
+    std::wstring GetDefaultDeviceName() {
+        wchar_t computerName[MAX_COMPUTERNAME_LENGTH + 1]{};
+        DWORD size = MAX_COMPUTERNAME_LENGTH + 1;
+        if (!GetComputerNameW(computerName, &size) || wcslen(computerName) == 0) {
+            return L"WindowsPC";
+        }
+        return std::wstring(computerName);
+    }
+
+    std::wstring GetConfiguredDeviceName() {
+        std::wstring configured = ReadIniString(L"Network", L"DeviceName", L"");
+        while (!configured.empty() && (configured.front() == L' ' || configured.front() == L'\t')) {
+            configured.erase(configured.begin());
+        }
+        while (!configured.empty() && (configured.back() == L' ' || configured.back() == L'\t')) {
+            configured.pop_back();
+        }
+        return configured.empty() ? GetDefaultDeviceName() : configured;
+    }
+
+    void SetConfiguredDeviceName(const std::wstring& deviceName) {
+        std::wstring clean = deviceName;
+        while (!clean.empty() && (clean.front() == L' ' || clean.front() == L'\t')) {
+            clean.erase(clean.begin());
+        }
+        while (!clean.empty() && (clean.back() == L' ' || clean.back() == L'\t')) {
+            clean.pop_back();
+        }
+        WriteIniString(L"Network", L"DeviceName", clean.c_str());
+    }
+
     std::wstring Utf8ToWide(const std::string& utf8) {
         if (utf8.empty()) return L"";
         int sizeNeeded = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(), static_cast<int>(utf8.size()), nullptr, 0);

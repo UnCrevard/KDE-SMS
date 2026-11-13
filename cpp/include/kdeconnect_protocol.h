@@ -64,6 +64,7 @@ namespace KDEConnect {
 
         const DeviceInfo& GetLocalIdentity() const { return m_localIdentity; }
         const std::wstring& GetBindIp() const { return m_bindIp; }
+        void UpdateDeviceName(const std::wstring& deviceName);
 
     private:
         struct TlsSession {
@@ -106,6 +107,7 @@ namespace KDEConnect {
         std::thread m_tcpThread;
         std::thread m_broadcastThread;
 
+        mutable std::mutex m_identityMutex;
         DeviceInfo m_localIdentity;
         PacketCallback m_onPacketReceived;
         DeviceDiscoveredCallback m_onDeviceDiscovered;

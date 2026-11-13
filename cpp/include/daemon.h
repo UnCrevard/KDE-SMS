@@ -48,9 +48,10 @@ namespace KDEConnect {
         // Protocol access
         ProtocolHandler& GetProtocol() { return m_protocol; }
 
-        // Directory watcher status
+        // Directory watcher & live settings reload
         std::wstring GetWatchDirectory() const { return m_watchDir; }
         void ReloadStorageDirectory();
+        bool ApplySettingsReload(const std::wstring& newBindIp, const std::wstring& newDeviceName);
 
     private:
         struct CachedContact {

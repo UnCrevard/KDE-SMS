@@ -35,6 +35,7 @@ static HWND g_hwndSendButton = nullptr;
 static HWND g_hwndThemeButton = nullptr;
 static HWND g_hwndSyncButton = nullptr;
 static HWND g_hwndFolderButton = nullptr;
+static HWND g_hwndSettingsButton = nullptr;
 static HWND g_hwndAttachButton = nullptr;
 static HFONT g_hFont = nullptr;
 static HBRUSH g_editBrush = nullptr;
@@ -51,15 +52,33 @@ static UINT g_msgTaskbarCreated = 0;
 #define IDC_ATTACH_BUTTON    1005
 #define IDC_SYNC_BUTTON      1006
 #define IDC_FOLDER_BUTTON    1007
+#define IDC_SETTINGS_BUTTON  1008
 #define IDC_SYNC_TIMER       1
 #define IDC_DEBOUNCE_TIMER   2
 #define IDM_DELETE_CONV      2001
 #define IDM_TRAY_SHOW        2002
 #define IDM_TRAY_EXIT        2003
+#define IDM_TRAY_SETTINGS    2004
 #define WM_APP_REFRESH_CONVS (WM_APP + 1)
 
-// Forward declaration
+// Settings modal control IDs
+#define IDC_SET_CONV_EDIT        3001
+#define IDC_SET_CONV_BROWSE      3002
+#define IDC_SET_RECV_EDIT        3003
+#define IDC_SET_RECV_BROWSE      3004
+#define IDC_SET_BIND_COMBO       3005
+#define IDC_SET_DEVNAME_EDIT     3006
+#define IDC_SET_THEME_COMBO      3007
+#define IDC_SET_SYNC_COMBO       3008
+#define IDC_SET_MINTRAY_CHK      3009
+#define IDC_SET_NOTIFY_CHK       3010
+#define IDC_SET_STARTHIDDEN_CHK  3011
+#define IDC_SET_SAVE_BTN         3012
+#define IDC_SET_CANCEL_BTN       3013
+
+// Forward declarations
 void OnSendMessage(HWND hwnd);
+void ShowSettingsDialog(HWND parent);
 
 static void SaveWindowBoundsToIni(HWND hwnd) {
     RECT rc{};
@@ -297,6 +316,337 @@ static void PromptFirstRunStorageSetup() {
     }
 
     SetConversationsDirectory(chosenDir);
+    if (ReadIniString(L"Storage", L"ReceivedFilesDir", L"").empty()) {
+        SetReceivedFilesDirectory(GetDefaultReceivedFilesDirectory());
+    }
+}
+
+static void ConfigureSyncTimer(HWND hwnd) {
+    if (!hwnd) return;
+    KillTimer(hwnd, IDC_SYNC_TIMER);
+    int intervalSec = ReadIniInt(L"App", L"AutoSyncIntervalSec", 5);
+    if (intervalSec > 0) {
+        intervalSec = std::clamp(intervalSec, 2, 3600);
+        SetTimer(hwnd, IDC_SYNC_TIMER, static_cast<UINT>(intervalSec * 1000), nullptr);
+    }
+}
+
+struct SettingsModalState {
+    HWND hwnd = nullptr;
+    HWND convEdit = nullptr;
+    HWND recvEdit = nullptr;
+    HWND bindCombo = nullptr;
+    HWND devNameEdit = nullptr;
+    HWND themeCombo = nullptr;
+    HWND syncCombo = nullptr;
+    HWND minTrayChk = nullptr;
+    HWND notifyChk = nullptr;
+    HWND startHiddenChk = nullptr;
+
+    std::vector<std::wstring> bindIpValues;
+    std::vector<int> syncSecValues;
+
+    std::wstring resConvDir;
+    std::wstring resRecvDir;
+    std::wstring resBindIp;
+    std::wstring resDeviceName;
+    ThemeMode resThemeMode = ThemeMode::System;
+    int resSyncSec = 5;
+    int resMinToTray = 1;
+    int resEnableNotifs = 1;
+    int resStartHidden = 0;
+
+    bool saved = false;
+    bool closed = false;
+};
+
+static std::wstring GetWindowTextSafe(HWND hCtrl) {
+    if (!hCtrl) return L"";
+    int len = GetWindowTextLengthW(hCtrl);
+    if (len <= 0) return L"";
+    std::wstring text(static_cast<size_t>(len) + 1, L'\0');
+    GetWindowTextW(hCtrl, &text[0], len + 1);
+    text.resize(static_cast<size_t>(len));
+    return text;
+}
+
+static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    SettingsModalState* st = reinterpret_cast<SettingsModalState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+    switch (msg) {
+        case WM_NCCREATE: {
+            CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+            return TRUE;
+        }
+
+        case WM_COMMAND: {
+            if (!st) break;
+            int id = LOWORD(wParam);
+            if (id == IDC_SET_CONV_BROWSE) {
+                std::wstring cur = GetWindowTextSafe(st->convEdit);
+                std::wstring picked;
+                if (PromptSelectStorageFolder(hwnd, L"Choisir le dossier des conversations", cur.empty() ? GetMessagesDirectory() : cur, picked)) {
+                    SetWindowTextW(st->convEdit, picked.c_str());
+                }
+                return 0;
+            } else if (id == IDC_SET_RECV_BROWSE) {
+                std::wstring cur = GetWindowTextSafe(st->recvEdit);
+                std::wstring picked;
+                if (PromptSelectStorageFolder(hwnd, L"Choisir le dossier des fichiers recus", cur.empty() ? GetReceivedFilesDirectory() : cur, picked)) {
+                    SetWindowTextW(st->recvEdit, picked.c_str());
+                }
+                return 0;
+            } else if (id == IDC_SET_SAVE_BTN || id == IDOK) {
+                st->resConvDir = GetWindowTextSafe(st->convEdit);
+                st->resRecvDir = GetWindowTextSafe(st->recvEdit);
+                st->resDeviceName = GetWindowTextSafe(st->devNameEdit);
+
+                int bindSel = static_cast<int>(SendMessageW(st->bindCombo, CB_GETCURSEL, 0, 0));
+                if (bindSel >= 0 && bindSel < static_cast<int>(st->bindIpValues.size())) {
+                    st->resBindIp = st->bindIpValues[static_cast<size_t>(bindSel)];
+                } else {
+                    st->resBindIp = L"";
+                }
+
+                int themeSel = static_cast<int>(SendMessageW(st->themeCombo, CB_GETCURSEL, 0, 0));
+                if (themeSel >= 0 && themeSel <= 2) {
+                    st->resThemeMode = static_cast<ThemeMode>(themeSel);
+                }
+
+                int syncSel = static_cast<int>(SendMessageW(st->syncCombo, CB_GETCURSEL, 0, 0));
+                if (syncSel >= 0 && syncSel < static_cast<int>(st->syncSecValues.size())) {
+                    st->resSyncSec = st->syncSecValues[static_cast<size_t>(syncSel)];
+                }
+
+                st->resMinToTray = (SendMessageW(st->minTrayChk, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+                st->resEnableNotifs = (SendMessageW(st->notifyChk, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+                st->resStartHidden = (SendMessageW(st->startHiddenChk, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+
+                st->saved = true;
+                st->closed = true;
+                DestroyWindow(hwnd);
+                return 0;
+            } else if (id == IDC_SET_CANCEL_BTN || id == IDCANCEL) {
+                st->saved = false;
+                st->closed = true;
+                DestroyWindow(hwnd);
+                return 0;
+            }
+            break;
+        }
+
+        case WM_CLOSE: {
+            if (st) {
+                st->saved = false;
+                st->closed = true;
+            }
+            DestroyWindow(hwnd);
+            return 0;
+        }
+
+        case WM_DESTROY: {
+            if (st) st->closed = true;
+            return 0;
+        }
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void ShowSettingsDialog(HWND parent) {
+    static bool classRegistered = false;
+    const wchar_t* kSettingsClass = L"KDEConnectSettingsModal";
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
+
+    if (!classRegistered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(WNDCLASSEXW);
+        wc.style = CS_HREDRAW | CS_VREDRAW;
+        wc.lpfnWndProc = SettingsWndProc;
+        wc.hInstance = hInst;
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_BTNFACE + 1);
+        wc.lpszClassName = kSettingsClass;
+        wc.hIcon = ToastNotifier::Instance().GetSmsIcon();
+        if (RegisterClassExW(&wc)) {
+            classRegistered = true;
+        }
+    }
+
+    const int clientW = 540;
+    const int clientH = 514;
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+    RECT winRc{ 0, 0, clientW, clientH };
+    AdjustWindowRectEx(&winRc, style, FALSE, 0);
+    int winW = winRc.right - winRc.left;
+    int winH = winRc.bottom - winRc.top;
+
+    int posX = (GetSystemMetrics(SM_CXSCREEN) - winW) / 2;
+    int posY = (GetSystemMetrics(SM_CYSCREEN) - winH) / 2;
+    if (parent && IsWindowVisible(parent) && !IsIconic(parent)) {
+        RECT parentRc{};
+        if (GetWindowRect(parent, &parentRc)) {
+            posX = parentRc.left + ((parentRc.right - parentRc.left) - winW) / 2;
+            posY = parentRc.top + ((parentRc.bottom - parentRc.top) - winH) / 2;
+        }
+    }
+
+    SettingsModalState state{};
+    HWND hDlg = CreateWindowExW(
+        WS_EX_DLGMODALFRAME,
+        kSettingsClass,
+        L"Reglages - KDE Connect SMS",
+        style,
+        posX, posY, winW, winH,
+        parent, nullptr, hInst, &state
+    );
+    if (!hDlg) return;
+    state.hwnd = hDlg;
+
+    auto addCtrl = [&](const wchar_t* cls, const wchar_t* text, DWORD ctrlStyle, DWORD exStyle, int x, int y, int w, int h, int id) -> HWND {
+        HWND hChild = CreateWindowExW(
+            exStyle, cls, text, WS_CHILD | WS_VISIBLE | ctrlStyle,
+            x, y, w, h, hDlg, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), hInst, nullptr
+        );
+        if (hChild && g_hFont) {
+            SendMessageW(hChild, WM_SETFONT, reinterpret_cast<WPARAM>(g_hFont), TRUE);
+        }
+        return hChild;
+    };
+
+    // Group 1: Storage folders
+    addCtrl(L"BUTTON", L"Dossiers d'enregistrement", BS_GROUPBOX, 0, 18, 12, 504, 134, 0);
+    addCtrl(L"STATIC", L"Dossier des conversations (historique SMS) :", 0, 0, 32, 34, 476, 18, 0);
+    state.convEdit = addCtrl(L"EDIT", GetMessagesDirectory().c_str(), ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 32, 54, 376, 24, IDC_SET_CONV_EDIT);
+    addCtrl(L"BUTTON", L"Parcourir...", BS_PUSHBUTTON | WS_TABSTOP, 0, 416, 53, 92, 26, IDC_SET_CONV_BROWSE);
+
+    addCtrl(L"STATIC", L"Dossier des fichiers recus (pieces jointes MMS) :", 0, 0, 32, 86, 476, 18, 0);
+    state.recvEdit = addCtrl(L"EDIT", GetReceivedFilesDirectory().c_str(), ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 32, 106, 376, 24, IDC_SET_RECV_EDIT);
+    addCtrl(L"BUTTON", L"Parcourir...", BS_PUSHBUTTON | WS_TABSTOP, 0, 416, 105, 92, 26, IDC_SET_RECV_BROWSE);
+
+    // Group 2: Network interface & device name
+    addCtrl(L"BUTTON", L"Reseau KDE Connect", BS_GROUPBOX, 0, 18, 156, 504, 126, 0);
+    addCtrl(L"STATIC", L"Interface reseau a utiliser (Bind IPv4) :", 0, 0, 32, 178, 476, 18, 0);
+    state.bindCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 32, 198, 476, 180, IDC_SET_BIND_COMBO);
+
+    state.bindIpValues.push_back(L"");
+    SendMessageW(state.bindCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Toutes les interfaces (0.0.0.0 - automatique)"));
+    std::vector<std::wstring> localIps = ProtocolHandler::GetLocalIpAddresses();
+    int selectedBindIdx = 0;
+    for (const auto& ip : localIps) {
+        state.bindIpValues.push_back(ip);
+        SendMessageW(state.bindCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(ip.c_str()));
+        if (!g_bindIp.empty() && ip == g_bindIp) {
+            selectedBindIdx = static_cast<int>(state.bindIpValues.size()) - 1;
+        }
+    }
+    if (!g_bindIp.empty() && selectedBindIdx == 0) {
+        state.bindIpValues.push_back(g_bindIp);
+        std::wstring customLabel = g_bindIp + L" (configuree)";
+        SendMessageW(state.bindCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(customLabel.c_str()));
+        selectedBindIdx = static_cast<int>(state.bindIpValues.size()) - 1;
+    }
+    SendMessageW(state.bindCombo, CB_SETCURSEL, static_cast<WPARAM>(selectedBindIdx), 0);
+
+    addCtrl(L"STATIC", L"Nom de cet ordinateur sur KDE Connect :", 0, 0, 32, 228, 476, 18, 0);
+    state.devNameEdit = addCtrl(L"EDIT", GetConfiguredDeviceName().c_str(), ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 32, 248, 476, 24, IDC_SET_DEVNAME_EDIT);
+
+    // Group 3: Application preferences
+    addCtrl(L"BUTTON", L"Reglages de l'application", BS_GROUPBOX, 0, 18, 292, 504, 166, 0);
+
+    addCtrl(L"STATIC", L"Theme de l'interface :", 0, 0, 32, 316, 170, 20, 0);
+    state.themeCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 210, 313, 298, 140, IDC_SET_THEME_COMBO);
+    SendMessageW(state.themeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Systeme (suivre Windows)"));
+    SendMessageW(state.themeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Clair"));
+    SendMessageW(state.themeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Sombre"));
+    SendMessageW(state.themeCombo, CB_SETCURSEL, static_cast<WPARAM>(ThemeManager::Instance().GetMode()), 0);
+
+    addCtrl(L"STATIC", L"Synchronisation auto :", 0, 0, 32, 346, 170, 20, 0);
+    state.syncCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 210, 343, 298, 160, IDC_SET_SYNC_COMBO);
+    const std::pair<int, const wchar_t*> syncOptions[] = {
+        { 3, L"Toutes les 3 secondes" },
+        { 5, L"Toutes les 5 secondes (par defaut)" },
+        { 10, L"Toutes les 10 secondes" },
+        { 30, L"Toutes les 30 secondes" },
+        { 60, L"Toutes les 60 secondes" },
+        { 0, L"Manuelle uniquement (desactivee)" }
+    };
+    int curSyncSec = ReadIniInt(L"App", L"AutoSyncIntervalSec", 5);
+    int syncSelIdx = 1;
+    for (size_t i = 0; i < sizeof(syncOptions) / sizeof(syncOptions[0]); ++i) {
+        state.syncSecValues.push_back(syncOptions[i].first);
+        SendMessageW(state.syncCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(syncOptions[i].second));
+        if (syncOptions[i].first == curSyncSec) {
+            syncSelIdx = static_cast<int>(i);
+        }
+    }
+    SendMessageW(state.syncCombo, CB_SETCURSEL, static_cast<WPARAM>(syncSelIdx), 0);
+
+    state.minTrayChk = addCtrl(L"BUTTON", L"Reduire dans la zone de notification lors de la fermeture", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 378, 476, 22, IDC_SET_MINTRAY_CHK);
+    SendMessageW(state.minTrayChk, BM_SETCHECK, ReadIniInt(L"App", L"MinimizeToTrayOnClose", 1) != 0 ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    state.notifyChk = addCtrl(L"BUTTON", L"Activer les notifications bureau pour les nouveaux SMS", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 404, 476, 22, IDC_SET_NOTIFY_CHK);
+    SendMessageW(state.notifyChk, BM_SETCHECK, ReadIniInt(L"App", L"EnableNotifications", 1) != 0 ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    state.startHiddenChk = addCtrl(L"BUTTON", L"Demarrer l'application reduite dans la zone de notification", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 430, 476, 22, IDC_SET_STARTHIDDEN_CHK);
+    SendMessageW(state.startHiddenChk, BM_SETCHECK, ReadIniInt(L"App", L"StartHidden", 0) != 0 ? BST_CHECKED : BST_UNCHECKED, 0);
+
+    // Bottom status & actions
+    addCtrl(L"STATIC", L"Fichier INI : KDEConnectSMS.ini", 0, 0, 18, 475, 290, 20, 0);
+    addCtrl(L"BUTTON", L"Enregistrer", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 316, 469, 100, 30, IDC_SET_SAVE_BTN);
+    addCtrl(L"BUTTON", L"Annuler", BS_PUSHBUTTON | WS_TABSTOP, 0, 422, 469, 100, 30, IDC_SET_CANCEL_BTN);
+
+    if (parent) EnableWindow(parent, FALSE);
+    ShowWindow(hDlg, SW_SHOW);
+    UpdateWindow(hDlg);
+    SetForegroundWindow(hDlg);
+
+    MSG modalMsg{};
+    while (!state.closed && GetMessageW(&modalMsg, nullptr, 0, 0) > 0) {
+        if (modalMsg.message == WM_KEYDOWN && modalMsg.wParam == VK_ESCAPE) {
+            SendMessageW(hDlg, WM_CLOSE, 0, 0);
+            continue;
+        }
+        if (!IsDialogMessageW(hDlg, &modalMsg)) {
+            TranslateMessage(&modalMsg);
+            DispatchMessageW(&modalMsg);
+        }
+    }
+    if (modalMsg.message == WM_QUIT) {
+        PostQuitMessage(static_cast<int>(modalMsg.wParam));
+    }
+
+    if (parent) {
+        EnableWindow(parent, TRUE);
+        if (IsWindowVisible(parent)) {
+            SetForegroundWindow(parent);
+        }
+    }
+
+    if (state.saved) {
+        SetConversationsDirectory(state.resConvDir);
+        SetReceivedFilesDirectory(state.resRecvDir);
+
+        g_bindIp = state.resBindIp;
+        WriteIniString(L"Network", L"BindIp", g_bindIp.c_str());
+        SetConfiguredDeviceName(state.resDeviceName);
+
+        WriteIniInt(L"App", L"AutoSyncIntervalSec", state.resSyncSec);
+        WriteIniInt(L"App", L"MinimizeToTrayOnClose", state.resMinToTray);
+        WriteIniInt(L"App", L"EnableNotifications", state.resEnableNotifs);
+        WriteIniInt(L"App", L"StartHidden", state.resStartHidden);
+
+        ThemeManager::Instance().SetMode(state.resThemeMode);
+        if (parent) {
+            ConfigureSyncTimer(parent);
+        }
+
+        SmsDaemon::Instance().ApplySettingsReload(g_bindIp, state.resDeviceName);
+        if (parent) {
+            ReloadConversations(parent, true, true);
+            InvalidateRect(parent, nullptr, FALSE);
+        }
+    }
 }
 
 void LayoutChildControls(HWND hwnd) {
@@ -328,6 +678,10 @@ void LayoutChildControls(HWND hwnd) {
     if (g_hwndSendButton) {
         int sendX = width - 88;
         SetWindowPos(g_hwndSendButton, nullptr, sendX, composerY + 9, 72, 36, SWP_NOZORDER);
+    }
+
+    if (g_hwndSettingsButton) {
+        SetWindowPos(g_hwndSettingsButton, nullptr, width - 164, 11, 34, 32, SWP_NOZORDER);
     }
 
     if (g_hwndFolderButton) {
@@ -461,6 +815,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 790, 500, 72, 36, hwnd, (HMENU)IDC_SEND_BUTTON, GetModuleHandle(nullptr), nullptr
             );
 
+            g_hwndSettingsButton = CreateWindowExW(
+                0, L"BUTTON", L"⚙",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                730, 11, 34, 32, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SETTINGS_BUTTON)), GetModuleHandle(nullptr), nullptr
+            );
+
             g_hwndFolderButton = CreateWindowExW(
                 0, L"BUTTON", L"📁",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
@@ -488,6 +848,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessageW(g_hwndSearchEdit, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndComposerEdit, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndSendButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+            SendMessageW(g_hwndSettingsButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndFolderButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndSyncButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndThemeButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
@@ -496,8 +857,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             LayoutChildControls(hwnd);
             ReloadConversations(hwnd, true, true);
 
-            // Periodic sync check every 5s when no conversations are loaded yet
-            SetTimer(hwnd, IDC_SYNC_TIMER, 5000, nullptr);
+            // Configure periodic sync check from INI
+            ConfigureSyncTimer(hwnd);
             return 0;
         }
 
@@ -517,8 +878,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 KillTimer(hwnd, IDC_DEBOUNCE_TIMER);
                 ReloadConversations(hwnd, true);
             } else if (wParam == IDC_SYNC_TIMER) {
+                SmsDaemon::Instance().RequestConversationsSync();
                 if (g_allConversations.empty()) {
-                    SmsDaemon::Instance().RequestConversationsSync();
                     std::wstring status = SmsDaemon::Instance().GetConnectionStatusText();
                     if (status != g_lastEmptyStatus) {
                         g_lastEmptyStatus = status;
@@ -779,6 +1140,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case IDC_SEND_BUTTON:
                     OnSendMessage(hwnd);
                     break;
+                case IDC_SETTINGS_BUTTON:
+                    ShowSettingsDialog(hwnd);
+                    break;
                 case IDC_FOLDER_BUTTON: {
                     std::wstring curDir = GetMessagesDirectory();
                     std::wstring picked;
@@ -846,7 +1210,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_CLOSE: {
             SaveWindowBoundsToIni(hwnd);
-            if (!g_forceExit) {
+            if (!g_forceExit && ReadIniInt(L"App", L"MinimizeToTrayOnClose", 1) != 0) {
                 ShowWindow(hwnd, SW_HIDE);
                 return 0;
             }
@@ -865,6 +1229,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (hMenu) {
                     bool visible = (IsWindowVisible(hwnd) != FALSE && !IsIconic(hwnd));
                     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_SHOW, visible ? L"Masquer la fenetre" : L"Ouvrir KDE Connect SMS");
+                    AppendMenuW(hMenu, MF_STRING, IDM_TRAY_SETTINGS, L"Reglages...");
                     AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
                     AppendMenuW(hMenu, MF_STRING, IDM_TRAY_EXIT, L"Quitter");
                     SetMenuDefaultItem(hMenu, IDM_TRAY_SHOW, FALSE);
@@ -884,6 +1249,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         } else {
                             RestoreFromTray(hwnd);
                         }
+                    } else if (cmd == IDM_TRAY_SETTINGS) {
+                        ShowSettingsDialog(hwnd);
                     } else if (cmd == IDM_TRAY_EXIT) {
                         g_forceExit = true;
                         DestroyWindow(hwnd);
@@ -990,7 +1357,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR pCmd
 
     if (!hwnd) return 1;
 
-    ShowWindow(hwnd, nCmdShow);
+    int initialShow = (ReadIniInt(L"App", L"StartHidden", 0) != 0) ? SW_HIDE : nCmdShow;
+    ShowWindow(hwnd, initialShow);
     UpdateWindow(hwnd);
 
     // Standard Win32 Message Loop

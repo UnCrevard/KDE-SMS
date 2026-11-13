@@ -195,6 +195,9 @@ namespace KDEConnect {
         int64_t threadId,
         const std::wstring& /*avatarPath*/
     ) {
+        if (ReadIniInt(L"App", L"EnableNotifications", 1) == 0) {
+            return false;
+        }
         if (m_winRtAvailable) {
             if (ShowWinRTToast(senderName, messageBody, threadId)) {
                 return true;
