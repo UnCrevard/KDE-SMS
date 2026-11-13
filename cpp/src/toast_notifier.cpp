@@ -14,7 +14,124 @@ using namespace Microsoft::WRL::Wrappers;
 #define HAS_WINRT_NOTIFIER 0
 #endif
 
+#include <cmath>
+#include <vector>
+
 namespace KDEConnect {
+
+    namespace {
+
+        // Signed distance to a rounded box centered at (cx, cy) with half-extents (hx, hy) and radius r
+        float SdfRoundedBox(float px, float py, float cx, float cy, float hx, float hy, float r) {
+            float dx = std::fabs(px - cx) - (hx - r);
+            float dy = std::fabs(py - cy) - (hy - r);
+            float ox = std::max(dx, 0.0f);
+            float oy = std::max(dy, 0.0f);
+            return std::sqrt(ox * ox + oy * oy) + std::min(std::max(dx, dy), 0.0f) - r;
+        }
+
+        // Exact signed distance to a triangle (p0, p1, p2)
+        float SdfTriangle(float px, float py, float x0, float y0, float x1, float y1, float x2, float y2) {
+            auto edgeDist = [&](float ax, float ay, float bx, float by) -> std::pair<float, float> {
+                float ex = bx - ax, ey = by - ay;
+                float wx = px - ax, wy = py - ay;
+                float ee = ex * ex + ey * ey;
+                float t = (ee > 0.0f) ? std::clamp((wx * ex + wy * ey) / ee, 0.0f, 1.0f) : 0.0f;
+                float dx = wx - ex * t;
+                float dy = wy - ey * t;
+                float s = (ex * wy - ey * wx);
+                return { dx * dx + dy * dy, s };
+            };
+            // Determine winding sign
+            float wind = ((x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0)) >= 0.0f ? 1.0f : -1.0f;
+            auto [d0, s0] = edgeDist(x0, y0, x1, y1);
+            auto [d1, s1] = edgeDist(x1, y1, x2, y2);
+            auto [d2, s2] = edgeDist(x2, y2, x0, y0);
+            float minD2 = std::min({ d0, d1, d2 });
+            float minS = std::min({ s0 * wind, s1 * wind, s2 * wind });
+            return (minS > 0.0f) ? -std::sqrt(minD2) : std::sqrt(minD2);
+        }
+
+        HICON CreateSmsTrayIcon() {
+            const int W = 32;
+            const int H = 32;
+
+            BITMAPINFO bmi{};
+            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth = W;
+            bmi.bmiHeader.biHeight = -H; // top-down DIB
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+
+            void* pvBits = nullptr;
+            HDC hdcScreen = GetDC(nullptr);
+            HBITMAP hColorBmp = CreateDIBSection(hdcScreen, &bmi, DIB_RGB_COLORS, &pvBits, nullptr, 0);
+            ReleaseDC(nullptr, hdcScreen);
+            if (!hColorBmp || !pvBits) {
+                if (hColorBmp) DeleteObject(hColorBmp);
+                return nullptr;
+            }
+
+            uint32_t* pixels = static_cast<uint32_t*>(pvBits);
+
+            for (int y = 0; y < H; ++y) {
+                for (int x = 0; x < W; ++x) {
+                    float px = static_cast<float>(x) + 0.5f;
+                    float py = static_cast<float>(y) + 0.5f;
+
+                    // Speech bubble body + bottom-left tail
+                    float dBox = SdfRoundedBox(px, py, 16.0f, 13.5f, 13.5f, 10.5f, 5.5f);
+                    float dTail = SdfTriangle(px, py, 7.0f, 22.0f, 5.0f, 29.0f, 14.5f, 23.0f);
+                    float dBubble = std::min(dBox, dTail);
+
+                    float bubbleAlpha = std::clamp(0.5f - dBubble, 0.0f, 1.0f);
+                    if (bubbleAlpha <= 0.001f) {
+                        pixels[y * W + x] = 0;
+                        continue;
+                    }
+
+                    // Gradient blue fill (#3B82F6 top -> #1D4ED8 bottom)
+                    float gradT = std::clamp((py - 3.0f) / 24.0f, 0.0f, 1.0f);
+                    float bR = 59.0f * (1.0f - gradT) + 29.0f * gradT;
+                    float bG = 130.0f * (1.0f - gradT) + 78.0f * gradT;
+                    float bB = 246.0f * (1.0f - gradT) + 216.0f * gradT;
+
+                    // Three crisp white message dots inside bubble
+                    float dDot1 = std::hypot(px - 10.0f, py - 13.5f) - 2.3f;
+                    float dDot2 = std::hypot(px - 16.0f, py - 13.5f) - 2.3f;
+                    float dDot3 = std::hypot(px - 22.0f, py - 13.5f) - 2.3f;
+                    float dDots = std::min({ dDot1, dDot2, dDot3 });
+                    float dotAlpha = std::clamp(0.5f - dDots, 0.0f, 1.0f);
+
+                    float outR = bR * (1.0f - dotAlpha) + 255.0f * dotAlpha;
+                    float outG = bG * (1.0f - dotAlpha) + 255.0f * dotAlpha;
+                    float outB = bB * (1.0f - dotAlpha) + 255.0f * dotAlpha;
+
+                    // Premultiplied BGRA
+                    uint32_t a = static_cast<uint32_t>(std::round(bubbleAlpha * 255.0f));
+                    uint32_t r = static_cast<uint32_t>(std::round(outR * bubbleAlpha));
+                    uint32_t g = static_cast<uint32_t>(std::round(outG * bubbleAlpha));
+                    uint32_t b = static_cast<uint32_t>(std::round(outB * bubbleAlpha));
+                    pixels[y * W + x] = (a << 24) | (r << 16) | (g << 8) | b;
+                }
+            }
+
+            std::vector<BYTE> maskBits(static_cast<size_t>((W / 8) * H), 0);
+            HBITMAP hMaskBmp = CreateBitmap(W, H, 1, 1, maskBits.data());
+
+            ICONINFO ii{};
+            ii.fIcon = TRUE;
+            ii.hbmMask = hMaskBmp;
+            ii.hbmColor = hColorBmp;
+            HICON hIcon = CreateIconIndirect(&ii);
+
+            if (hMaskBmp) DeleteObject(hMaskBmp);
+            DeleteObject(hColorBmp);
+            return hIcon;
+        }
+
+    } // namespace
 
     ToastNotifier& ToastNotifier::Instance() {
         static ToastNotifier instance;
@@ -31,18 +148,26 @@ namespace KDEConnect {
         m_winRtAvailable = false;
 #endif
 
-        // Setup notification icon for tray/fallback
-        if (m_hwnd) {
-            ZeroMemory(&m_nid, sizeof(m_nid));
-            m_nid.cbSize = sizeof(NOTIFYICONDATAW);
-            m_nid.hWnd = m_hwnd;
-            m_nid.uID = 1001;
-            m_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_INFO;
-            m_nid.uCallbackMessage = WM_USER + 101;
-            m_nid.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-            wcscpy_s(m_nid.szTip, L"KDE Connect SMS Client");
+        if (!m_smsIcon) {
+            m_smsIcon = CreateSmsTrayIcon();
+        }
 
-            Shell_NotifyIconW(NIM_ADD, &m_nid);
+        EnsureTrayIcon();
+    }
+
+    void ToastNotifier::EnsureTrayIcon() {
+        if (!m_hwnd || !IsWindow(m_hwnd)) return;
+
+        ZeroMemory(&m_nid, sizeof(m_nid));
+        m_nid.cbSize = sizeof(NOTIFYICONDATAW);
+        m_nid.hWnd = m_hwnd;
+        m_nid.uID = 1001;
+        m_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        m_nid.uCallbackMessage = WM_TRAY_ICON;
+        m_nid.hIcon = m_smsIcon ? m_smsIcon : LoadIcon(nullptr, IDI_APPLICATION);
+        wcscpy_s(m_nid.szTip, L"KDE Connect SMS");
+
+        if (Shell_NotifyIconW(NIM_ADD, &m_nid) == TRUE) {
             m_nidAdded = true;
         }
     }
@@ -51,6 +176,10 @@ namespace KDEConnect {
         if (m_nidAdded) {
             Shell_NotifyIconW(NIM_DELETE, &m_nid);
             m_nidAdded = false;
+        }
+        if (m_smsIcon) {
+            DestroyIcon(m_smsIcon);
+            m_smsIcon = nullptr;
         }
 #if HAS_WINRT_NOTIFIER
         if (m_winRtAvailable) {

@@ -28,7 +28,7 @@ endif
 
 # Compiler & Linker Flags
 CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -DUNICODE -D_UNICODE -DNOMINMAX -DWIN32_LEAN_AND_MEAN -Iinclude
-LDFLAGS_COMMON = -s -lws2_32 -lcrypt32 -lsecur32 -lshlwapi -lole32 -lshell32 -luuid -lcomdlg32 -ladvapi32 -ldwmapi
+LDFLAGS_COMMON = -s -lws2_32 -lcrypt32 -lsecur32 -lshlwapi -lole32 -lshell32 -luuid -lcomdlg32 -ladvapi32 -ldwmapi -lgdi32
 LDFLAGS_UI = -mwindows -municode -ld2d1 -ldwrite -lwindowscodecs -lcomctl32 $(LDFLAGS_COMMON)
 LDFLAGS_DAEMON = -municode $(LDFLAGS_COMMON)
 

@@ -41,6 +41,8 @@ static HBRUSH g_editBrush = nullptr;
 static COLORREF g_editBrushColor = RGB(0, 0, 0);
 static WNDPROC g_origComposerProc = nullptr;
 static bool g_suppressNextEnterChar = false;
+static bool g_forceExit = false;
+static UINT g_msgTaskbarCreated = 0;
 
 #define IDC_SEARCH_EDIT      1001
 #define IDC_COMPOSER_EDIT    1002
@@ -52,10 +54,34 @@ static bool g_suppressNextEnterChar = false;
 #define IDC_SYNC_TIMER       1
 #define IDC_DEBOUNCE_TIMER   2
 #define IDM_DELETE_CONV      2001
+#define IDM_TRAY_SHOW        2002
+#define IDM_TRAY_EXIT        2003
 #define WM_APP_REFRESH_CONVS (WM_APP + 1)
 
 // Forward declaration
 void OnSendMessage(HWND hwnd);
+
+static void SaveWindowBoundsToIni(HWND hwnd) {
+    RECT rc{};
+    if (hwnd && !IsIconic(hwnd) && GetWindowRect(hwnd, &rc)) {
+        int w = rc.right - rc.left;
+        int h = rc.bottom - rc.top;
+        if (w >= 480 && h >= 360) {
+            WriteIniInt(L"Window", L"Width", w);
+            WriteIniInt(L"Window", L"Height", h);
+        }
+    }
+}
+
+static void RestoreFromTray(HWND hwnd) {
+    if (!hwnd) return;
+    if (IsIconic(hwnd)) {
+        ShowWindow(hwnd, SW_RESTORE);
+    } else {
+        ShowWindow(hwnd, SW_SHOW);
+    }
+    SetForegroundWindow(hwnd);
+}
 
 static LRESULT CALLBACK ComposerEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
@@ -385,8 +411,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // Initialize Direct2D & DirectWrite engine
             g_renderer.Initialize(hwnd);
 
-            // Initialize Windows Toast Notifier
+            // Register Explorer taskbar restart notification
+            g_msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+
+            // Initialize Windows Toast Notifier & SMS Tray Icon
             ToastNotifier::Instance().Initialize(hwnd);
+            if (HICON hSmsIcon = ToastNotifier::Instance().GetSmsIcon()) {
+                SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hSmsIcon));
+                SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hSmsIcon));
+            }
 
             // Register live conversation update hook before starting daemon
             SmsDaemon::Instance().SetOnConversationsUpdated([]() {
@@ -811,16 +844,57 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return (LRESULT)g_editBrush;
         }
 
-        case WM_DESTROY: {
-            RECT rc{};
-            if (!IsIconic(hwnd) && GetWindowRect(hwnd, &rc)) {
-                int w = rc.right - rc.left;
-                int h = rc.bottom - rc.top;
-                if (w >= 480 && h >= 360) {
-                    WriteIniInt(L"Window", L"Width", w);
-                    WriteIniInt(L"Window", L"Height", h);
+        case WM_CLOSE: {
+            SaveWindowBoundsToIni(hwnd);
+            if (!g_forceExit) {
+                ShowWindow(hwnd, SW_HIDE);
+                return 0;
+            }
+            DestroyWindow(hwnd);
+            return 0;
+        }
+
+        case WM_TRAY_ICON: {
+            UINT eventMsg = LOWORD(static_cast<DWORD>(lParam));
+            if (eventMsg == WM_LBUTTONUP || eventMsg == WM_LBUTTONDBLCLK || eventMsg == NIN_BALLOONUSERCLICK) {
+                RestoreFromTray(hwnd);
+            } else if (eventMsg == WM_RBUTTONUP || eventMsg == WM_CONTEXTMENU) {
+                POINT pt{};
+                GetCursorPos(&pt);
+                HMENU hMenu = CreatePopupMenu();
+                if (hMenu) {
+                    bool visible = (IsWindowVisible(hwnd) != FALSE && !IsIconic(hwnd));
+                    AppendMenuW(hMenu, MF_STRING, IDM_TRAY_SHOW, visible ? L"Masquer la fenetre" : L"Ouvrir KDE Connect SMS");
+                    AppendMenuW(hMenu, MF_SEPARATOR, 0, nullptr);
+                    AppendMenuW(hMenu, MF_STRING, IDM_TRAY_EXIT, L"Quitter");
+                    SetMenuDefaultItem(hMenu, IDM_TRAY_SHOW, FALSE);
+
+                    SetForegroundWindow(hwnd);
+                    UINT cmd = TrackPopupMenu(
+                        hMenu,
+                        TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                        pt.x, pt.y, 0, hwnd, nullptr
+                    );
+                    PostMessageW(hwnd, WM_NULL, 0, 0);
+                    DestroyMenu(hMenu);
+
+                    if (cmd == IDM_TRAY_SHOW) {
+                        if (visible) {
+                            ShowWindow(hwnd, SW_HIDE);
+                        } else {
+                            RestoreFromTray(hwnd);
+                        }
+                    } else if (cmd == IDM_TRAY_EXIT) {
+                        g_forceExit = true;
+                        DestroyWindow(hwnd);
+                    }
                 }
             }
+            return 0;
+        }
+
+        case WM_DESTROY: {
+            SaveWindowBoundsToIni(hwnd);
             KillTimer(hwnd, IDC_SYNC_TIMER);
             KillTimer(hwnd, IDC_DEBOUNCE_TIMER);
             SmsDaemon::Instance().SetOnConversationsUpdated(nullptr);
@@ -840,6 +914,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         default:
+            if (g_msgTaskbarCreated != 0 && msg == g_msgTaskbarCreated) {
+                ToastNotifier::Instance().EnsureTrayIcon();
+                return 0;
+            }
             return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
 }
