@@ -11,6 +11,7 @@
 #include <thread>
 #include <atomic>
 #include <map>
+#include <set>
 
 namespace KDEConnect {
 
@@ -27,6 +28,7 @@ namespace KDEConnect {
     public:
         using PacketCallback = std::function<void(const DeviceInfo& device, const KDEPacket& packet)>;
         using DeviceDiscoveredCallback = std::function<void(const DeviceInfo& device)>;
+        using DeviceReadyCallback = std::function<void(const DeviceInfo& device)>;
 
         ProtocolHandler();
         ~ProtocolHandler();
@@ -40,16 +42,21 @@ namespace KDEConnect {
         // Enumerate local IPv4 addresses
         static std::vector<std::wstring> GetLocalIpAddresses();
 
-        // Send packet to paired device over active TLS session (or fallback TCP)
+        // Send packet to paired device over active TLS session
         bool SendPacket(const DeviceInfo& device, const KDEPacket& packet);
+        bool SendPairRequest(const DeviceInfo& device);
 
         // High-level SMS commands
-        bool RequestAllConversations(const DeviceInfo& device);
-        bool RequestConversationMessages(const DeviceInfo& device, int64_t threadId, int64_t rangeStart = 0);
+        bool RequestAllConversations(const DeviceInfo& device = DeviceInfo{});
+        bool RequestConversationMessages(const DeviceInfo& device, int64_t threadId, int64_t rangeStart = -1);
         bool SendSms(const DeviceInfo& device, const std::wstring& phoneNumber, const std::wstring& text);
 
         void SetOnPacketReceived(PacketCallback cb) { m_onPacketReceived = cb; }
         void SetOnDeviceDiscovered(DeviceDiscoveredCallback cb) { m_onDeviceDiscovered = cb; }
+        void SetOnDeviceReady(DeviceReadyCallback cb) { m_onDeviceReady = cb; }
+
+        std::vector<DeviceInfo> GetConnectedDevices() const;
+        bool IsDevicePaired(const std::wstring& deviceId) const;
 
         const DeviceInfo& GetLocalIdentity() const { return m_localIdentity; }
         const std::wstring& GetBindIp() const { return m_bindIp; }
@@ -66,6 +73,8 @@ namespace KDEConnect {
             std::mutex sendMutex;
         };
 
+        void LoadPairedDevices();
+        void MarkDevicePaired(const std::wstring& deviceId, bool paired);
         bool EnsureLocalCertificate();
         bool PerformTlsHandshakeClient(SOCKET sock, TlsSession& session);
         bool PerformTlsHandshakeServer(SOCKET sock, TlsSession& session);
@@ -96,11 +105,13 @@ namespace KDEConnect {
         DeviceInfo m_localIdentity;
         PacketCallback m_onPacketReceived;
         DeviceDiscoveredCallback m_onDeviceDiscovered;
+        DeviceReadyCallback m_onDeviceReady;
 
-        std::mutex m_devicesMutex;
+        mutable std::mutex m_devicesMutex;
         std::vector<DeviceInfo> m_knownDevices;
+        std::set<std::wstring> m_pairedDeviceIds;
 
-        std::mutex m_connMutex;
+        mutable std::mutex m_connMutex;
         std::map<std::wstring, std::shared_ptr<TlsSession>> m_activeSessions;
         std::map<std::wstring, std::chrono::steady_clock::time_point> m_lastTcpAttempt;
     };

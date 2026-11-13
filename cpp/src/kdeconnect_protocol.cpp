@@ -3,6 +3,8 @@
 #include <iomanip>
 #include <cstring>
 #include <cstdio>
+#include <fstream>
+#include <filesystem>
 
 namespace KDEConnect {
 
@@ -29,6 +31,84 @@ namespace KDEConnect {
         return ss.str();
     }
 
+    static size_t SkipJsonWhitespace(const std::string& s, size_t pos) {
+        while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\r' || s[pos] == '\n')) {
+            ++pos;
+        }
+        return pos;
+    }
+
+    static size_t FindMatchingJsonStringEnd(const std::string& s, size_t openQuotePos) {
+        size_t i = openQuotePos + 1;
+        while (i < s.size()) {
+            if (s[i] == '\\') {
+                i += 2;
+                continue;
+            }
+            if (s[i] == '"') return i;
+            ++i;
+        }
+        return std::string::npos;
+    }
+
+    static size_t FindMatchingJsonCompoundEnd(const std::string& s, size_t startPos) {
+        char openCh = s[startPos];
+        char closeCh = (openCh == '{') ? '}' : ']';
+        int depth = 0;
+        for (size_t i = startPos; i < s.size(); ++i) {
+            if (s[i] == '"') {
+                size_t qEnd = FindMatchingJsonStringEnd(s, i);
+                if (qEnd == std::string::npos) return std::string::npos;
+                i = qEnd;
+                continue;
+            }
+            if (s[i] == openCh) {
+                ++depth;
+            } else if (s[i] == closeCh) {
+                --depth;
+                if (depth == 0) return i;
+            }
+        }
+        return std::string::npos;
+    }
+
+    static std::string ExtractTopLevelStringField(const std::string& jsonObj, const std::string& keyName) {
+        size_t pos = SkipJsonWhitespace(jsonObj, 0);
+        if (pos >= jsonObj.size() || jsonObj[pos] != '{') return "";
+        ++pos;
+        while (pos < jsonObj.size()) {
+            pos = SkipJsonWhitespace(jsonObj, pos);
+            if (pos >= jsonObj.size() || jsonObj[pos] == '}') break;
+            if (jsonObj[pos] == ',') { ++pos; continue; }
+            if (jsonObj[pos] != '"') break;
+            size_t keyEnd = FindMatchingJsonStringEnd(jsonObj, pos);
+            if (keyEnd == std::string::npos) break;
+            std::string key = jsonObj.substr(pos + 1, keyEnd - pos - 1);
+            pos = SkipJsonWhitespace(jsonObj, keyEnd + 1);
+            if (pos >= jsonObj.size() || jsonObj[pos] != ':') break;
+            pos = SkipJsonWhitespace(jsonObj, pos + 1);
+            if (pos >= jsonObj.size()) break;
+
+            if (jsonObj[pos] == '"') {
+                size_t valEnd = FindMatchingJsonStringEnd(jsonObj, pos);
+                if (valEnd == std::string::npos) break;
+                if (key == keyName) {
+                    return jsonObj.substr(pos + 1, valEnd - pos - 1);
+                }
+                pos = valEnd + 1;
+            } else if (jsonObj[pos] == '{' || jsonObj[pos] == '[') {
+                size_t valEnd = FindMatchingJsonCompoundEnd(jsonObj, pos);
+                if (valEnd == std::string::npos) break;
+                pos = valEnd + 1;
+            } else {
+                size_t valEnd = jsonObj.find_first_of(",}\r\n", pos);
+                if (valEnd == std::string::npos) valEnd = jsonObj.size();
+                pos = valEnd;
+            }
+        }
+        return "";
+    }
+
     static bool SendAllBytes(SOCKET sock, const char* data, int len) {
         int totalSent = 0;
         while (totalSent < len) {
@@ -42,7 +122,7 @@ namespace KDEConnect {
     static bool ReadPlaintextLine(SOCKET sock, std::string& outLine) {
         outLine.clear();
         char ch = 0;
-        for (int i = 0; i < 8192; ++i) {
+        for (int i = 0; i < 65536; ++i) {
             int r = recv(sock, &ch, 1, 0);
             if (r <= 0) return false;
             if (ch == '\n') return true;
@@ -61,45 +141,48 @@ namespace KDEConnect {
     }
 
     bool KDEPacket::Deserialize(const std::string& raw, KDEPacket& outPacket) {
-        if (raw.empty()) return false;
+        outPacket = KDEPacket{};
+        size_t pos = SkipJsonWhitespace(raw, 0);
+        if (pos >= raw.size() || raw[pos] != '{') return false;
+        ++pos;
 
-        size_t idPos = raw.find("\"id\":");
-        if (idPos != std::string::npos) {
-            size_t idEnd = raw.find_first_of(",}\r\n", idPos + 5);
-            if (idEnd != std::string::npos) {
-                std::string idStr = raw.substr(idPos + 5, idEnd - (idPos + 5));
-                outPacket.id = std::strtoll(idStr.c_str(), nullptr, 10);
-            }
-        }
+        while (pos < raw.size()) {
+            pos = SkipJsonWhitespace(raw, pos);
+            if (pos >= raw.size() || raw[pos] == '}') break;
+            if (raw[pos] == ',') { ++pos; continue; }
+            if (raw[pos] != '"') break;
 
-        size_t typePos = raw.find("\"type\":");
-        if (typePos != std::string::npos) {
-            size_t quoteStart = raw.find('"', typePos + 7);
-            if (quoteStart != std::string::npos) {
-                size_t quoteEnd = raw.find('"', quoteStart + 1);
-                if (quoteEnd != std::string::npos) {
-                    outPacket.type = raw.substr(quoteStart + 1, quoteEnd - quoteStart - 1);
+            size_t keyEnd = FindMatchingJsonStringEnd(raw, pos);
+            if (keyEnd == std::string::npos) break;
+            std::string key = raw.substr(pos + 1, keyEnd - pos - 1);
+
+            pos = SkipJsonWhitespace(raw, keyEnd + 1);
+            if (pos >= raw.size() || raw[pos] != ':') break;
+            pos = SkipJsonWhitespace(raw, pos + 1);
+            if (pos >= raw.size()) break;
+
+            if (raw[pos] == '"') {
+                size_t valEnd = FindMatchingJsonStringEnd(raw, pos);
+                if (valEnd == std::string::npos) break;
+                if (key == "type") {
+                    outPacket.type = raw.substr(pos + 1, valEnd - pos - 1);
                 }
-            }
-        }
-
-        size_t bodyPos = raw.find("\"body\":");
-        if (bodyPos != std::string::npos) {
-            size_t startBrace = raw.find('{', bodyPos);
-            if (startBrace != std::string::npos) {
-                int braceCount = 0;
-                size_t endBrace = startBrace;
-                for (size_t i = startBrace; i < raw.size(); ++i) {
-                    if (raw[i] == '{') braceCount++;
-                    else if (raw[i] == '}') {
-                        braceCount--;
-                        if (braceCount == 0) {
-                            endBrace = i;
-                            break;
-                        }
-                    }
+                pos = valEnd + 1;
+            } else if (raw[pos] == '{' || raw[pos] == '[') {
+                size_t valEnd = FindMatchingJsonCompoundEnd(raw, pos);
+                if (valEnd == std::string::npos) break;
+                if (key == "body") {
+                    outPacket.bodyJson = raw.substr(pos, valEnd - pos + 1);
                 }
-                outPacket.bodyJson = raw.substr(startBrace, endBrace - startBrace + 1);
+                pos = valEnd + 1;
+            } else {
+                size_t valEnd = raw.find_first_of(",}\r\n", pos);
+                if (valEnd == std::string::npos) valEnd = raw.size();
+                if (key == "id") {
+                    std::string idStr = raw.substr(pos, valEnd - pos);
+                    outPacket.id = std::strtoll(idStr.c_str(), nullptr, 10);
+                }
+                pos = valEnd;
             }
         }
 
@@ -111,39 +194,23 @@ namespace KDEConnect {
         dev.ipAddress = fallbackIp;
         dev.port = fallbackPort;
 
-        size_t dId = pkt.bodyJson.find("\"deviceId\":");
-        if (dId != std::string::npos) {
-            size_t q1 = pkt.bodyJson.find('"', dId + 11);
-            size_t q2 = pkt.bodyJson.find('"', q1 + 1);
-            if (q1 != std::string::npos && q2 != std::string::npos) {
-                dev.deviceId = Utf8ToWide(pkt.bodyJson.substr(q1 + 1, q2 - q1 - 1));
-            }
-        }
+        std::string dId = ExtractTopLevelStringField(pkt.bodyJson, "deviceId");
+        if (!dId.empty()) dev.deviceId = Utf8ToWide(dId);
 
-        size_t dName = pkt.bodyJson.find("\"deviceName\":");
-        if (dName != std::string::npos) {
-            size_t q1 = pkt.bodyJson.find('"', dName + 13);
-            size_t q2 = pkt.bodyJson.find('"', q1 + 1);
-            if (q1 != std::string::npos && q2 != std::string::npos) {
-                dev.deviceName = Utf8ToWide(pkt.bodyJson.substr(q1 + 1, q2 - q1 - 1));
-            }
-        }
+        std::string dName = ExtractTopLevelStringField(pkt.bodyJson, "deviceName");
+        if (!dName.empty()) dev.deviceName = Utf8ToWide(dName);
 
-        size_t dType = pkt.bodyJson.find("\"deviceType\":");
-        if (dType != std::string::npos) {
-            size_t q1 = pkt.bodyJson.find('"', dType + 13);
-            size_t q2 = pkt.bodyJson.find('"', q1 + 1);
-            if (q1 != std::string::npos && q2 != std::string::npos) {
-                dev.deviceType = Utf8ToWide(pkt.bodyJson.substr(q1 + 1, q2 - q1 - 1));
-            }
-        }
+        std::string dType = ExtractTopLevelStringField(pkt.bodyJson, "deviceType");
+        if (!dType.empty()) dev.deviceType = Utf8ToWide(dType);
 
         size_t pPort = pkt.bodyJson.find("\"tcpPort\":");
         if (pPort != std::string::npos) {
             size_t portEnd = pkt.bodyJson.find_first_of(",}\r\n", pPort + 10);
-            std::string portStr = pkt.bodyJson.substr(pPort + 10, portEnd - (pPort + 10));
-            int parsedPort = std::atoi(portStr.c_str());
-            if (parsedPort > 0 && parsedPort <= 65535) dev.port = static_cast<uint16_t>(parsedPort);
+            if (portEnd != std::string::npos) {
+                std::string portStr = pkt.bodyJson.substr(pPort + 10, portEnd - (pPort + 10));
+                int parsedPort = std::atoi(portStr.c_str());
+                if (parsedPort > 0 && parsedPort <= 65535) dev.port = static_cast<uint16_t>(parsedPort);
+            }
         }
 
         return dev;
@@ -185,6 +252,73 @@ namespace KDEConnect {
         m_localIdentity.deviceType = L"desktop";
         m_localIdentity.isPaired = true;
         m_localIdentity.isReachable = true;
+
+        LoadPairedDevices();
+    }
+
+    void ProtocolHandler::LoadPairedDevices() {
+        std::wstring path = GetAppDataDirectory() + L"\\paired_devices.txt";
+        std::ifstream file(std::filesystem::path(path));
+        if (!file.is_open()) return;
+        std::lock_guard<std::mutex> lock(m_devicesMutex);
+        std::string line;
+        while (std::getline(file, line)) {
+            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ')) {
+                line.pop_back();
+            }
+            if (!line.empty()) {
+                m_pairedDeviceIds.insert(Utf8ToWide(line));
+            }
+        }
+    }
+
+    void ProtocolHandler::MarkDevicePaired(const std::wstring& deviceId, bool paired) {
+        if (deviceId.empty()) return;
+        {
+            std::lock_guard<std::mutex> lock(m_devicesMutex);
+            if (paired) {
+                m_pairedDeviceIds.insert(deviceId);
+            } else {
+                m_pairedDeviceIds.erase(deviceId);
+            }
+            for (auto& d : m_knownDevices) {
+                if (d.deviceId == deviceId) d.isPaired = paired;
+            }
+        }
+        std::wstring path = GetAppDataDirectory() + L"\\paired_devices.txt";
+        std::ofstream file(std::filesystem::path(path), std::ios::out | std::ios::trunc);
+        if (file.is_open()) {
+            std::lock_guard<std::mutex> lock(m_devicesMutex);
+            for (const auto& id : m_pairedDeviceIds) {
+                file << WideToUtf8(id) << "\n";
+            }
+        }
+    }
+
+    bool ProtocolHandler::IsDevicePaired(const std::wstring& deviceId) const {
+        std::lock_guard<std::mutex> lock(m_devicesMutex);
+        return m_pairedDeviceIds.find(deviceId) != m_pairedDeviceIds.end();
+    }
+
+    std::vector<DeviceInfo> ProtocolHandler::GetConnectedDevices() const {
+        std::vector<DeviceInfo> connected;
+        std::lock_guard<std::mutex> connLock(m_connMutex);
+        std::lock_guard<std::mutex> devLock(m_devicesMutex);
+        for (const auto& kv : m_activeSessions) {
+            DeviceInfo info;
+            info.deviceId = kv.first;
+            info.isReachable = true;
+            info.isPaired = (m_pairedDeviceIds.find(kv.first) != m_pairedDeviceIds.end());
+            for (const auto& d : m_knownDevices) {
+                if (d.deviceId == kv.first) {
+                    info = d;
+                    info.isReachable = true;
+                    break;
+                }
+            }
+            connected.push_back(info);
+        }
+        return connected;
     }
 
     ProtocolHandler::~ProtocolHandler() {
@@ -746,13 +880,15 @@ namespace KDEConnect {
            << "\"kdeconnect.telephony\","
            << "\"kdeconnect.sms\","
            << "\"kdeconnect.sms.messages\","
+           << "\"kdeconnect.sms.attachment_file\","
            << "\"kdeconnect.battery\""
            << "],"
            << "\"outgoingCapabilities\":["
            << "\"kdeconnect.ping\","
            << "\"kdeconnect.sms.request\","
            << "\"kdeconnect.sms.request_conversations\","
-           << "\"kdeconnect.sms.request_conversation\""
+           << "\"kdeconnect.sms.request_conversation\","
+           << "\"kdeconnect.sms.request_attachment\""
            << "]"
            << "}";
         pkt.bodyJson = ss.str();
@@ -1029,6 +1165,8 @@ namespace KDEConnect {
             std::lock_guard<std::mutex> lock(m_connMutex);
             m_activeSessions[dev.deviceId] = session;
         }
+        dev.isPaired = IsDevicePaired(dev.deviceId);
+        dev.isReachable = true;
         {
             std::lock_guard<std::mutex> lock(m_devicesMutex);
             auto it = std::find_if(m_knownDevices.begin(), m_knownDevices.end(), [&](const DeviceInfo& d) {
@@ -1044,12 +1182,13 @@ namespace KDEConnect {
                 it->ipAddress = dev.ipAddress;
                 it->port = dev.port;
                 it->isReachable = true;
+                it->isPaired = dev.isPaired;
             }
         }
 
         std::string bufferAccumulator;
         std::string chunk;
-        bool pairReplySent = false;
+        bool readyNotified = false;
 
         while (m_running && TlsRecvChunk(*session, chunk)) {
             bufferAccumulator += chunk;
@@ -1058,26 +1197,62 @@ namespace KDEConnect {
             while ((newlinePos = bufferAccumulator.find('\n')) != std::string::npos) {
                 std::string packetLine = bufferAccumulator.substr(0, newlinePos);
                 bufferAccumulator.erase(0, newlinePos + 1);
+                if (packetLine.empty()) continue;
 
                 KDEPacket pkt;
                 if (KDEPacket::Deserialize(packetLine, pkt)) {
                     std::wcout << L"[TLS Paquet] Type: " << Utf8ToWide(pkt.type)
-                               << L" recu de " << (dev.deviceName.empty() ? dev.ipAddress : dev.deviceName) << std::endl;
+                               << L" (" << packetLine.size() << L" octets) recu de "
+                               << (dev.deviceName.empty() ? dev.ipAddress : dev.deviceName) << std::endl;
 
                     if (pkt.type == "kdeconnect.identity") {
+                        DeviceInfo updated = ParseIdentityBody(pkt, dev.ipAddress, dev.port);
+                        if (!updated.deviceId.empty()) dev.deviceId = updated.deviceId;
+                        if (!updated.deviceName.empty()) dev.deviceName = updated.deviceName;
+                        if (!updated.deviceType.empty()) dev.deviceType = updated.deviceType;
+                        dev.isPaired = IsDevicePaired(dev.deviceId);
+                        dev.isReachable = true;
+                        {
+                            std::lock_guard<std::mutex> lock(m_devicesMutex);
+                            for (auto& d : m_knownDevices) {
+                                if (d.deviceId == dev.deviceId) {
+                                    d.deviceName = dev.deviceName;
+                                    d.deviceType = dev.deviceType;
+                                    d.isReachable = true;
+                                }
+                            }
+                        }
                         std::wcout << L"[TLS Identite] Identite chiffree confirmee (Protocole v8 OK) !" << std::endl;
+                        if (!readyNotified && m_onDeviceReady) {
+                            readyNotified = true;
+                            m_onDeviceReady(dev);
+                        }
                     } else if (pkt.type == "kdeconnect.pair") {
-                        bool wantsPair = (pkt.bodyJson.find("true") != std::string::npos);
-                        if (wantsPair && !pairReplySent) {
-                            pairReplySent = true;
-                            std::wcout << L"[Appairage] Demande d'appairage TLS recue ! Validation automatique..." << std::endl;
+                        bool wantsPair = (pkt.bodyJson.find("\"pair\":true") != std::string::npos ||
+                                          pkt.bodyJson.find("\"pair\": true") != std::string::npos);
+                        bool unpair = (pkt.bodyJson.find("\"pair\":false") != std::string::npos ||
+                                       pkt.bodyJson.find("\"pair\": false") != std::string::npos);
+                        if (wantsPair) {
+                            std::wcout << L"[Appairage] Confirmation/Demande d'appairage TLS recue ! Validation..." << std::endl;
+                            MarkDevicePaired(dev.deviceId, true);
+                            dev.isPaired = true;
+
                             KDEPacket pairReply;
                             pairReply.id = std::chrono::duration_cast<std::chrono::milliseconds>(
                                 std::chrono::system_clock::now().time_since_epoch()).count();
                             pairReply.type = "kdeconnect.pair";
                             pairReply.bodyJson = "{\"pair\":true}";
                             TlsSendAll(*session, pairReply.Serialize());
-                            std::wcout << L"[Appairage] Confirmation chiffree envoyee au telephone !" << std::endl;
+                            std::wcout << L"[Appairage] Appairage confirme avec " << (dev.deviceName.empty() ? dev.ipAddress : dev.deviceName) << L" !" << std::endl;
+
+                            if (m_onDeviceReady) {
+                                readyNotified = true;
+                                m_onDeviceReady(dev);
+                            }
+                        } else if (unpair) {
+                            MarkDevicePaired(dev.deviceId, false);
+                            dev.isPaired = false;
+                            std::wcout << L"[Appairage] Appareil dissocie: " << dev.deviceName << std::endl;
                         }
                     } else if (pkt.type == "kdeconnect.ping") {
                         std::wcout << L"[Ping] Ping recu du telephone, reponse..." << std::endl;
@@ -1087,6 +1262,11 @@ namespace KDEConnect {
                         pingReply.type = "kdeconnect.ping";
                         pingReply.bodyJson = "{}";
                         TlsSendAll(*session, pingReply.Serialize());
+                    } else if (pkt.type.rfind("kdeconnect.sms", 0) == 0 || pkt.type == "kdeconnect.telephony") {
+                        if (!dev.isPaired) {
+                            MarkDevicePaired(dev.deviceId, true);
+                            dev.isPaired = true;
+                        }
                     }
 
                     if (m_onPacketReceived) {
@@ -1266,6 +1446,14 @@ namespace KDEConnect {
         return false;
     }
 
+    bool ProtocolHandler::SendPairRequest(const DeviceInfo& device) {
+        KDEPacket pkt;
+        pkt.id = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        pkt.type = "kdeconnect.pair";
+        pkt.bodyJson = "{\"pair\":true}";
+        return SendPacket(device, pkt);
+    }
+
     bool ProtocolHandler::RequestAllConversations(const DeviceInfo& device) {
         KDEPacket pkt;
         pkt.id = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
@@ -1279,7 +1467,11 @@ namespace KDEConnect {
         pkt.id = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         pkt.type = "kdeconnect.sms.request_conversation";
         std::ostringstream ss;
-        ss << "{\"threadID\":" << threadId << ",\"rangeStartTimestamp\":" << rangeStart << "}";
+        ss << "{\"threadID\":" << threadId;
+        if (rangeStart >= 0) {
+            ss << ",\"rangeStartTimestamp\":" << rangeStart;
+        }
+        ss << ",\"numberToRequest\":50}";
         pkt.bodyJson = ss.str();
         return SendPacket(device, pkt);
     }
@@ -1289,11 +1481,16 @@ namespace KDEConnect {
         pkt.id = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         pkt.type = "kdeconnect.sms.request";
 
+        std::string escapedPhone = EscapeJsonString(WideToUtf8(phoneNumber));
+        std::string escapedBody = EscapeJsonString(WideToUtf8(text));
+
         std::ostringstream ss;
         ss << "{"
            << "\"sendSms\":true,"
-           << "\"phoneNumber\":\"" << EscapeJsonString(WideToUtf8(phoneNumber)) << "\","
-           << "\"messageBody\":\"" << EscapeJsonString(WideToUtf8(text)) << "\""
+           << "\"phoneNumber\":\"" << escapedPhone << "\","
+           << "\"addresses\":[{\"address\":\"" << escapedPhone << "\"}],"
+           << "\"messageBody\":\"" << escapedBody << "\","
+           << "\"version\":2"
            << "}";
         pkt.bodyJson = ss.str();
         return SendPacket(device, pkt);

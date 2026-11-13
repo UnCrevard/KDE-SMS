@@ -281,22 +281,27 @@ namespace KDEConnect {
     ) {
         if (!m_renderTarget) return;
 
+        const float topHeaderH = 54.0f;
+
         // Background of sidebar
         D2D1_RECT_F sidebarRect = D2D1::RectF(0.0f, 0.0f, width, height);
         m_renderTarget->FillRectangle(sidebarRect, m_brushSidebarBg);
 
-        // Right divider
-        m_renderTarget->DrawLine(D2D1::Point2F(width, 0.0f), D2D1::Point2F(width, height), m_brushDivider, 1.0f);
+        // Clip conversation list below search bar
+        m_renderTarget->PushAxisAlignedClip(
+            D2D1::RectF(0.0f, topHeaderH, width, height),
+            D2D1_ANTIALIAS_MODE_ALIASED
+        );
 
         float itemHeight = 68.0f;
-        float currentY = -scrollOffset;
+        float currentY = topHeaderH - scrollOffset;
 
         for (size_t i = 0; i < conversations.size(); ++i) {
             const auto& conv = conversations[i];
             D2D1_RECT_F itemRect = D2D1::RectF(0.0f, currentY, width, currentY + itemHeight);
 
             // Check visibility
-            if (itemRect.bottom >= 0.0f && itemRect.top <= height) {
+            if (itemRect.bottom >= topHeaderH && itemRect.top <= height) {
                 // Background highlight
                 if (conv.threadId == selectedThreadId) {
                     m_renderTarget->FillRectangle(itemRect, m_brushSidebarSelected);
@@ -307,7 +312,7 @@ namespace KDEConnect {
                 }
 
                 // Avatar circle
-                float avatarX = 20.0f;
+                float avatarX = 18.0f;
                 float avatarY = currentY + itemHeight / 2.0f;
                 float avatarRadius = 18.0f;
                 D2D1_ELLIPSE avatarEllipse = D2D1::Ellipse(D2D1::Point2F(avatarX + avatarRadius, avatarY), avatarRadius, avatarRadius);
@@ -316,26 +321,27 @@ namespace KDEConnect {
                 // Avatar initial letter
                 std::wstring initial = conv.contactName.empty() ? L"#" : conv.contactName.substr(0, 1);
                 std::transform(initial.begin(), initial.end(), initial.begin(), ::towupper);
-                D2D1_RECT_F avatarTextRect = D2D1::RectF(avatarX, avatarY - 10.0f, avatarX + avatarRadius * 2.0f, avatarY + 10.0f);
+                D2D1_RECT_F avatarTextRect = D2D1::RectF(avatarX + 11.0f, avatarY - 10.0f, avatarX + avatarRadius * 2.0f, avatarY + 10.0f);
                 m_renderTarget->DrawText(initial.c_str(), static_cast<UINT32>(initial.length()), m_fontBodyBold, avatarTextRect, m_brushTextPrimary);
 
-                // Contact Name
-                float textStartX = avatarX + avatarRadius * 2.0f + 14.0f;
-                float textMaxWidth = width - textStartX - 55.0f;
-                D2D1_RECT_F nameRect = D2D1::RectF(textStartX, currentY + 14.0f, textStartX + textMaxWidth, currentY + 34.0f);
-                m_renderTarget->DrawText(conv.contactName.c_str(), static_cast<UINT32>(conv.contactName.length()), m_fontBodyBold, nameRect, m_brushTextPrimary);
+                // Contact Name / Number
+                float textStartX = avatarX + avatarRadius * 2.0f + 12.0f;
+                float textMaxWidth = width - textStartX - 58.0f;
+                std::wstring displayName = conv.contactName.empty() ? conv.address : conv.contactName;
+                D2D1_RECT_F nameRect = D2D1::RectF(textStartX, currentY + 13.0f, textStartX + std::max(40.0f, textMaxWidth), currentY + 33.0f);
+                m_renderTarget->DrawText(displayName.c_str(), static_cast<UINT32>(displayName.length()), m_fontBodyBold, nameRect, m_brushTextPrimary);
 
                 // Timestamp on top right
                 if (!conv.messages.empty()) {
                     std::wstring timeStr = conv.messages.back().GetFormattedTime();
-                    D2D1_RECT_F timeRect = D2D1::RectF(width - 55.0f, currentY + 14.0f, width - 12.0f, currentY + 32.0f);
+                    D2D1_RECT_F timeRect = D2D1::RectF(width - 54.0f, currentY + 14.0f, width - 10.0f, currentY + 32.0f);
                     m_renderTarget->DrawText(timeStr.c_str(), static_cast<UINT32>(timeStr.length()), m_fontTime, timeRect, m_brushTextMuted);
                 }
 
                 // Message snippet with color emoji support
-                D2D1_RECT_F snippetRect = D2D1::RectF(textStartX, currentY + 36.0f, width - 20.0f, currentY + 54.0f);
+                D2D1_RECT_F snippetRect = D2D1::RectF(textStartX, currentY + 36.0f, width - 18.0f, currentY + 54.0f);
                 IDWriteTextLayout* snippetLayout = nullptr;
-                if (SUCCEEDED(m_dwriteFactory->CreateTextLayout(conv.snippet.c_str(), static_cast<UINT32>(conv.snippet.length()), m_fontCaption, width - textStartX - 20.0f, 18.0f, &snippetLayout))) {
+                if (SUCCEEDED(m_dwriteFactory->CreateTextLayout(conv.snippet.c_str(), static_cast<UINT32>(conv.snippet.length()), m_fontCaption, std::max(40.0f, width - textStartX - 18.0f), 18.0f, &snippetLayout))) {
                     DWRITE_TRIMMING trimming = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
                     IDWriteInlineObject* ellipsis = nullptr;
                     m_dwriteFactory->CreateEllipsisTrimmingSign(m_fontCaption, &ellipsis);
@@ -356,6 +362,15 @@ namespace KDEConnect {
             }
             currentY += itemHeight;
         }
+
+        m_renderTarget->PopAxisAlignedClip();
+
+        // Top search bar background & divider
+        m_renderTarget->FillRectangle(D2D1::RectF(0.0f, 0.0f, width, topHeaderH), m_brushSidebarBg);
+        m_renderTarget->DrawLine(D2D1::Point2F(0.0f, topHeaderH), D2D1::Point2F(width, topHeaderH), m_brushDivider, 1.0f);
+
+        // Right divider
+        m_renderTarget->DrawLine(D2D1::Point2F(width, 0.0f), D2D1::Point2F(width, height), m_brushDivider, 1.0f);
     }
 
     void Direct2DRenderer::RenderThread(
@@ -370,13 +385,37 @@ namespace KDEConnect {
 
         outBubbleLayouts.clear();
 
+        const float headerH = 54.0f;
+        const float composerH = 54.0f;
+        float messageAreaBottom = headerH + height;
+
+        // Top Conversation Header
+        D2D1_RECT_F headerRect = D2D1::RectF(startX, 0.0f, startX + width, headerH);
+        m_renderTarget->FillRectangle(headerRect, m_brushSidebarBg);
+        m_renderTarget->DrawLine(D2D1::Point2F(startX, headerH), D2D1::Point2F(startX + width, headerH), m_brushDivider, 1.0f);
+
+        std::wstring title = conversation.contactName.empty() ? conversation.address : conversation.contactName;
+        if (!conversation.address.empty() && conversation.contactName != conversation.address) {
+            title += L"  (" + conversation.address + L")";
+        }
+        D2D1_RECT_F titleRect = D2D1::RectF(startX + 20.0f, 15.0f, startX + width - 130.0f, 40.0f);
+        m_renderTarget->DrawText(title.c_str(), static_cast<UINT32>(title.length()), m_fontHeading, titleRect, m_brushTextPrimary);
+
         // Background of message panel
-        D2D1_RECT_F threadRect = D2D1::RectF(startX, 0.0f, startX + width, height);
+        D2D1_RECT_F threadRect = D2D1::RectF(startX, headerH, startX + width, messageAreaBottom);
         m_renderTarget->FillRectangle(threadRect, m_brushWindowBg);
+
+        // Bottom composer backdrop
+        D2D1_RECT_F composerRect = D2D1::RectF(startX, messageAreaBottom, startX + width, messageAreaBottom + composerH);
+        m_renderTarget->FillRectangle(composerRect, m_brushSidebarBg);
+        m_renderTarget->DrawLine(D2D1::Point2F(startX, messageAreaBottom), D2D1::Point2F(startX + width, messageAreaBottom), m_brushDivider, 1.0f);
+
+        // Clip message bubbles strictly between header and composer
+        m_renderTarget->PushAxisAlignedClip(threadRect, D2D1_ANTIALIAS_MODE_ALIASED);
 
         float padding = 20.0f;
         float maxBubbleWidth = std::min(width * 0.68f, 520.0f);
-        float currentY = padding - scrollOffset;
+        float currentY = headerH + padding - scrollOffset;
 
         for (const auto& msg : conversation.messages) {
             bool isOut = msg.isOutgoing;
@@ -390,8 +429,8 @@ namespace KDEConnect {
                 if (textLayout) textLayout->GetMetrics(&textMetrics);
             }
 
-            float bubbleContentWidth = std::max(textMetrics.widthIncludingTrailingWhitespace + 28.0f, 90.0f);
-            float bubbleContentHeight = std::max(textMetrics.height + 24.0f, 42.0f);
+            float bubbleContentWidth = std::max(textMetrics.widthIncludingTrailingWhitespace + 32.0f, 95.0f);
+            float bubbleContentHeight = std::max(textMetrics.height + 30.0f, 46.0f);
 
             // Handle image attachment height
             ID2D1Bitmap* attachmentBitmap = nullptr;
@@ -420,8 +459,8 @@ namespace KDEConnect {
                 14.0f, 14.0f
             );
 
-            // Render bubble only if in visible window
-            if (bubbleBottom >= 0.0f && bubbleTop <= height) {
+            // Render bubble only if in visible message area
+            if (bubbleBottom >= headerH && bubbleTop <= messageAreaBottom) {
                 // Draw Bubble Background & Border
                 if (isOut) {
                     m_renderTarget->FillRoundedRectangle(roundedBubble, m_brushBubbleOutbound);
@@ -474,6 +513,8 @@ namespace KDEConnect {
             if (textLayout) textLayout->Release();
             currentY += bubbleContentHeight + 12.0f;
         }
+
+        m_renderTarget->PopAxisAlignedClip();
     }
 
     void Direct2DRenderer::RenderEmptyState(float startX, float width, float height, const std::wstring& message) {
@@ -482,7 +523,7 @@ namespace KDEConnect {
         D2D1_RECT_F rect = D2D1::RectF(startX, 0.0f, startX + width, height);
         m_renderTarget->FillRectangle(rect, m_brushWindowBg);
 
-        D2D1_RECT_F textRect = D2D1::RectF(startX + 40.0f, height / 2.0f - 20.0f, startX + width - 40.0f, height / 2.0f + 20.0f);
+        D2D1_RECT_F textRect = D2D1::RectF(startX + 40.0f, height / 2.0f - 45.0f, startX + width - 40.0f, height / 2.0f + 45.0f);
         m_renderTarget->DrawText(
             message.c_str(),
             static_cast<UINT32>(message.length()),
@@ -500,7 +541,7 @@ namespace KDEConnect {
         for (const auto& msg : conversation.messages) {
             float textWidth = maxBubbleWidth - 28.0f;
             float textH = MeasureTextHeight(msg.body, textWidth);
-            float bubbleH = std::max(textH + 24.0f, 42.0f);
+            float bubbleH = std::max(textH + 30.0f, 46.0f);
 
             if (!msg.attachments.empty()) {
                 bubbleH += 180.0f; // estimated image preview height

@@ -9,8 +9,10 @@ using namespace KDEConnect;
 // Global state for Win32 UI window
 static const wchar_t* WINDOW_CLASS_NAME = L"KDEConnectSMSWin32";
 static Direct2DRenderer g_renderer;
-static std::vector<Conversation> g_conversations;
-static int64_t g_selectedThreadId = 101;
+static std::vector<Conversation> g_allConversations;
+static std::vector<Conversation> g_visibleConversations;
+static std::wstring g_searchFilter;
+static int64_t g_selectedThreadId = -1;
 static int g_hoveredSidebarIndex = -1;
 static float g_sidebarWidth = 320.0f;
 static float g_sidebarScroll = 0.0f;
@@ -26,14 +28,103 @@ static HWND g_hwndSearchEdit = nullptr;
 static HWND g_hwndComposerEdit = nullptr;
 static HWND g_hwndSendButton = nullptr;
 static HWND g_hwndThemeButton = nullptr;
+static HWND g_hwndSyncButton = nullptr;
 static HWND g_hwndAttachButton = nullptr;
 static HFONT g_hFont = nullptr;
 
-#define IDC_SEARCH_EDIT   1001
-#define IDC_COMPOSER_EDIT 1002
-#define IDC_SEND_BUTTON   1003
-#define IDC_THEME_BUTTON  1004
-#define IDC_ATTACH_BUTTON 1005
+#define IDC_SEARCH_EDIT      1001
+#define IDC_COMPOSER_EDIT    1002
+#define IDC_SEND_BUTTON      1003
+#define IDC_THEME_BUTTON     1004
+#define IDC_ATTACH_BUTTON    1005
+#define IDC_SYNC_BUTTON      1006
+#define IDC_SYNC_TIMER       1
+#define WM_APP_REFRESH_CONVS (WM_APP + 1)
+
+static std::wstring ToLowerCopy(const std::wstring& s) {
+    std::wstring out = s;
+    std::transform(out.begin(), out.end(), out.begin(), ::towlower);
+    return out;
+}
+
+static Conversation* FindActiveConversation() {
+    for (auto& c : g_visibleConversations) {
+        if (c.threadId == g_selectedThreadId) return &c;
+    }
+    for (auto& c : g_allConversations) {
+        if (c.threadId == g_selectedThreadId) return &c;
+    }
+    return nullptr;
+}
+
+static void ScrollThreadToBottom(HWND hwnd) {
+    Conversation* active = FindActiveConversation();
+    if (!active) {
+        g_threadScroll = 0.0f;
+        return;
+    }
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    float totalWidth = static_cast<float>(rc.right - rc.left);
+    float totalHeight = static_cast<float>(rc.bottom - rc.top);
+    float threadWidth = std::max(200.0f, totalWidth - g_sidebarWidth);
+    float visibleThreadHeight = std::max(100.0f, totalHeight - 54.0f - 54.0f);
+
+    float contentHeight = g_renderer.CalculateTotalThreadHeight(*active, threadWidth);
+    g_threadScroll = std::max(0.0f, contentHeight - visibleThreadHeight);
+}
+
+static void ApplySearchFilter() {
+    g_visibleConversations.clear();
+    if (g_searchFilter.empty()) {
+        g_visibleConversations = g_allConversations;
+        return;
+    }
+    std::wstring q = ToLowerCopy(g_searchFilter);
+    for (const auto& conv : g_allConversations) {
+        if (ToLowerCopy(conv.contactName).find(q) != std::wstring::npos ||
+            ToLowerCopy(conv.address).find(q) != std::wstring::npos ||
+            ToLowerCopy(conv.snippet).find(q) != std::wstring::npos) {
+            g_visibleConversations.push_back(conv);
+        }
+    }
+}
+
+static void ReloadConversations(HWND hwnd, bool autoScrollIfNewOrActive) {
+    size_t prevSelectedCount = 0;
+    if (Conversation* prev = FindActiveConversation()) {
+        prevSelectedCount = prev->messages.size();
+    }
+
+    g_allConversations = SmsDaemon::Instance().LoadAllConversations();
+    ApplySearchFilter();
+
+    bool selectedExists = false;
+    for (const auto& c : g_allConversations) {
+        if (c.threadId == g_selectedThreadId) {
+            selectedExists = true;
+            break;
+        }
+    }
+
+    bool selectionChanged = false;
+    if (!selectedExists && !g_visibleConversations.empty()) {
+        g_selectedThreadId = g_visibleConversations.front().threadId;
+        selectionChanged = true;
+        SmsDaemon::Instance().RequestThreadSync(g_selectedThreadId);
+    }
+
+    size_t newSelectedCount = 0;
+    if (Conversation* cur = FindActiveConversation()) {
+        newSelectedCount = cur->messages.size();
+    }
+
+    if (autoScrollIfNewOrActive && (selectionChanged || newSelectedCount > prevSelectedCount)) {
+        ScrollThreadToBottom(hwnd);
+    }
+
+    InvalidateRect(hwnd, nullptr, FALSE);
+}
 
 void LayoutChildControls(HWND hwnd) {
     RECT rc;
@@ -43,31 +134,35 @@ void LayoutChildControls(HWND hwnd) {
 
     // Search box in sidebar top
     if (g_hwndSearchEdit) {
-        SetWindowPos(g_hwndSearchEdit, nullptr, 16, 14, static_cast<int>(g_sidebarWidth) - 32, 28, SWP_NOZORDER);
+        SetWindowPos(g_hwndSearchEdit, nullptr, 16, 13, static_cast<int>(g_sidebarWidth) - 32, 28, SWP_NOZORDER);
     }
 
     // Composer bar at bottom of thread view
-    int composerHeight = 52;
+    int composerHeight = 54;
     int composerY = height - composerHeight;
     int threadWidth = width - static_cast<int>(g_sidebarWidth);
 
     if (g_hwndAttachButton) {
-        SetWindowPos(g_hwndAttachButton, nullptr, static_cast<int>(g_sidebarWidth) + 16, composerY + 8, 36, 36, SWP_NOZORDER);
+        SetWindowPos(g_hwndAttachButton, nullptr, static_cast<int>(g_sidebarWidth) + 16, composerY + 9, 36, 36, SWP_NOZORDER);
     }
 
     if (g_hwndComposerEdit) {
         int editX = static_cast<int>(g_sidebarWidth) + 60;
-        int editWidth = threadWidth - 160;
-        SetWindowPos(g_hwndComposerEdit, nullptr, editX, composerY + 10, editWidth, 32, SWP_NOZORDER);
+        int editWidth = std::max(80, threadWidth - 160);
+        SetWindowPos(g_hwndComposerEdit, nullptr, editX, composerY + 11, editWidth, 32, SWP_NOZORDER);
     }
 
     if (g_hwndSendButton) {
         int sendX = width - 88;
-        SetWindowPos(g_hwndSendButton, nullptr, sendX, composerY + 8, 72, 36, SWP_NOZORDER);
+        SetWindowPos(g_hwndSendButton, nullptr, sendX, composerY + 9, 72, 36, SWP_NOZORDER);
+    }
+
+    if (g_hwndSyncButton) {
+        SetWindowPos(g_hwndSyncButton, nullptr, width - 84, 11, 34, 32, SWP_NOZORDER);
     }
 
     if (g_hwndThemeButton) {
-        SetWindowPos(g_hwndThemeButton, nullptr, width - 42, 10, 32, 32, SWP_NOZORDER);
+        SetWindowPos(g_hwndThemeButton, nullptr, width - 44, 11, 34, 32, SWP_NOZORDER);
     }
 }
 
@@ -79,28 +174,19 @@ void OnSendMessage(HWND hwnd) {
     GetWindowTextW(g_hwndComposerEdit, &text[0], length + 1);
     text.resize(length);
 
-    // Find active conversation address
-    std::wstring targetAddress = L"";
-    for (const auto& conv : g_conversations) {
-        if (conv.threadId == g_selectedThreadId) {
-            targetAddress = conv.address;
-            break;
-        }
+    Conversation* active = FindActiveConversation();
+    if (!active || active->address.empty()) {
+        return;
     }
 
-    if (targetAddress.empty()) {
-        targetAddress = L"+1 (555) 019-2834";
-    }
-
-    // Send via daemon
-    SmsDaemon::Instance().SendOutgoingSms(targetAddress, text);
+    // Send via daemon (host TLS or IPC to background daemon)
+    SmsDaemon::Instance().SendOutgoingSms(active->address, text, active->threadId);
 
     // Clear composer edit box
     SetWindowTextW(g_hwndComposerEdit, L"");
 
-    // Reload conversation and trigger repaint
-    g_conversations = SmsDaemon::Instance().LoadAllConversations();
-    InvalidateRect(hwnd, nullptr, FALSE);
+    // Reload conversation and scroll to newest bubble
+    ReloadConversations(hwnd, true);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -117,9 +203,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // Initialize Windows Toast Notifier
             ToastNotifier::Instance().Initialize(hwnd);
 
-            // Start background sync daemon
+            // Register live conversation update hook before starting daemon
+            SmsDaemon::Instance().SetOnConversationsUpdated([]() {
+                if (g_hwndMain && IsWindow(g_hwndMain)) {
+                    PostMessageW(g_hwndMain, WM_APP_REFRESH_CONVS, 0, 0);
+                }
+            });
+
+            // Start background sync daemon (or attach as IPC client if KDEConnectDaemon already runs)
             SmsDaemon::Instance().Start(g_bindIp);
-            g_conversations = SmsDaemon::Instance().LoadAllConversations();
 
             // Create UI font
             g_hFont = CreateFontW(
@@ -132,8 +224,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_hwndSearchEdit = CreateWindowExW(
                 WS_EX_CLIENTEDGE, L"EDIT", L"",
                 WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                16, 14, 280, 28, hwnd, (HMENU)IDC_SEARCH_EDIT, GetModuleHandle(nullptr), nullptr
+                16, 13, 280, 28, hwnd, (HMENU)IDC_SEARCH_EDIT, GetModuleHandle(nullptr), nullptr
             );
+            SendMessageW(g_hwndSearchEdit, 0x1501 /* EM_SETCUEBANNER */, FALSE, (LPARAM)L"Rechercher un contact ou SMS...");
 
             g_hwndComposerEdit = CreateWindowExW(
                 WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -142,15 +235,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             );
 
             g_hwndSendButton = CreateWindowExW(
-                0, L"BUTTON", L"Send",
+                0, L"BUTTON", L"Envoyer",
                 WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
                 790, 500, 72, 36, hwnd, (HMENU)IDC_SEND_BUTTON, GetModuleHandle(nullptr), nullptr
+            );
+
+            g_hwndSyncButton = CreateWindowExW(
+                0, L"BUTTON", L"↻",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                810, 11, 34, 32, hwnd, (HMENU)IDC_SYNC_BUTTON, GetModuleHandle(nullptr), nullptr
             );
 
             g_hwndThemeButton = CreateWindowExW(
                 0, L"BUTTON", L"🌓",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                850, 10, 32, 32, hwnd, (HMENU)IDC_THEME_BUTTON, GetModuleHandle(nullptr), nullptr
+                850, 11, 34, 32, hwnd, (HMENU)IDC_THEME_BUTTON, GetModuleHandle(nullptr), nullptr
             );
 
             g_hwndAttachButton = CreateWindowExW(
@@ -162,10 +261,30 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessageW(g_hwndSearchEdit, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndComposerEdit, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndSendButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+            SendMessageW(g_hwndSyncButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndThemeButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndAttachButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
             LayoutChildControls(hwnd);
+            ReloadConversations(hwnd, true);
+
+            // Periodic sync check every 5s until conversations load (or keeps connection status fresh)
+            SetTimer(hwnd, IDC_SYNC_TIMER, 5000, nullptr);
+            return 0;
+        }
+
+        case WM_APP_REFRESH_CONVS: {
+            ReloadConversations(hwnd, true);
+            return 0;
+        }
+
+        case WM_TIMER: {
+            if (wParam == IDC_SYNC_TIMER) {
+                if (g_allConversations.empty()) {
+                    SmsDaemon::Instance().RequestConversationsSync();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+            }
             return 0;
         }
 
@@ -186,13 +305,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             GetClientRect(hwnd, &rc);
             float totalWidth = static_cast<float>(rc.right - rc.left);
             float totalHeight = static_cast<float>(rc.bottom - rc.top);
-            float threadWidth = totalWidth - g_sidebarWidth;
+            float threadWidth = std::max(100.0f, totalWidth - g_sidebarWidth);
 
             g_renderer.BeginDraw();
 
             // 1. Render Left Sidebar (Conversations List)
             g_renderer.RenderSidebar(
-                g_conversations,
+                g_visibleConversations,
                 g_selectedThreadId,
                 g_hoveredSidebarIndex,
                 g_sidebarWidth,
@@ -201,18 +320,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             );
 
             // 2. Render Right Message Thread (Direct2D + Color Emoji)
-            Conversation* activeConv = nullptr;
-            for (auto& c : g_conversations) {
-                if (c.threadId == g_selectedThreadId) {
-                    activeConv = &c;
-                    break;
-                }
-            }
+            Conversation* activeConv = FindActiveConversation();
 
             if (activeConv) {
-                float threadHeaderH = 50.0f;
+                float threadHeaderH = 54.0f;
                 float composerH = 54.0f;
-                float visibleThreadHeight = totalHeight - threadHeaderH - composerH;
+                float visibleThreadHeight = std::max(50.0f, totalHeight - threadHeaderH - composerH);
 
                 g_renderer.RenderThread(
                     *activeConv,
@@ -223,11 +336,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_currentBubbleLayouts
                 );
             } else {
+                std::wstring emptyMsg = L"Aucune conversation SMS chargee.\n\n"
+                                        L"Statut : " + SmsDaemon::Instance().GetConnectionStatusText() + L"\n\n"
+                                        L"Assurez-vous que KDE Connect est appaire sur le telephone,\n"
+                                        L"que l'autorisation SMS est accordee, puis cliquez sur ↻.";
                 g_renderer.RenderEmptyState(
                     g_sidebarWidth,
                     threadWidth,
                     totalHeight,
-                    L"Select a conversation to start reading messages."
+                    emptyMsg
                 );
             }
 
@@ -239,7 +356,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_MOUSEWHEEL: {
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
-            g_threadScroll = std::max(0.0f, g_threadScroll - (delta / 2.0f));
+            POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ScreenToClient(hwnd, &pt);
+
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            float totalWidth = static_cast<float>(rc.right - rc.left);
+            float totalHeight = static_cast<float>(rc.bottom - rc.top);
+
+            if (pt.x < static_cast<LONG>(g_sidebarWidth)) {
+                float maxSidebarScroll = std::max(0.0f, static_cast<float>(g_visibleConversations.size()) * 68.0f - (totalHeight - 54.0f));
+                g_sidebarScroll = std::clamp(g_sidebarScroll - (delta / 2.0f), 0.0f, maxSidebarScroll);
+            } else {
+                Conversation* active = FindActiveConversation();
+                float maxThreadScroll = 0.0f;
+                if (active) {
+                    float threadWidth = std::max(200.0f, totalWidth - g_sidebarWidth);
+                    float visibleThreadHeight = std::max(100.0f, totalHeight - 54.0f - 54.0f);
+                    float contentHeight = g_renderer.CalculateTotalThreadHeight(*active, threadWidth);
+                    maxThreadScroll = std::max(0.0f, contentHeight - visibleThreadHeight);
+                }
+                g_threadScroll = std::clamp(g_threadScroll - (delta / 2.0f), 0.0f, maxThreadScroll);
+            }
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -248,13 +386,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
 
-            // Clicked inside sidebar
-            if (x < g_sidebarWidth) {
+            // Clicked inside sidebar list area (below 54px search bar)
+            if (x < static_cast<int>(g_sidebarWidth) && y >= 54) {
                 float itemH = 68.0f;
-                int clickedIdx = static_cast<int>((y + g_sidebarScroll) / itemH);
-                if (clickedIdx >= 0 && clickedIdx < static_cast<int>(g_conversations.size())) {
-                    g_selectedThreadId = g_conversations[clickedIdx].threadId;
-                    g_threadScroll = 0.0f;
+                int clickedIdx = static_cast<int>((static_cast<float>(y) - 54.0f + g_sidebarScroll) / itemH);
+                if (clickedIdx >= 0 && clickedIdx < static_cast<int>(g_visibleConversations.size())) {
+                    g_selectedThreadId = g_visibleConversations[clickedIdx].threadId;
+                    ScrollThreadToBottom(hwnd);
+                    SmsDaemon::Instance().RequestThreadSync(g_selectedThreadId);
                     InvalidateRect(hwnd, nullptr, FALSE);
                 }
             }
@@ -270,9 +409,31 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_COMMAND: {
             int wmId = LOWORD(wParam);
+            int wmCode = HIWORD(wParam);
             switch (wmId) {
+                case IDC_SEARCH_EDIT:
+                    if (wmCode == EN_CHANGE) {
+                        int len = GetWindowTextLengthW(g_hwndSearchEdit);
+                        std::wstring buf(len + 1, 0);
+                        if (len > 0) {
+                            GetWindowTextW(g_hwndSearchEdit, &buf[0], len + 1);
+                        }
+                        buf.resize(len);
+                        g_searchFilter = buf;
+                        g_sidebarScroll = 0.0f;
+                        ApplySearchFilter();
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                    break;
                 case IDC_SEND_BUTTON:
                     OnSendMessage(hwnd);
+                    break;
+                case IDC_SYNC_BUTTON:
+                    SmsDaemon::Instance().RequestConversationsSync();
+                    if (g_selectedThreadId > 0) {
+                        SmsDaemon::Instance().RequestThreadSync(g_selectedThreadId);
+                    }
+                    InvalidateRect(hwnd, nullptr, FALSE);
                     break;
                 case IDC_THEME_BUTTON: {
                     // Manual theme toggle
@@ -313,6 +474,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_DESTROY: {
+            KillTimer(hwnd, IDC_SYNC_TIMER);
+            SmsDaemon::Instance().SetOnConversationsUpdated(nullptr);
             if (g_hFont) DeleteObject(g_hFont);
             ToastNotifier::Instance().Shutdown();
             SmsDaemon::Instance().Stop();
@@ -399,4 +562,3 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR pCmd
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR /*lpCmdLine*/, int nCmdShow) {
     return wWinMain(hInstance, hPrevInstance, GetCommandLineW(), nCmdShow);
 }
-
