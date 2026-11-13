@@ -322,9 +322,10 @@ namespace KDEConnect {
             std::wcerr << L"[Daemon] Avertissement: impossible d'ouvrir le dossier " << m_watchDir << std::endl;
         }
 
-        // Preload any existing synced threads from disk immediately
+        // Preload deleted threads & any existing synced threads from disk immediately
         {
             std::lock_guard<std::mutex> lock(m_storageMutex);
+            LoadDeletedThreadsLocked();
             LoadAllConversationsFromDiskLocked();
         }
 
@@ -423,8 +424,14 @@ namespace KDEConnect {
             }
 
             if (hasJsonChange && m_running) {
-                // Brief debounce so atomic moves/writes settle
-                std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (!m_isClientMode && nowMs < m_ignoreWatcherUntilMs.load()) {
+                    // Skip self-triggered write notifications in Host mode (already notified directly)
+                    continue;
+                }
+                // Debounce bursts so disk atomic renames settle
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 ProcessFolderChangeNotification();
             }
         }
@@ -433,6 +440,7 @@ namespace KDEConnect {
     void SmsDaemon::ProcessFolderChangeNotification() {
         {
             std::lock_guard<std::mutex> lock(m_storageMutex);
+            LoadDeletedThreadsLocked();
             LoadAllConversationsFromDiskLocked();
         }
         NotifyConversationsUpdated();
@@ -507,6 +515,10 @@ namespace KDEConnect {
                         int64_t tid = std::strtoll(cmd.substr(12).c_str(), nullptr, 10);
                         bool ok = RequestThreadSync(tid);
                         response = ok ? "{\"status\":\"ok\"}\n" : "{\"status\":\"no_device\"}\n";
+                    } else if (cmd.rfind("DELETE_THREAD:", 0) == 0) {
+                        int64_t tid = std::strtoll(cmd.substr(14).c_str(), nullptr, 10);
+                        DeleteConversation(tid);
+                        response = "{\"status\":\"ok\"}\n";
                     } else if (cmd.rfind("SEND_SMS|", 0) == 0) {
                         size_t sep1 = cmd.find('|', 9);
                         if (sep1 != std::string::npos) {
@@ -741,6 +753,66 @@ namespace KDEConnect {
         }
     }
 
+    void SmsDaemon::LoadDeletedThreadsLocked() {
+        m_deletedThreads.clear();
+        std::wstring path = GetAppDataDirectory() + L"\\deleted_threads.txt";
+        std::filesystem::path fsPath(path);
+        std::ifstream file(fsPath);
+        if (!file.is_open()) return;
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.empty()) continue;
+            size_t sp = line.find(' ');
+            if (sp != std::string::npos) {
+                int64_t tid = std::strtoll(line.substr(0, sp).c_str(), nullptr, 10);
+                int64_t ts = std::strtoll(line.substr(sp + 1).c_str(), nullptr, 10);
+                if (tid > 0) m_deletedThreads[tid] = ts;
+            }
+        }
+    }
+
+    void SmsDaemon::SaveDeletedThreadsLocked() {
+        std::wstring path = GetAppDataDirectory() + L"\\deleted_threads.txt";
+        std::filesystem::path fsPath(path);
+        std::ofstream file(fsPath, std::ios::out | std::ios::trunc);
+        if (file.is_open()) {
+            for (const auto& kv : m_deletedThreads) {
+                file << kv.first << " " << kv.second << "\n";
+            }
+        }
+    }
+
+    bool SmsDaemon::DeleteConversation(int64_t threadId) {
+        if (threadId <= 0) return false;
+
+        {
+            std::lock_guard<std::mutex> lock(m_storageMutex);
+            int64_t deletedWatermark = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            auto it = m_conversations.find(threadId);
+            if (it != m_conversations.end()) {
+                deletedWatermark = std::max(deletedWatermark, it->second.lastTimestamp);
+                m_conversations.erase(it);
+            }
+            m_deletedThreads[threadId] = deletedWatermark;
+            SaveDeletedThreadsLocked();
+
+            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            m_ignoreWatcherUntilMs = nowMs + 350;
+
+            std::wstring filePath = m_watchDir + L"\\thread_" + std::to_wstring(threadId) + L".json";
+            DeleteFileW(filePath.c_str());
+        }
+
+        NotifyConversationsUpdated();
+
+        if (m_isClientMode) {
+            SendIpcCommand("DELETE_THREAD:" + std::to_string(threadId) + "\n");
+        }
+        return true;
+    }
+
     void SmsDaemon::SaveMessageToDisk(const Message& msg) {
         SaveMessagesBatchToDisk(std::vector<Message>{ msg });
     }
@@ -750,8 +822,19 @@ namespace KDEConnect {
 
         std::lock_guard<std::mutex> lock(m_storageMutex);
         std::set<int64_t> dirtyThreads;
+        bool deletedChanged = false;
 
         for (const auto& msg : messages) {
+            auto delIt = m_deletedThreads.find(msg.threadId);
+            if (delIt != m_deletedThreads.end()) {
+                if (msg.timestamp <= delIt->second) {
+                    continue; // Ignore already-deleted history during resync
+                }
+                // New message arrived after deletion -> unhide thread cleanly
+                m_deletedThreads.erase(delIt);
+                deletedChanged = true;
+            }
+
             auto& conv = m_conversations[msg.threadId];
             conv.threadId = msg.threadId;
             if (!msg.address.empty() && conv.address.empty()) {
@@ -791,6 +874,16 @@ namespace KDEConnect {
             dirtyThreads.insert(msg.threadId);
         }
 
+        if (deletedChanged) {
+            SaveDeletedThreadsLocked();
+        }
+
+        if (dirtyThreads.empty()) return;
+
+        int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        m_ignoreWatcherUntilMs = nowMs + 350;
+
         for (int64_t tid : dirtyThreads) {
             auto& conv = m_conversations[tid];
             std::sort(conv.messages.begin(), conv.messages.end(), [](const Message& a, const Message& b) {
@@ -813,7 +906,8 @@ namespace KDEConnect {
             std::wstring tmpPath = filePath + L".tmp";
 
             {
-                std::ofstream file(std::filesystem::path(tmpPath), std::ios::out | std::ios::trunc);
+                std::filesystem::path fsTmpPath(tmpPath);
+                std::ofstream file(fsTmpPath, std::ios::out | std::ios::trunc);
                 if (file.is_open()) {
                     file << "{\n"
                          << "  \"threadId\": " << conv.threadId << ",\n"
@@ -870,6 +964,7 @@ namespace KDEConnect {
                 });
 
                 if (conv.threadId <= 0) continue;
+                if (m_deletedThreads.find(conv.threadId) != m_deletedThreads.end()) continue;
                 if (conv.contactName.empty()) {
                     conv.contactName = conv.address.empty() ? (L"Fil #" + std::to_wstring(conv.threadId)) : conv.address;
                 }
@@ -913,9 +1008,7 @@ namespace KDEConnect {
             return;
         }
 
-        if (!loadedFromDisk.empty()) {
-            m_conversations = std::move(loadedFromDisk);
-        }
+        m_conversations = std::move(loadedFromDisk);
     }
 
     std::vector<Conversation> SmsDaemon::LoadAllConversations() {

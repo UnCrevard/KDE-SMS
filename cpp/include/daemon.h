@@ -25,6 +25,7 @@ namespace KDEConnect {
         std::vector<Conversation> LoadAllConversations();
         Conversation LoadConversation(int64_t threadId);
         void SaveMessageToDisk(const Message& msg);
+        bool DeleteConversation(int64_t threadId);
 
         // Sync triggers (work seamlessly in both Standalone and IPC Client modes)
         bool RequestConversationsSync();
@@ -55,11 +56,14 @@ namespace KDEConnect {
         void HandleIncomingKdePacket(const DeviceInfo& device, const KDEPacket& packet);
         void SaveMessagesBatchToDisk(const std::vector<Message>& messages);
         void LoadAllConversationsFromDiskLocked();
+        void LoadDeletedThreadsLocked();
+        void SaveDeletedThreadsLocked();
         bool SendIpcCommand(const std::string& command, std::string* outResponse = nullptr);
         void NotifyConversationsUpdated();
 
         std::atomic<bool> m_running{false};
         std::atomic<bool> m_isClientMode{false};
+        std::atomic<int64_t> m_ignoreWatcherUntilMs{0};
         std::wstring m_watchDir;
         HANDLE m_dirHandle = INVALID_HANDLE_VALUE;
 
@@ -69,6 +73,7 @@ namespace KDEConnect {
         ProtocolHandler m_protocol;
         mutable std::mutex m_storageMutex;
         std::map<int64_t, Conversation> m_conversations;
+        std::map<int64_t, int64_t> m_deletedThreads;
         std::set<int64_t> m_requestedThreads;
 
         std::mutex m_callbackMutex;

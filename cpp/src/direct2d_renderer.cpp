@@ -339,9 +339,9 @@ namespace KDEConnect {
                 }
 
                 // Message snippet with color emoji support
-                D2D1_RECT_F snippetRect = D2D1::RectF(textStartX, currentY + 36.0f, width - 18.0f, currentY + 54.0f);
+                D2D1_RECT_F snippetRect = D2D1::RectF(textStartX, currentY + 36.0f, width - 38.0f, currentY + 54.0f);
                 IDWriteTextLayout* snippetLayout = nullptr;
-                if (SUCCEEDED(m_dwriteFactory->CreateTextLayout(conv.snippet.c_str(), static_cast<UINT32>(conv.snippet.length()), m_fontCaption, std::max(40.0f, width - textStartX - 18.0f), 18.0f, &snippetLayout))) {
+                if (SUCCEEDED(m_dwriteFactory->CreateTextLayout(conv.snippet.c_str(), static_cast<UINT32>(conv.snippet.length()), m_fontCaption, std::max(40.0f, width - textStartX - 38.0f), 18.0f, &snippetLayout))) {
                     DWRITE_TRIMMING trimming = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
                     IDWriteInlineObject* ellipsis = nullptr;
                     m_dwriteFactory->CreateEllipsisTrimmingSign(m_fontCaption, &ellipsis);
@@ -355,6 +355,20 @@ namespace KDEConnect {
                         D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT
                     );
                     snippetLayout->Release();
+                }
+
+                // Subtle delete button on hovered or selected conversation row
+                if (static_cast<int>(i) == hoveredIndex || conv.threadId == selectedThreadId) {
+                    D2D1_ROUNDED_RECT delBtn = D2D1::RoundedRect(
+                        D2D1::RectF(width - 30.0f, currentY + 35.0f, width - 8.0f, currentY + 57.0f),
+                        5.0f, 5.0f
+                    );
+                    if (static_cast<int>(i) == hoveredIndex) {
+                        m_renderTarget->FillRoundedRectangle(delBtn, m_brushDivider);
+                    }
+                    D2D1_RECT_F xRect = D2D1::RectF(width - 25.0f, currentY + 36.0f, width - 8.0f, currentY + 57.0f);
+                    m_renderTarget->DrawText(L"×", 1, m_fontBodyBold, xRect,
+                        static_cast<int>(i) == hoveredIndex ? m_brushTextPrimary : m_brushTextMuted);
                 }
 
                 // Bottom hairline

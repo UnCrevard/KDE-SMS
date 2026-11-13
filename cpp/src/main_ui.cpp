@@ -12,8 +12,10 @@ static Direct2DRenderer g_renderer;
 static std::vector<Conversation> g_allConversations;
 static std::vector<Conversation> g_visibleConversations;
 static std::wstring g_searchFilter;
+static std::wstring g_lastEmptyStatus;
 static int64_t g_selectedThreadId = -1;
 static int g_hoveredSidebarIndex = -1;
+static bool g_trackingMouseLeave = false;
 static float g_sidebarWidth = 320.0f;
 static float g_sidebarScroll = 0.0f;
 static float g_threadScroll = 0.0f;
@@ -22,7 +24,7 @@ static std::vector<BubbleLayout> g_currentBubbleLayouts;
 // Network bind IP
 static std::wstring g_bindIp = L"";
 
-// Child controls
+// Child controls & cached GDI resources
 static HWND g_hwndMain = nullptr;
 static HWND g_hwndSearchEdit = nullptr;
 static HWND g_hwndComposerEdit = nullptr;
@@ -31,6 +33,10 @@ static HWND g_hwndThemeButton = nullptr;
 static HWND g_hwndSyncButton = nullptr;
 static HWND g_hwndAttachButton = nullptr;
 static HFONT g_hFont = nullptr;
+static HBRUSH g_editBrush = nullptr;
+static COLORREF g_editBrushColor = RGB(0, 0, 0);
+static WNDPROC g_origComposerProc = nullptr;
+static bool g_suppressNextEnterChar = false;
 
 #define IDC_SEARCH_EDIT      1001
 #define IDC_COMPOSER_EDIT    1002
@@ -39,7 +45,31 @@ static HFONT g_hFont = nullptr;
 #define IDC_ATTACH_BUTTON    1005
 #define IDC_SYNC_BUTTON      1006
 #define IDC_SYNC_TIMER       1
+#define IDC_DEBOUNCE_TIMER   2
+#define IDM_DELETE_CONV      2001
 #define WM_APP_REFRESH_CONVS (WM_APP + 1)
+
+// Forward declaration
+void OnSendMessage(HWND hwnd);
+
+static LRESULT CALLBACK ComposerEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
+        if ((GetKeyState(VK_SHIFT) & 0x8000) == 0) {
+            g_suppressNextEnterChar = true;
+            if (g_hwndMain) {
+                OnSendMessage(g_hwndMain);
+            }
+            return 0;
+        }
+        g_suppressNextEnterChar = false;
+    } else if (msg == WM_CHAR && (wParam == L'\r' || wParam == L'\n')) {
+        if (g_suppressNextEnterChar) {
+            g_suppressNextEnterChar = false;
+            return 0;
+        }
+    }
+    return CallWindowProcW(g_origComposerProc, hwnd, msg, wParam, lParam);
+}
 
 static std::wstring ToLowerCopy(const std::wstring& s) {
     std::wstring out = s;
@@ -55,6 +85,28 @@ static Conversation* FindActiveConversation() {
         if (c.threadId == g_selectedThreadId) return &c;
     }
     return nullptr;
+}
+
+static bool ConversationsSnapshotEqual(const std::vector<Conversation>& a, const std::vector<Conversation>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].threadId != b[i].threadId ||
+            a[i].lastTimestamp != b[i].lastTimestamp ||
+            a[i].messages.size() != b[i].messages.size() ||
+            a[i].contactName != b[i].contactName ||
+            a[i].snippet != b[i].snippet) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void ClampSidebarScroll(HWND hwnd) {
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    float totalHeight = static_cast<float>(rc.bottom - rc.top);
+    float maxSidebarScroll = std::max(0.0f, static_cast<float>(g_visibleConversations.size()) * 68.0f - (totalHeight - 54.0f));
+    g_sidebarScroll = std::clamp(g_sidebarScroll, 0.0f, maxSidebarScroll);
 }
 
 static void ScrollThreadToBottom(HWND hwnd) {
@@ -90,14 +142,21 @@ static void ApplySearchFilter() {
     }
 }
 
-static void ReloadConversations(HWND hwnd, bool autoScrollIfNewOrActive) {
+static void ReloadConversations(HWND hwnd, bool autoScrollIfNewOrActive, bool forceRepaint = false) {
     size_t prevSelectedCount = 0;
     if (Conversation* prev = FindActiveConversation()) {
         prevSelectedCount = prev->messages.size();
     }
 
-    g_allConversations = SmsDaemon::Instance().LoadAllConversations();
+    std::vector<Conversation> fresh = SmsDaemon::Instance().LoadAllConversations();
+    bool listChanged = !ConversationsSnapshotEqual(g_allConversations, fresh);
+    if (!listChanged && !forceRepaint) {
+        return;
+    }
+
+    g_allConversations = std::move(fresh);
     ApplySearchFilter();
+    ClampSidebarScroll(hwnd);
 
     bool selectedExists = false;
     for (const auto& c : g_allConversations) {
@@ -108,10 +167,15 @@ static void ReloadConversations(HWND hwnd, bool autoScrollIfNewOrActive) {
     }
 
     bool selectionChanged = false;
-    if (!selectedExists && !g_visibleConversations.empty()) {
-        g_selectedThreadId = g_visibleConversations.front().threadId;
-        selectionChanged = true;
-        SmsDaemon::Instance().RequestThreadSync(g_selectedThreadId);
+    if (!selectedExists) {
+        if (!g_visibleConversations.empty()) {
+            g_selectedThreadId = g_visibleConversations.front().threadId;
+            selectionChanged = true;
+            SmsDaemon::Instance().RequestThreadSync(g_selectedThreadId);
+        } else {
+            g_selectedThreadId = -1;
+            selectionChanged = true;
+        }
     }
 
     size_t newSelectedCount = 0;
@@ -124,6 +188,23 @@ static void ReloadConversations(HWND hwnd, bool autoScrollIfNewOrActive) {
     }
 
     InvalidateRect(hwnd, nullptr, FALSE);
+}
+
+static void PerformDeleteConversation(HWND hwnd, int idx, bool askConfirm) {
+    if (idx < 0 || idx >= static_cast<int>(g_visibleConversations.size())) return;
+
+    Conversation target = g_visibleConversations[idx];
+    if (askConfirm) {
+        std::wstring label = target.contactName.empty() ? target.address : target.contactName;
+        std::wstring prompt = L"Effacer la conversation avec \"" + label + L"\" de la liste ?";
+        if (MessageBoxW(hwnd, prompt.c_str(), L"Supprimer la conversation", MB_YESNO | MB_ICONQUESTION) != IDYES) {
+            return;
+        }
+    }
+
+    SmsDaemon::Instance().DeleteConversation(target.threadId);
+    g_hoveredSidebarIndex = -1;
+    ReloadConversations(hwnd, true, true);
 }
 
 void LayoutChildControls(HWND hwnd) {
@@ -174,6 +255,15 @@ void OnSendMessage(HWND hwnd) {
     GetWindowTextW(g_hwndComposerEdit, &text[0], length + 1);
     text.resize(length);
 
+    // Trim trailing CR/LF/whitespace
+    while (!text.empty() && (text.back() == L'\r' || text.back() == L'\n' || text.back() == L' ' || text.back() == L'\t')) {
+        text.pop_back();
+    }
+    if (text.empty()) {
+        SetWindowTextW(g_hwndComposerEdit, L"");
+        return;
+    }
+
     Conversation* active = FindActiveConversation();
     if (!active || active->address.empty()) {
         return;
@@ -186,7 +276,7 @@ void OnSendMessage(HWND hwnd) {
     SetWindowTextW(g_hwndComposerEdit, L"");
 
     // Reload conversation and scroll to newest bubble
-    ReloadConversations(hwnd, true);
+    ReloadConversations(hwnd, true, true);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -230,8 +320,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             g_hwndComposerEdit = CreateWindowExW(
                 WS_EX_CLIENTEDGE, L"EDIT", L"",
-                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_MULTILINE,
+                WS_CHILD | WS_VISIBLE | ES_MULTILINE | ES_AUTOVSCROLL,
                 380, 500, 400, 32, hwnd, (HMENU)IDC_COMPOSER_EDIT, GetModuleHandle(nullptr), nullptr
+            );
+            g_origComposerProc = reinterpret_cast<WNDPROC>(
+                SetWindowLongPtrW(g_hwndComposerEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(ComposerEditProc))
             );
 
             g_hwndSendButton = CreateWindowExW(
@@ -266,23 +359,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessageW(g_hwndAttachButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
 
             LayoutChildControls(hwnd);
-            ReloadConversations(hwnd, true);
+            ReloadConversations(hwnd, true, true);
 
-            // Periodic sync check every 5s until conversations load (or keeps connection status fresh)
+            // Periodic sync check every 5s when no conversations are loaded yet
             SetTimer(hwnd, IDC_SYNC_TIMER, 5000, nullptr);
             return 0;
         }
 
+        case WM_ERASEBKGND: {
+            // Direct2D paints the entire client area; suppress GDI background erase to prevent flicker
+            return 1;
+        }
+
         case WM_APP_REFRESH_CONVS: {
-            ReloadConversations(hwnd, true);
+            // Coalesce bursts of incoming packet/disk updates into a single smooth UI refresh
+            SetTimer(hwnd, IDC_DEBOUNCE_TIMER, 120, nullptr);
             return 0;
         }
 
         case WM_TIMER: {
-            if (wParam == IDC_SYNC_TIMER) {
+            if (wParam == IDC_DEBOUNCE_TIMER) {
+                KillTimer(hwnd, IDC_DEBOUNCE_TIMER);
+                ReloadConversations(hwnd, true);
+            } else if (wParam == IDC_SYNC_TIMER) {
                 if (g_allConversations.empty()) {
                     SmsDaemon::Instance().RequestConversationsSync();
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    std::wstring status = SmsDaemon::Instance().GetConnectionStatusText();
+                    if (status != g_lastEmptyStatus) {
+                        g_lastEmptyStatus = status;
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
                 }
             }
             return 0;
@@ -336,8 +442,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_currentBubbleLayouts
                 );
             } else {
+                g_lastEmptyStatus = SmsDaemon::Instance().GetConnectionStatusText();
                 std::wstring emptyMsg = L"Aucune conversation SMS chargee.\n\n"
-                                        L"Statut : " + SmsDaemon::Instance().GetConnectionStatusText() + L"\n\n"
+                                        L"Statut : " + g_lastEmptyStatus + L"\n\n"
                                         L"Assurez-vous que KDE Connect est appaire sur le telephone,\n"
                                         L"que l'autorisation SMS est accordee, puis cliquez sur ↻.";
                 g_renderer.RenderEmptyState(
@@ -354,6 +461,46 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        case WM_MOUSEMOVE: {
+            int x = GET_X_LPARAM(lParam);
+            int y = GET_Y_LPARAM(lParam);
+
+            if (!g_trackingMouseLeave) {
+                TRACKMOUSEEVENT tme{ sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd, 0 };
+                TrackMouseEvent(&tme);
+                g_trackingMouseLeave = true;
+            }
+
+            int newHover = -1;
+            if (x >= 0 && x < static_cast<int>(g_sidebarWidth) && y >= 54) {
+                int idx = static_cast<int>((static_cast<float>(y) - 54.0f + g_sidebarScroll) / 68.0f);
+                if (idx >= 0 && idx < static_cast<int>(g_visibleConversations.size())) {
+                    newHover = idx;
+                }
+            }
+
+            if (newHover != g_hoveredSidebarIndex) {
+                g_hoveredSidebarIndex = newHover;
+                RECT rc{};
+                GetClientRect(hwnd, &rc);
+                RECT sidebarOnly{ 0, 54, static_cast<LONG>(g_sidebarWidth), rc.bottom };
+                InvalidateRect(hwnd, &sidebarOnly, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_MOUSELEAVE: {
+            g_trackingMouseLeave = false;
+            if (g_hoveredSidebarIndex != -1) {
+                g_hoveredSidebarIndex = -1;
+                RECT rc{};
+                GetClientRect(hwnd, &rc);
+                RECT sidebarOnly{ 0, 54, static_cast<LONG>(g_sidebarWidth), rc.bottom };
+                InvalidateRect(hwnd, &sidebarOnly, FALSE);
+            }
+            return 0;
+        }
+
         case WM_MOUSEWHEEL: {
             int delta = GET_WHEEL_DELTA_WPARAM(wParam);
             POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
@@ -367,6 +514,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (pt.x < static_cast<LONG>(g_sidebarWidth)) {
                 float maxSidebarScroll = std::max(0.0f, static_cast<float>(g_visibleConversations.size()) * 68.0f - (totalHeight - 54.0f));
                 g_sidebarScroll = std::clamp(g_sidebarScroll - (delta / 2.0f), 0.0f, maxSidebarScroll);
+                RECT sidebarOnly{ 0, 54, static_cast<LONG>(g_sidebarWidth), rc.bottom };
+                InvalidateRect(hwnd, &sidebarOnly, FALSE);
             } else {
                 Conversation* active = FindActiveConversation();
                 float maxThreadScroll = 0.0f;
@@ -377,8 +526,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     maxThreadScroll = std::max(0.0f, contentHeight - visibleThreadHeight);
                 }
                 g_threadScroll = std::clamp(g_threadScroll - (delta / 2.0f), 0.0f, maxThreadScroll);
+                RECT threadOnly{ static_cast<LONG>(g_sidebarWidth), 54, rc.right, rc.bottom - 54 };
+                InvalidateRect(hwnd, &threadOnly, FALSE);
             }
-            InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
 
@@ -389,12 +539,53 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             // Clicked inside sidebar list area (below 54px search bar)
             if (x < static_cast<int>(g_sidebarWidth) && y >= 54) {
                 float itemH = 68.0f;
+                float relY = static_cast<float>(y) - 54.0f + g_sidebarScroll;
+                int clickedIdx = static_cast<int>(relY / itemH);
+                if (clickedIdx >= 0 && clickedIdx < static_cast<int>(g_visibleConversations.size())) {
+                    float rowLocalY = relY - static_cast<float>(clickedIdx) * itemH;
+                    bool hitDeleteBtn = (x >= static_cast<int>(g_sidebarWidth) - 32 &&
+                                         x <= static_cast<int>(g_sidebarWidth) - 6 &&
+                                         rowLocalY >= 33.0f && rowLocalY <= 59.0f);
+                    if (hitDeleteBtn) {
+                        PerformDeleteConversation(hwnd, clickedIdx, true);
+                    } else {
+                        g_selectedThreadId = g_visibleConversations[clickedIdx].threadId;
+                        ScrollThreadToBottom(hwnd);
+                        SmsDaemon::Instance().RequestThreadSync(g_selectedThreadId);
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                }
+            }
+            return 0;
+        }
+
+        case WM_RBUTTONUP: {
+            int x = GET_X_LPARAM(lParam);
+            int y = GET_Y_LPARAM(lParam);
+
+            if (x >= 0 && x < static_cast<int>(g_sidebarWidth) && y >= 54) {
+                float itemH = 68.0f;
                 int clickedIdx = static_cast<int>((static_cast<float>(y) - 54.0f + g_sidebarScroll) / itemH);
                 if (clickedIdx >= 0 && clickedIdx < static_cast<int>(g_visibleConversations.size())) {
-                    g_selectedThreadId = g_visibleConversations[clickedIdx].threadId;
-                    ScrollThreadToBottom(hwnd);
-                    SmsDaemon::Instance().RequestThreadSync(g_selectedThreadId);
-                    InvalidateRect(hwnd, nullptr, FALSE);
+                    HMENU hMenu = CreatePopupMenu();
+                    if (hMenu) {
+                        AppendMenuW(hMenu, MF_STRING, IDM_DELETE_CONV, L"Supprimer la conversation");
+                        POINT screenPt{ x, y };
+                        ClientToScreen(hwnd, &screenPt);
+                        UINT cmd = TrackPopupMenu(
+                            hMenu,
+                            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                            screenPt.x,
+                            screenPt.y,
+                            0,
+                            hwnd,
+                            nullptr
+                        );
+                        DestroyMenu(hMenu);
+                        if (cmd == IDM_DELETE_CONV) {
+                            PerformDeleteConversation(hwnd, clickedIdx, false);
+                        }
+                    }
                 }
             }
             return 0;
@@ -403,7 +594,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_SETTINGCHANGE: {
             // Windows system light/dark theme change
             ThemeManager::Instance().HandleSettingChange(hwnd, lParam);
-            InvalidateRect(hwnd, nullptr, TRUE);
+            InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
 
@@ -422,7 +613,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         g_searchFilter = buf;
                         g_sidebarScroll = 0.0f;
                         ApplySearchFilter();
-                        InvalidateRect(hwnd, nullptr, FALSE);
+                        RECT rc{};
+                        GetClientRect(hwnd, &rc);
+                        RECT sidebarOnly{ 0, 54, static_cast<LONG>(g_sidebarWidth), rc.bottom };
+                        InvalidateRect(hwnd, &sidebarOnly, FALSE);
                     }
                     break;
                 case IDC_SEND_BUTTON:
@@ -433,13 +627,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (g_selectedThreadId > 0) {
                         SmsDaemon::Instance().RequestThreadSync(g_selectedThreadId);
                     }
-                    InvalidateRect(hwnd, nullptr, FALSE);
                     break;
                 case IDC_THEME_BUTTON: {
                     // Manual theme toggle
                     bool currentlyDark = ThemeManager::Instance().IsDarkActive();
                     ThemeManager::Instance().SetMode(currentlyDark ? ThemeMode::Light : ThemeMode::Dark);
-                    InvalidateRect(hwnd, nullptr, TRUE);
+                    InvalidateRect(hwnd, nullptr, FALSE);
                     break;
                 }
                 case IDC_ATTACH_BUTTON: {
@@ -467,15 +660,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             const auto& colors = ThemeManager::Instance().GetColors();
             SetTextColor(hdc, colors.win32TextColor);
             SetBkColor(hdc, colors.win32BgColor);
-            static HBRUSH hbr = nullptr;
-            if (hbr) DeleteObject(hbr);
-            hbr = CreateSolidBrush(colors.win32BgColor);
-            return (LRESULT)hbr;
+            if (!g_editBrush || g_editBrushColor != colors.win32BgColor) {
+                if (g_editBrush) DeleteObject(g_editBrush);
+                g_editBrushColor = colors.win32BgColor;
+                g_editBrush = CreateSolidBrush(g_editBrushColor);
+            }
+            return (LRESULT)g_editBrush;
         }
 
         case WM_DESTROY: {
             KillTimer(hwnd, IDC_SYNC_TIMER);
+            KillTimer(hwnd, IDC_DEBOUNCE_TIMER);
             SmsDaemon::Instance().SetOnConversationsUpdated(nullptr);
+            if (g_origComposerProc && g_hwndComposerEdit) {
+                SetWindowLongPtrW(g_hwndComposerEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_origComposerProc));
+                g_origComposerProc = nullptr;
+            }
+            if (g_editBrush) {
+                DeleteObject(g_editBrush);
+                g_editBrush = nullptr;
+            }
             if (g_hFont) DeleteObject(g_hFont);
             ToastNotifier::Instance().Shutdown();
             SmsDaemon::Instance().Stop();
@@ -525,7 +729,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR pCmd
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hbrBackground = nullptr;
     wc.lpszClassName = WINDOW_CLASS_NAME;
     wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
 
@@ -537,7 +741,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR pCmd
         0,
         WINDOW_CLASS_NAME,
         L"KDE Connect SMS - Windows Win32",
-        WS_OVERLAPPEDWINDOW,
+        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 960, 680,
         nullptr, nullptr, hInstance, nullptr
     );
