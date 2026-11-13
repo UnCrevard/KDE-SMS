@@ -2,8 +2,15 @@
 #include "common.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#ifndef SECURITY_WIN32
+#define SECURITY_WIN32
+#endif
+#include <wincrypt.h>
+#include <security.h>
+#include <schannel.h>
 #include <thread>
 #include <atomic>
+#include <map>
 
 namespace KDEConnect {
 
@@ -33,7 +40,7 @@ namespace KDEConnect {
         // Enumerate local IPv4 addresses
         static std::vector<std::wstring> GetLocalIpAddresses();
 
-        // Send packet to paired device over TCP
+        // Send packet to paired device over active TLS session (or fallback TCP)
         bool SendPacket(const DeviceInfo& device, const KDEPacket& packet);
 
         // High-level SMS commands
@@ -48,10 +55,31 @@ namespace KDEConnect {
         const std::wstring& GetBindIp() const { return m_bindIp; }
 
     private:
+        struct TlsSession {
+            SOCKET sock = INVALID_SOCKET;
+            CredHandle hCred{};
+            CtxtHandle hCtx{};
+            bool hasCred = false;
+            bool hasCtx = false;
+            SecPkgContext_StreamSizes streamSizes{};
+            std::vector<char> pendingCipher;
+            std::mutex sendMutex;
+        };
+
+        bool EnsureLocalCertificate();
+        bool PerformTlsHandshakeClient(SOCKET sock, TlsSession& session);
+        bool PerformTlsHandshakeServer(SOCKET sock, TlsSession& session);
+        bool TlsSendAll(TlsSession& session, const std::string& plaintext);
+        bool TlsRecvChunk(TlsSession& session, std::string& outPlaintext);
+        void CleanupTlsSession(TlsSession& session);
+        void RunEncryptedPacketLoop(std::shared_ptr<TlsSession> session, DeviceInfo dev);
+
         void UdpDiscoveryThread();
         void TcpServerThread();
         void HandleClientConnection(SOCKET clientSocket);
         void PeriodicBroadcastThread();
+        void ConnectAndSendIdentityTcp(const DeviceInfo& device);
+        std::string BuildIdentityPacket() const;
 
         std::atomic<bool> m_running{false};
         uint16_t m_port = 1716;
@@ -59,6 +87,7 @@ namespace KDEConnect {
 
         SOCKET m_udpSocket = INVALID_SOCKET;
         SOCKET m_tcpListenSocket = INVALID_SOCKET;
+        PCCERT_CONTEXT m_localCert = nullptr;
 
         std::thread m_udpThread;
         std::thread m_tcpThread;
@@ -70,6 +99,10 @@ namespace KDEConnect {
 
         std::mutex m_devicesMutex;
         std::vector<DeviceInfo> m_knownDevices;
+
+        std::mutex m_connMutex;
+        std::map<std::wstring, std::shared_ptr<TlsSession>> m_activeSessions;
+        std::map<std::wstring, std::chrono::steady_clock::time_point> m_lastTcpAttempt;
     };
 
 } // namespace KDEConnect
