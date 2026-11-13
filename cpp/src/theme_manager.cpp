@@ -4,21 +4,124 @@
 
 namespace KDEConnect {
 
-    std::wstring GetAppDataDirectory() {
-        PWSTR localAppData = nullptr;
-        if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &localAppData))) {
-            std::wstring path = localAppData;
-            CoTaskMemFree(localAppData);
-            path += L"\\" + std::wstring(APPDATA_FOLDER);
-            CreateDirectoryW(path.c_str(), nullptr);
-            return path;
+    namespace {
+
+        std::wstring ResolveInitialCurrentDirectory() {
+            static std::wstring cachedDir;
+            static std::once_flag once;
+            std::call_once(once, []() {
+                DWORD len = GetCurrentDirectoryW(0, nullptr);
+                if (len > 0) {
+                    std::wstring buf(len, L'\0');
+                    DWORD copied = GetCurrentDirectoryW(len, &buf[0]);
+                    if (copied > 0) {
+                        buf.resize(copied);
+                        while (buf.size() > 3 && (buf.back() == L'\\' || buf.back() == L'/')) {
+                            buf.pop_back();
+                        }
+                        cachedDir = buf;
+                        return;
+                    }
+                }
+                cachedDir = L".";
+            });
+            return cachedDir;
         }
-        return L".";
+
+        void EnsureIniFileUtf16Bom(const std::wstring& iniPath) {
+            DWORD attrs = GetFileAttributesW(iniPath.c_str());
+            if (attrs == INVALID_FILE_ATTRIBUTES) {
+                HANDLE hFile = CreateFileW(
+                    iniPath.c_str(),
+                    GENERIC_WRITE,
+                    FILE_SHARE_READ,
+                    nullptr,
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL,
+                    nullptr
+                );
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    const unsigned char bom[2] = { 0xFF, 0xFE };
+                    DWORD written = 0;
+                    WriteFile(hFile, bom, sizeof(bom), &written, nullptr);
+                    CloseHandle(hFile);
+                }
+            }
+        }
+
+        void EnsureDirectoryExistsRecursive(const std::wstring& dirPath) {
+            if (dirPath.empty()) return;
+            SHCreateDirectoryExW(nullptr, dirPath.c_str(), nullptr);
+        }
+
+    } // namespace
+
+    std::wstring GetAppDataDirectory() {
+        return ResolveInitialCurrentDirectory();
+    }
+
+    std::wstring GetSettingsIniPath() {
+        return GetAppDataDirectory() + L"\\" + std::wstring(SETTINGS_INI_FILENAME);
+    }
+
+    std::wstring ReadIniString(const wchar_t* section, const wchar_t* key, const wchar_t* defaultValue) {
+        std::wstring iniPath = GetSettingsIniPath();
+        wchar_t buffer[2048]{};
+        DWORD count = GetPrivateProfileStringW(
+            section,
+            key,
+            defaultValue ? defaultValue : L"",
+            buffer,
+            static_cast<DWORD>(sizeof(buffer) / sizeof(wchar_t)),
+            iniPath.c_str()
+        );
+        return std::wstring(buffer, count);
+    }
+
+    void WriteIniString(const wchar_t* section, const wchar_t* key, const wchar_t* value) {
+        std::wstring iniPath = GetSettingsIniPath();
+        EnsureIniFileUtf16Bom(iniPath);
+        WritePrivateProfileStringW(section, key, value ? value : L"", iniPath.c_str());
+    }
+
+    int ReadIniInt(const wchar_t* section, const wchar_t* key, int defaultValue) {
+        std::wstring iniPath = GetSettingsIniPath();
+        return static_cast<int>(GetPrivateProfileIntW(section, key, defaultValue, iniPath.c_str()));
+    }
+
+    void WriteIniInt(const wchar_t* section, const wchar_t* key, int value) {
+        std::wstring valStr = std::to_wstring(value);
+        WriteIniString(section, key, valStr.c_str());
+    }
+
+    bool HasConfiguredConversationsDirectory() {
+        std::wstring configured = ReadIniString(L"Storage", L"ConversationsDir", L"");
+        return !configured.empty();
+    }
+
+    std::wstring GetDefaultConversationsDirectory() {
+        return GetAppDataDirectory() + L"\\Conversations";
+    }
+
+    void SetConversationsDirectory(const std::wstring& dirPath) {
+        std::wstring clean = dirPath;
+        while (clean.size() > 3 && (clean.back() == L'\\' || clean.back() == L'/')) {
+            clean.pop_back();
+        }
+        if (clean.empty()) {
+            clean = GetDefaultConversationsDirectory();
+        }
+        EnsureDirectoryExistsRecursive(clean);
+        WriteIniString(L"Storage", L"ConversationsDir", clean.c_str());
+        WriteIniInt(L"Storage", L"Initialized", 1);
     }
 
     std::wstring GetMessagesDirectory() {
-        std::wstring path = GetAppDataDirectory() + L"\\messages";
-        CreateDirectoryW(path.c_str(), nullptr);
+        std::wstring path = ReadIniString(L"Storage", L"ConversationsDir", L"");
+        if (path.empty()) {
+            path = GetDefaultConversationsDirectory();
+        }
+        EnsureDirectoryExistsRecursive(path);
         return path;
     }
 
@@ -59,12 +162,17 @@ namespace KDEConnect {
 
     void ThemeManager::Initialize(HWND mainHwnd) {
         m_mainHwnd = mainHwnd;
+        int savedMode = ReadIniInt(L"Appearance", L"ThemeMode", static_cast<int>(ThemeMode::System));
+        if (savedMode >= static_cast<int>(ThemeMode::System) && savedMode <= static_cast<int>(ThemeMode::Dark)) {
+            m_currentMode = static_cast<ThemeMode>(savedMode);
+        }
         UpdateColors();
         ApplyToWindow(m_mainHwnd);
     }
 
     void ThemeManager::SetMode(ThemeMode mode) {
         m_currentMode = mode;
+        WriteIniInt(L"Appearance", L"ThemeMode", static_cast<int>(mode));
         UpdateColors();
         if (m_mainHwnd) {
             ApplyToWindow(m_mainHwnd);

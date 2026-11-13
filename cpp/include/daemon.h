@@ -45,6 +45,7 @@ namespace KDEConnect {
 
         // Directory watcher status
         std::wstring GetWatchDirectory() const { return m_watchDir; }
+        void ReloadStorageDirectory();
 
     private:
         SmsDaemon();

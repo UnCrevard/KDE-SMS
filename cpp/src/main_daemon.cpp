@@ -36,6 +36,20 @@ int wmain(int argc, wchar_t* argv[]) {
 
     std::wstring targetBindIp = L"";
 
+    // First-run prompt for conversation storage folder (stored in KDEConnectSMS.ini in current directory)
+    if (!HasConfiguredConversationsDirectory()) {
+        std::wstring defaultDir = GetDefaultConversationsDirectory();
+        std::wcout << L"\n[Premier demarrage] Fichier de reglages: " << GetSettingsIniPath() << std::endl;
+        std::wcout << L"Dossier de stockage des conversations (Entree pour defaut: " << defaultDir << L"): ";
+        std::wstring input;
+        if (std::getline(std::wcin, input)) {
+            while (!input.empty() && (input.front() == L' ' || input.front() == L'"')) input.erase(input.begin());
+            while (!input.empty() && (input.back() == L' ' || input.back() == L'"' || input.back() == L'\r')) input.pop_back();
+        }
+        SetConversationsDirectory(input.empty() ? defaultDir : input);
+        std::wcout << L"[+] Dossier de conversations enregistre: " << GetMessagesDirectory() << L"\n" << std::endl;
+    }
+
     // Parse command line arguments
     for (int i = 1; i < argc; ++i) {
         std::wstring arg = argv[i];
@@ -47,6 +61,12 @@ int wmain(int argc, wchar_t* argv[]) {
         } else if (!arg.empty() && arg[0] != L'-') {
             targetBindIp = arg;
         }
+    }
+
+    if (targetBindIp.empty()) {
+        targetBindIp = ReadIniString(L"Network", L"BindIp", L"");
+    } else {
+        WriteIniString(L"Network", L"BindIp", targetBindIp.c_str());
     }
 
     // Display available local adapters
@@ -76,7 +96,8 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     SmsDaemon& daemon = SmsDaemon::Instance();
-    std::wcout << L"[*] Monitoring folder: " << daemon.GetWatchDirectory() << std::endl;
+    std::wcout << L"[*] INI Settings: " << GetSettingsIniPath() << std::endl;
+    std::wcout << L"[*] Monitoring folder: " << GetMessagesDirectory() << std::endl;
     std::wcout << L"[*] Listening on UDP 1716 (Discovery) & TCP 1716 (Data)..." << std::endl;
     std::wcout << L"[*] Periodic identity broadcast active (every 4s)..." << std::endl;
 

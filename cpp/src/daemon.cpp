@@ -281,7 +281,6 @@ namespace KDEConnect {
     }
 
     SmsDaemon::SmsDaemon() {
-        m_watchDir = GetMessagesDirectory();
     }
 
     SmsDaemon::~SmsDaemon() {
@@ -302,10 +301,46 @@ namespace KDEConnect {
         if (cb) cb();
     }
 
+    void SmsDaemon::ReloadStorageDirectory() {
+        std::wstring newDir = GetMessagesDirectory();
+        {
+            std::lock_guard<std::mutex> lock(m_storageMutex);
+            m_watchDir = newDir;
+            m_requestedThreads.clear();
+            LoadDeletedThreadsLocked();
+            LoadAllConversationsFromDiskLocked();
+        }
+        if (m_running) {
+            if (m_dirHandle != INVALID_HANDLE_VALUE) {
+                CancelIoEx(m_dirHandle, nullptr);
+                CloseHandle(m_dirHandle);
+                m_dirHandle = INVALID_HANDLE_VALUE;
+            }
+            if (m_watcherThread.joinable()) {
+                m_watcherThread.join();
+            }
+            m_dirHandle = CreateFileW(
+                newDir.c_str(),
+                FILE_LIST_DIRECTORY,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                nullptr
+            );
+            m_watcherThread = std::thread(&SmsDaemon::DirectoryWatcherThread, this);
+        }
+        NotifyConversationsUpdated();
+    }
+
     bool SmsDaemon::Start(const std::wstring& bindIp) {
         if (m_running) return true;
 
         m_running = true;
+        {
+            std::lock_guard<std::mutex> lock(m_storageMutex);
+            m_watchDir = GetMessagesDirectory();
+        }
 
         // Open directory handle for ReadDirectoryChangesW
         m_dirHandle = CreateFileW(

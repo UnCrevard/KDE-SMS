@@ -31,6 +31,7 @@ static HWND g_hwndComposerEdit = nullptr;
 static HWND g_hwndSendButton = nullptr;
 static HWND g_hwndThemeButton = nullptr;
 static HWND g_hwndSyncButton = nullptr;
+static HWND g_hwndFolderButton = nullptr;
 static HWND g_hwndAttachButton = nullptr;
 static HFONT g_hFont = nullptr;
 static HBRUSH g_editBrush = nullptr;
@@ -44,6 +45,7 @@ static bool g_suppressNextEnterChar = false;
 #define IDC_THEME_BUTTON     1004
 #define IDC_ATTACH_BUTTON    1005
 #define IDC_SYNC_BUTTON      1006
+#define IDC_FOLDER_BUTTON    1007
 #define IDC_SYNC_TIMER       1
 #define IDC_DEBOUNCE_TIMER   2
 #define IDM_DELETE_CONV      2001
@@ -207,6 +209,66 @@ static void PerformDeleteConversation(HWND hwnd, int idx, bool askConfirm) {
     ReloadConversations(hwnd, true, true);
 }
 
+static bool PromptSelectStorageFolder(HWND owner, const std::wstring& title, const std::wstring& initialDir, std::wstring& outPath) {
+    IFileOpenDialog* pfd = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pfd));
+    if (FAILED(hr) || !pfd) return false;
+
+    DWORD options = 0;
+    if (SUCCEEDED(pfd->GetOptions(&options))) {
+        pfd->SetOptions(options | FOS_PICKFOLDERS | FOS_PATHMUSTEXIST | FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR);
+    }
+    pfd->SetTitle(title.c_str());
+    pfd->SetOkButtonLabel(L"Choisir ce dossier");
+
+    if (!initialDir.empty()) {
+        IShellItem* pInitItem = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(initialDir.c_str(), nullptr, IID_PPV_ARGS(&pInitItem))) && pInitItem) {
+            pfd->SetFolder(pInitItem);
+            pInitItem->Release();
+        }
+    }
+
+    bool chosen = false;
+    if (SUCCEEDED(pfd->Show(owner))) {
+        IShellItem* psiResult = nullptr;
+        if (SUCCEEDED(pfd->GetResult(&psiResult)) && psiResult) {
+            PWSTR pszFilePath = nullptr;
+            if (SUCCEEDED(psiResult->GetDisplayName(SIGDN_FILESYSPATH, &pszFilePath)) && pszFilePath) {
+                outPath = pszFilePath;
+                CoTaskMemFree(pszFilePath);
+                chosen = !outPath.empty();
+            }
+            psiResult->Release();
+        }
+    }
+    pfd->Release();
+    return chosen;
+}
+
+static void PromptFirstRunStorageSetup() {
+    if (HasConfiguredConversationsDirectory()) return;
+
+    std::wstring defaultDir = GetDefaultConversationsDirectory();
+    std::wstring msg = L"Bienvenue dans KDE Connect SMS !\n\n"
+                       L"Pour ce premier demarrage, choisissez le dossier ou stocker vos conversations.\n"
+                       L"Les reglages de l'application seront enregistres dans :\n"
+                       + GetSettingsIniPath() + L"\n\n"
+                       L"• OK : Parcourir et choisir un dossier\n"
+                       L"• Annuler : Utiliser le dossier par defaut :\n  " + defaultDir;
+
+    std::wstring chosenDir = defaultDir;
+    int res = MessageBoxW(nullptr, msg.c_str(), L"Premier demarrage - Stockage des conversations", MB_OKCANCEL | MB_ICONINFORMATION);
+    if (res == IDOK) {
+        std::wstring picked;
+        if (PromptSelectStorageFolder(nullptr, L"Choisir le dossier de stockage des conversations", GetAppDataDirectory(), picked)) {
+            chosenDir = picked;
+        }
+    }
+
+    SetConversationsDirectory(chosenDir);
+}
+
 void LayoutChildControls(HWND hwnd) {
     RECT rc;
     GetClientRect(hwnd, &rc);
@@ -236,6 +298,10 @@ void LayoutChildControls(HWND hwnd) {
     if (g_hwndSendButton) {
         int sendX = width - 88;
         SetWindowPos(g_hwndSendButton, nullptr, sendX, composerY + 9, 72, 36, SWP_NOZORDER);
+    }
+
+    if (g_hwndFolderButton) {
+        SetWindowPos(g_hwndFolderButton, nullptr, width - 124, 11, 34, 32, SWP_NOZORDER);
     }
 
     if (g_hwndSyncButton) {
@@ -333,6 +399,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 790, 500, 72, 36, hwnd, (HMENU)IDC_SEND_BUTTON, GetModuleHandle(nullptr), nullptr
             );
 
+            g_hwndFolderButton = CreateWindowExW(
+                0, L"BUTTON", L"📁",
+                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                770, 11, 34, 32, hwnd, (HMENU)IDC_FOLDER_BUTTON, GetModuleHandle(nullptr), nullptr
+            );
+
             g_hwndSyncButton = CreateWindowExW(
                 0, L"BUTTON", L"↻",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
@@ -354,6 +426,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessageW(g_hwndSearchEdit, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndComposerEdit, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndSendButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+            SendMessageW(g_hwndFolderButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndSyncButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndThemeButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndAttachButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
@@ -622,6 +695,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case IDC_SEND_BUTTON:
                     OnSendMessage(hwnd);
                     break;
+                case IDC_FOLDER_BUTTON: {
+                    std::wstring curDir = GetMessagesDirectory();
+                    std::wstring picked;
+                    if (PromptSelectStorageFolder(hwnd, L"Choisir le dossier de stockage des conversations", curDir, picked)) {
+                        SetConversationsDirectory(picked);
+                        SmsDaemon::Instance().ReloadStorageDirectory();
+                        SmsDaemon::Instance().RequestConversationsSync();
+                        ReloadConversations(hwnd, true, true);
+                    }
+                    break;
+                }
                 case IDC_SYNC_BUTTON:
                     SmsDaemon::Instance().RequestConversationsSync();
                     if (g_selectedThreadId > 0) {
@@ -669,6 +753,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_DESTROY: {
+            RECT rc{};
+            if (!IsIconic(hwnd) && GetWindowRect(hwnd, &rc)) {
+                int w = rc.right - rc.left;
+                int h = rc.bottom - rc.top;
+                if (w >= 480 && h >= 360) {
+                    WriteIniInt(L"Window", L"Width", w);
+                    WriteIniInt(L"Window", L"Height", h);
+                }
+            }
             KillTimer(hwnd, IDC_SYNC_TIMER);
             KillTimer(hwnd, IDC_DEBOUNCE_TIMER);
             SmsDaemon::Instance().SetOnConversationsUpdated(nullptr);
@@ -715,8 +808,20 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR pCmd
         }
     }
 
-    // Initialize COM for WIC and Shell
+    // Initialize COM for WIC, Shell & Folder Picker
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    // First-run prompt for conversation storage folder + create local INI in current directory
+    PromptFirstRunStorageSetup();
+
+    if (g_bindIp.empty()) {
+        g_bindIp = ReadIniString(L"Network", L"BindIp", L"");
+    } else {
+        WriteIniString(L"Network", L"BindIp", g_bindIp.c_str());
+    }
+
+    int initWidth = std::max(640, ReadIniInt(L"Window", L"Width", 960));
+    int initHeight = std::max(480, ReadIniInt(L"Window", L"Height", 680));
 
     INITCOMMONCONTROLSEX icex;
     icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
@@ -742,7 +847,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR pCmd
         WINDOW_CLASS_NAME,
         L"KDE Connect SMS - Windows Win32",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT, 960, 680,
+        CW_USEDEFAULT, CW_USEDEFAULT, initWidth, initHeight,
         nullptr, nullptr, hInstance, nullptr
     );
 

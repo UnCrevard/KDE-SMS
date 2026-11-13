@@ -20,6 +20,7 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <shlwapi.h>
 
 #include <string>
@@ -124,8 +125,19 @@ namespace KDEConnect {
     constexpr const wchar_t* IPC_PIPE_NAME = L"\\\\.\\pipe\\kdeconnect_sms_ipc";
     constexpr const wchar_t* APP_SUBKEY = L"Software\\KDEConnectWin32";
     constexpr const wchar_t* APPDATA_FOLDER = L"KDEConnectSMS";
+    constexpr const wchar_t* SETTINGS_INI_FILENAME = L"KDEConnectSMS.ini";
 
-    // Helper functions
+    // Portable settings (.ini in current directory) & storage path helpers
+    std::wstring GetSettingsIniPath();
+    std::wstring ReadIniString(const wchar_t* section, const wchar_t* key, const wchar_t* defaultValue = L"");
+    void WriteIniString(const wchar_t* section, const wchar_t* key, const wchar_t* value);
+    int ReadIniInt(const wchar_t* section, const wchar_t* key, int defaultValue);
+    void WriteIniInt(const wchar_t* section, const wchar_t* key, int value);
+
+    bool HasConfiguredConversationsDirectory();
+    std::wstring GetDefaultConversationsDirectory();
+    void SetConversationsDirectory(const std::wstring& dirPath);
+
     std::wstring GetAppDataDirectory();
     std::wstring GetMessagesDirectory();
     std::wstring Utf8ToWide(const std::string& utf8);
