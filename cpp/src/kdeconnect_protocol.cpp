@@ -258,7 +258,8 @@ namespace KDEConnect {
 
     void ProtocolHandler::LoadPairedDevices() {
         std::wstring path = GetAppDataDirectory() + L"\\paired_devices.txt";
-        std::ifstream file(std::filesystem::path(path));
+        std::filesystem::path fsPath(path);
+        std::ifstream file(fsPath);
         if (!file.is_open()) return;
         std::lock_guard<std::mutex> lock(m_devicesMutex);
         std::string line;
@@ -286,7 +287,8 @@ namespace KDEConnect {
             }
         }
         std::wstring path = GetAppDataDirectory() + L"\\paired_devices.txt";
-        std::ofstream file(std::filesystem::path(path), std::ios::out | std::ios::trunc);
+        std::filesystem::path fsPath(path);
+        std::ofstream file(fsPath, std::ios::out | std::ios::trunc);
         if (file.is_open()) {
             std::lock_guard<std::mutex> lock(m_devicesMutex);
             for (const auto& id : m_pairedDeviceIds) {
