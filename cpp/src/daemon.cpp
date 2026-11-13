@@ -5,6 +5,8 @@
 #include <iomanip>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
+#include <cwctype>
 
 namespace KDEConnect {
 
@@ -123,8 +125,11 @@ namespace KDEConnect {
             size_t i = openQuote + 1;
             while (i < s.size()) {
                 if (s[i] == '\\') {
-                    i += 2;
-                    continue;
+                    if (i + 1 < s.size()) {
+                        i += 2;
+                        continue;
+                    }
+                    break;
                 }
                 if (s[i] == '"') return i;
                 ++i;
@@ -233,6 +238,35 @@ namespace KDEConnect {
             }
         }
 
+        // Iterates string elements inside a JSON array
+        template<typename Fn>
+        void ForEachJsonArrayString(const std::string& arr, Fn&& callback) {
+            size_t pos = SkipWs(arr, 0);
+            if (pos >= arr.size() || arr[pos] != '[') return;
+            ++pos;
+
+            while (pos < arr.size()) {
+                pos = SkipWs(arr, pos);
+                if (pos >= arr.size() || arr[pos] == ']') break;
+                if (arr[pos] == ',') { ++pos; continue; }
+
+                if (arr[pos] == '"') {
+                    size_t end = FindStringEnd(arr, pos);
+                    if (end == std::string::npos) break;
+                    callback(UnescapeJsonString(arr.substr(pos + 1, end - pos - 1)));
+                    pos = end + 1;
+                } else if (arr[pos] == '{' || arr[pos] == '[') {
+                    size_t end = FindCompoundEnd(arr, pos);
+                    if (end == std::string::npos) break;
+                    pos = end + 1;
+                } else {
+                    size_t end = arr.find_first_of(",]\r\n", pos);
+                    if (end == std::string::npos) break;
+                    pos = end;
+                }
+            }
+        }
+
         std::string HexEncode(const std::string& bytes) {
             static const char* hex = "0123456789abcdef";
             std::string out;
@@ -262,15 +296,171 @@ namespace KDEConnect {
             return out;
         }
 
-        std::wstring NormalizePhoneSuffix(const std::wstring& phone) {
+        std::wstring NormalizePhoneDigits(const std::wstring& phone) {
             std::wstring digits;
             for (wchar_t ch : phone) {
                 if (ch >= L'0' && ch <= L'9') digits.push_back(ch);
             }
+            return digits;
+        }
+
+        std::wstring NormalizePhoneSuffix(const std::wstring& phone) {
+            std::wstring digits = NormalizePhoneDigits(phone);
             if (digits.size() > 9) {
                 return digits.substr(digits.size() - 9);
             }
             return digits;
+        }
+
+        std::wstring GuessMimeTypeWide(const std::wstring& filePath) {
+            std::wstring ext = std::filesystem::path(filePath).extension().wstring();
+            for (auto& ch : ext) ch = static_cast<wchar_t>(::towlower(ch));
+            if (ext == L".jpg" || ext == L".jpeg") return L"image/jpeg";
+            if (ext == L".png") return L"image/png";
+            if (ext == L".gif") return L"image/gif";
+            if (ext == L".webp") return L"image/webp";
+            if (ext == L".bmp") return L"image/bmp";
+            if (ext == L".heic") return L"image/heic";
+            return L"application/octet-stream";
+        }
+
+        std::string DecodeQuotedPrintable(const std::string& raw) {
+            std::string out;
+            out.reserve(raw.size());
+            auto hexVal = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            for (size_t i = 0; i < raw.size(); ++i) {
+                if (raw[i] == '=' && i + 2 < raw.size()) {
+                    int h = hexVal(raw[i + 1]);
+                    int l = hexVal(raw[i + 2]);
+                    if (h >= 0 && l >= 0) {
+                        out.push_back(static_cast<char>((h << 4) | l));
+                        i += 2;
+                        continue;
+                    }
+                }
+                out.push_back(raw[i]);
+            }
+            return out;
+        }
+
+        std::string UnescapeVCardValue(const std::string& raw) {
+            std::string out;
+            out.reserve(raw.size());
+            for (size_t i = 0; i < raw.size(); ++i) {
+                if (raw[i] == '\\' && i + 1 < raw.size()) {
+                    char next = raw[++i];
+                    if (next == 'n' || next == 'N') out.push_back(' ');
+                    else out.push_back(next);
+                } else {
+                    out.push_back(raw[i]);
+                }
+            }
+            return out;
+        }
+
+        std::string TrimAscii(std::string s) {
+            while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\r' || s.front() == '\n')) s.erase(s.begin());
+            while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\r' || s.back() == '\n')) s.pop_back();
+            return s;
+        }
+
+        void ParseVCardFields(const std::string& vcardRaw, std::wstring& outName, std::vector<std::wstring>& outPhones) {
+            outName.clear();
+            outPhones.clear();
+
+            // Normalize CRLF -> LF first
+            std::string normalized;
+            normalized.reserve(vcardRaw.size());
+            for (size_t i = 0; i < vcardRaw.size(); ++i) {
+                if (vcardRaw[i] == '\r') {
+                    if (i + 1 < vcardRaw.size() && vcardRaw[i + 1] == '\n') ++i;
+                    normalized.push_back('\n');
+                } else {
+                    normalized.push_back(vcardRaw[i]);
+                }
+            }
+
+            // Unfold continuation lines (\n + space/tab, and quoted-printable soft breaks =\n)
+            std::vector<std::string> lines;
+            std::istringstream ls(normalized);
+            std::string rawLine;
+            bool prevEndsSoftBreak = false;
+            while (std::getline(ls, rawLine)) {
+                if (!rawLine.empty() && (rawLine[0] == ' ' || rawLine[0] == '\t') && !lines.empty()) {
+                    lines.back() += rawLine.substr(1);
+                } else if (prevEndsSoftBreak && !lines.empty()) {
+                    lines.back() += rawLine;
+                } else {
+                    lines.push_back(rawLine);
+                }
+                prevEndsSoftBreak = (!lines.empty() && !lines.back().empty() && lines.back().back() == '=');
+                if (prevEndsSoftBreak) {
+                    lines.back().pop_back();
+                }
+            }
+
+            std::wstring fallbackStructuredName;
+            for (const auto& line : lines) {
+                size_t colonPos = line.find(':');
+                if (colonPos == std::string::npos) continue;
+
+                std::string header = line.substr(0, colonPos);
+                std::string value = line.substr(colonPos + 1);
+
+                std::string upperHeader = header;
+                for (char& ch : upperHeader) ch = static_cast<char>(::toupper(static_cast<unsigned char>(ch)));
+
+                // Strip optional "itemN." prefix
+                size_t dotPos = upperHeader.find('.');
+                std::string propAndParams = (dotPos != std::string::npos) ? upperHeader.substr(dotPos + 1) : upperHeader;
+                size_t semiPos = propAndParams.find(';');
+                std::string propName = (semiPos != std::string::npos) ? propAndParams.substr(0, semiPos) : propAndParams;
+
+                bool isQuotedPrintable = (upperHeader.find("QUOTED-PRINTABLE") != std::string::npos);
+                if (isQuotedPrintable) {
+                    value = DecodeQuotedPrintable(value);
+                }
+
+                if (propName == "FN") {
+                    std::string clean = TrimAscii(UnescapeVCardValue(value));
+                    if (!clean.empty()) {
+                        outName = Utf8ToWide(clean);
+                    }
+                } else if (propName == "N" && fallbackStructuredName.empty()) {
+                    // Format: Family;Given;Middle;Prefix;Suffix
+                    std::vector<std::string> parts;
+                    std::stringstream ss(value);
+                    std::string item;
+                    while (std::getline(ss, item, ';')) {
+                        parts.push_back(TrimAscii(UnescapeVCardValue(item)));
+                    }
+                    std::string family = parts.size() > 0 ? parts[0] : "";
+                    std::string given = parts.size() > 1 ? parts[1] : "";
+                    std::string assembled = TrimAscii((!given.empty() && !family.empty()) ? (given + " " + family) : (given + family));
+                    if (!assembled.empty()) {
+                        fallbackStructuredName = Utf8ToWide(assembled);
+                    }
+                } else if (propName == "TEL") {
+                    std::string cleanTel = TrimAscii(value);
+                    if (cleanTel.size() > 4) {
+                        std::string prefix = cleanTel.substr(0, 4);
+                        for (char& ch : prefix) ch = static_cast<char>(::tolower(static_cast<unsigned char>(ch)));
+                        if (prefix == "tel:") cleanTel = cleanTel.substr(4);
+                    }
+                    if (!cleanTel.empty()) {
+                        outPhones.push_back(Utf8ToWide(cleanTel));
+                    }
+                }
+            }
+
+            if (outName.empty() && !fallbackStructuredName.empty()) {
+                outName = fallbackStructuredName;
+            }
         }
 
     } // namespace
@@ -307,8 +497,10 @@ namespace KDEConnect {
             std::lock_guard<std::mutex> lock(m_storageMutex);
             m_watchDir = newDir;
             m_requestedThreads.clear();
+            LoadContactsCacheLocked();
             LoadDeletedThreadsLocked();
             LoadAllConversationsFromDiskLocked();
+            ApplyContactsToConversationsLocked();
         }
         if (m_running) {
             if (m_dirHandle != INVALID_HANDLE_VALUE) {
@@ -357,11 +549,13 @@ namespace KDEConnect {
             std::wcerr << L"[Daemon] Avertissement: impossible d'ouvrir le dossier " << m_watchDir << std::endl;
         }
 
-        // Preload deleted threads & any existing synced threads from disk immediately
+        // Preload cached contacts, deleted threads & synced threads from disk immediately
         {
             std::lock_guard<std::mutex> lock(m_storageMutex);
+            LoadContactsCacheLocked();
             LoadDeletedThreadsLocked();
             LoadAllConversationsFromDiskLocked();
+            ApplyContactsToConversationsLocked();
         }
 
         // Hook protocol packet and ready callbacks
@@ -371,7 +565,8 @@ namespace KDEConnect {
 
         m_protocol.SetOnDeviceReady([this](const DeviceInfo& dev) {
             std::wcout << L"[SMS Sync] Appareil pret (" << (dev.deviceName.empty() ? dev.ipAddress : dev.deviceName)
-                       << L") -> Demande des conversations SMS..." << std::endl;
+                       << L") -> Demande des contacts et conversations SMS..." << std::endl;
+            m_protocol.RequestAllContacts(dev);
             m_protocol.RequestAllConversations(dev);
         });
 
@@ -475,8 +670,10 @@ namespace KDEConnect {
     void SmsDaemon::ProcessFolderChangeNotification() {
         {
             std::lock_guard<std::mutex> lock(m_storageMutex);
+            LoadContactsCacheLocked();
             LoadDeletedThreadsLocked();
             LoadAllConversationsFromDiskLocked();
+            ApplyContactsToConversationsLocked();
         }
         NotifyConversationsUpdated();
     }
@@ -561,9 +758,31 @@ namespace KDEConnect {
                             std::string bodyHex = cmd.substr(sep1 + 1);
                             std::wstring phone = Utf8ToWide(HexDecode(phoneHex));
                             std::wstring body = Utf8ToWide(HexDecode(bodyHex));
-                            if (!phone.empty() && !body.empty()) {
-                                m_protocol.SendSms(DeviceInfo{}, phone, body);
+                            bool sentOk = (!phone.empty() && !body.empty()) && m_protocol.SendSms(DeviceInfo{}, phone, body);
+                            response = sentOk ? "{\"status\":\"ok\"}\n" : "{\"status\":\"error\"}\n";
+                        } else {
+                            response = "{\"status\":\"error\"}\n";
+                        }
+                    } else if (cmd.rfind("SEND_MMS|", 0) == 0) {
+                        size_t sep1 = cmd.find('|', 9);
+                        size_t sep2 = (sep1 != std::string::npos) ? cmd.find('|', sep1 + 1) : std::string::npos;
+                        if (sep1 != std::string::npos && sep2 != std::string::npos) {
+                            std::wstring phone = Utf8ToWide(HexDecode(cmd.substr(9, sep1 - 9)));
+                            std::wstring body = Utf8ToWide(HexDecode(cmd.substr(sep1 + 1, sep2 - sep1 - 1)));
+                            std::wstring filePath = Utf8ToWide(HexDecode(cmd.substr(sep2 + 1)));
+                            std::vector<Attachment> atts;
+                            if (!filePath.empty()) {
+                                Attachment att;
+                                att.localFilePath = filePath;
+                                att.fileName = std::filesystem::path(filePath).filename().wstring();
+                                att.mimeType = GuessMimeTypeWide(filePath);
+                                atts.push_back(std::move(att));
                             }
+                            bool sentOk = (!phone.empty() && (!body.empty() || !atts.empty())) &&
+                                          m_protocol.SendSms(DeviceInfo{}, phone, body, atts);
+                            response = sentOk ? "{\"status\":\"ok\"}\n" : "{\"status\":\"error\"}\n";
+                        } else {
+                            response = "{\"status\":\"error\"}\n";
                         }
                     } else if (cmd == "STATUS") {
                         auto connectedDevs = m_protocol.GetConnectedDevices();
@@ -587,6 +806,7 @@ namespace KDEConnect {
         }
         auto devs = m_protocol.GetConnectedDevices();
         if (devs.empty()) return false;
+        m_protocol.RequestAllContacts(devs.front());
         return m_protocol.RequestAllConversations(devs.front());
     }
 
@@ -729,6 +949,81 @@ namespace KDEConnect {
                     }).detach();
                 }
             }
+        } else if (packet.type == "kdeconnect.contacts.response_uids_timestamps") {
+            std::vector<std::string> allUids;
+            std::map<std::string, int64_t> remoteTs;
+            ForEachJsonObjectField(packet.bodyJson, [&](const std::string& key, const std::string& val, bool) {
+                if (key == "uids") {
+                    ForEachJsonArrayString(val, [&](const std::string& uid) {
+                        if (!uid.empty()) allUids.push_back(uid);
+                    });
+                } else if (!key.empty()) {
+                    int64_t ts = std::strtoll(val.c_str(), nullptr, 10);
+                    remoteTs[key] = ts;
+                }
+            });
+
+            std::vector<std::string> uidsToFetch;
+            {
+                std::lock_guard<std::mutex> lock(m_storageMutex);
+                for (const auto& uid : allUids) {
+                    int64_t rTs = 0;
+                    auto rtIt = remoteTs.find(uid);
+                    if (rtIt != remoteTs.end()) rTs = rtIt->second;
+
+                    auto cacheIt = m_contactUidTimestamps.find(uid);
+                    if (cacheIt == m_contactUidTimestamps.end() || (rTs > 0 && rTs > cacheIt->second)) {
+                        uidsToFetch.push_back(uid);
+                        if (rTs > 0) m_contactUidTimestamps[uid] = rTs;
+                    }
+                }
+            }
+
+            std::wcout << L"[Contacts Sync] " << allUids.size() << L" UID(s) sur telephone, "
+                       << uidsToFetch.size() << L" fiche(s) a recuperer." << std::endl;
+
+            if (!uidsToFetch.empty()) {
+                std::thread([this, device, uidsToFetch = std::move(uidsToFetch)]() {
+                    const size_t kBatch = 50;
+                    for (size_t i = 0; i < uidsToFetch.size() && m_running; i += kBatch) {
+                        size_t end = std::min(i + kBatch, uidsToFetch.size());
+                        std::vector<std::string> batch(uidsToFetch.begin() + i, uidsToFetch.begin() + end);
+                        m_protocol.RequestContactsVcards(device, batch);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                    }
+                }).detach();
+            }
+        } else if (packet.type == "kdeconnect.contacts.response_vcards") {
+            size_t addedCount = 0;
+            bool anyConversationUpdated = false;
+            {
+                std::lock_guard<std::mutex> lock(m_storageMutex);
+                ForEachJsonObjectField(packet.bodyJson, [&](const std::string& key, const std::string& val, bool isStr) {
+                    if (!isStr || key == "uids" || key.empty()) return;
+                    std::string rawVCard = UnescapeJsonString(val);
+
+                    CachedContact contact;
+                    contact.uid = key;
+                    auto tsIt = m_contactUidTimestamps.find(key);
+                    contact.timestamp = (tsIt != m_contactUidTimestamps.end()) ? tsIt->second : 0;
+                    ParseVCardFields(rawVCard, contact.name, contact.phones);
+                    if (!contact.name.empty() && !contact.phones.empty()) {
+                        m_contactsCache[contact.uid] = contact;
+                        IndexContactLocked(contact);
+                        addedCount++;
+                    }
+                });
+
+                if (addedCount > 0) {
+                    SaveContactsCacheLocked();
+                    anyConversationUpdated = ApplyContactsToConversationsLocked();
+                }
+            }
+
+            std::wcout << L"[Contacts Sync] " << addedCount << L" vCard(s) contact(s) importee(s)." << std::endl;
+            if (anyConversationUpdated) {
+                NotifyConversationsUpdated();
+            }
         } else if (packet.type == "kdeconnect.telephony") {
             std::string eventType;
             std::string phone;
@@ -750,6 +1045,9 @@ namespace KDEConnect {
                 int64_t matchedThreadId = -1;
                 {
                     std::lock_guard<std::mutex> lock(m_storageMutex);
+                    if (wName.empty()) {
+                        wName = ResolveContactNameForAddressLocked(wPhone);
+                    }
                     for (auto& kv : m_conversations) {
                         if (!wSuffix.empty() && NormalizePhoneSuffix(kv.second.address) == wSuffix) {
                             matchedThreadId = kv.first;
@@ -786,6 +1084,130 @@ namespace KDEConnect {
                 m_protocol.RequestAllConversations(device);
             }
         }
+    }
+
+    void SmsDaemon::IndexContactLocked(const CachedContact& contact) {
+        if (contact.name.empty()) return;
+        for (const auto& phone : contact.phones) {
+            std::wstring digits = NormalizePhoneDigits(phone);
+            if (digits.empty()) continue;
+            m_phoneToContactName[L"exact:" + digits] = contact.name;
+            if (digits.size() >= 8) {
+                std::wstring suf = digits.size() > 9 ? digits.substr(digits.size() - 9) : digits;
+                m_phoneToContactName[L"suf:" + suf] = contact.name;
+            }
+        }
+    }
+
+    std::wstring SmsDaemon::ResolveSingleContactLocked(const std::wstring& rawAddress) const {
+        std::wstring digits = NormalizePhoneDigits(rawAddress);
+        if (digits.empty()) return L"";
+        auto itExact = m_phoneToContactName.find(L"exact:" + digits);
+        if (itExact != m_phoneToContactName.end()) return itExact->second;
+        if (digits.size() >= 8) {
+            std::wstring suf = digits.size() > 9 ? digits.substr(digits.size() - 9) : digits;
+            auto itSuf = m_phoneToContactName.find(L"suf:" + suf);
+            if (itSuf != m_phoneToContactName.end()) return itSuf->second;
+        }
+        return L"";
+    }
+
+    std::wstring SmsDaemon::ResolveContactNameForAddressLocked(const std::wstring& rawAddress) const {
+        if (rawAddress.empty()) return L"";
+        if (rawAddress.find(L',') == std::wstring::npos) {
+            return ResolveSingleContactLocked(rawAddress);
+        }
+        std::wstring combined;
+        bool anyResolved = false;
+        size_t start = 0;
+        while (start < rawAddress.size()) {
+            size_t comma = rawAddress.find(L',', start);
+            std::wstring part = (comma == std::wstring::npos) ? rawAddress.substr(start) : rawAddress.substr(start, comma - start);
+            while (!part.empty() && part.front() == L' ') part.erase(part.begin());
+            while (!part.empty() && part.back() == L' ') part.pop_back();
+            std::wstring resolved = ResolveSingleContactLocked(part);
+            if (!resolved.empty()) anyResolved = true;
+            if (!combined.empty()) combined += L", ";
+            combined += resolved.empty() ? part : resolved;
+            if (comma == std::wstring::npos) break;
+            start = comma + 1;
+        }
+        return anyResolved ? combined : L"";
+    }
+
+    void SmsDaemon::LoadContactsCacheLocked() {
+        m_contactsCache.clear();
+        m_contactUidTimestamps.clear();
+        m_phoneToContactName.clear();
+
+        std::wstring path = GetAppDataDirectory() + L"\\contacts_cache.txt";
+        std::filesystem::path fsPath(path);
+        std::ifstream file(fsPath);
+        if (!file.is_open()) return;
+
+        std::string line;
+        while (std::getline(file, line)) {
+            if (line.empty()) continue;
+            // Format: uid|timestamp|nameHex|phonesCommaSeparatedHex
+            size_t p1 = line.find('|');
+            size_t p2 = (p1 != std::string::npos) ? line.find('|', p1 + 1) : std::string::npos;
+            size_t p3 = (p2 != std::string::npos) ? line.find('|', p2 + 1) : std::string::npos;
+            if (p1 == std::string::npos || p2 == std::string::npos || p3 == std::string::npos) continue;
+
+            CachedContact c;
+            c.uid = line.substr(0, p1);
+            c.timestamp = std::strtoll(line.substr(p1 + 1, p2 - p1 - 1).c_str(), nullptr, 10);
+            c.name = Utf8ToWide(HexDecode(line.substr(p2 + 1, p3 - p2 - 1)));
+            std::string phonesField = line.substr(p3 + 1);
+            size_t pos = 0;
+            while (pos < phonesField.size()) {
+                size_t comma = phonesField.find(',', pos);
+                std::string pHex = (comma == std::string::npos) ? phonesField.substr(pos) : phonesField.substr(pos, comma - pos);
+                if (!pHex.empty()) c.phones.push_back(Utf8ToWide(HexDecode(pHex)));
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+
+            if (!c.uid.empty() && !c.name.empty()) {
+                m_contactUidTimestamps[c.uid] = c.timestamp;
+                m_contactsCache[c.uid] = c;
+                IndexContactLocked(c);
+            }
+        }
+    }
+
+    void SmsDaemon::SaveContactsCacheLocked() {
+        std::wstring path = GetAppDataDirectory() + L"\\contacts_cache.txt";
+        std::filesystem::path fsPath(path);
+        std::ofstream file(fsPath, std::ios::out | std::ios::trunc);
+        if (!file.is_open()) return;
+        for (const auto& kv : m_contactsCache) {
+            const auto& c = kv.second;
+            file << c.uid << "|" << c.timestamp << "|" << HexEncode(WideToUtf8(c.name)) << "|";
+            for (size_t i = 0; i < c.phones.size(); ++i) {
+                if (i > 0) file << ",";
+                file << HexEncode(WideToUtf8(c.phones[i]));
+            }
+            file << "\n";
+        }
+    }
+
+    bool SmsDaemon::ApplyContactsToConversationsLocked() {
+        bool changed = false;
+        int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+
+        for (auto& kv : m_conversations) {
+            Conversation& conv = kv.second;
+            std::wstring resolved = ResolveContactNameForAddressLocked(conv.address);
+            if (!resolved.empty() && conv.contactName != resolved) {
+                conv.contactName = resolved;
+                m_ignoreWatcherUntilMs = nowMs + 350;
+                WriteConversationJsonLocked(conv);
+                changed = true;
+            }
+        }
+        return changed;
     }
 
     void SmsDaemon::LoadDeletedThreadsLocked() {
@@ -844,12 +1266,64 @@ namespace KDEConnect {
 
         if (m_isClientMode) {
             SendIpcCommand("DELETE_THREAD:" + std::to_string(threadId) + "\n");
+        } else {
+            m_protocol.RequestDeleteConversation(DeviceInfo{}, threadId);
         }
         return true;
     }
 
     void SmsDaemon::SaveMessageToDisk(const Message& msg) {
         SaveMessagesBatchToDisk(std::vector<Message>{ msg });
+    }
+
+    void SmsDaemon::WriteConversationJsonLocked(const Conversation& conv) {
+        std::wstring filePath = m_watchDir + L"\\thread_" + std::to_wstring(conv.threadId) + L".json";
+        std::wstring tmpPath = filePath + L".tmp";
+
+        {
+            std::filesystem::path fsTmpPath(tmpPath);
+            std::ofstream file(fsTmpPath, std::ios::out | std::ios::trunc);
+            if (file.is_open()) {
+                file << "{\n"
+                     << "  \"threadId\": " << conv.threadId << ",\n"
+                     << "  \"address\": \"" << EscapeJson(WideToUtf8(conv.address)) << "\",\n"
+                     << "  \"contactName\": \"" << EscapeJson(WideToUtf8(conv.contactName)) << "\",\n"
+                     << "  \"messages\": [\n";
+
+                for (size_t i = 0; i < conv.messages.size(); ++i) {
+                    const auto& m = conv.messages[i];
+                    file << "    {\n"
+                         << "      \"id\": " << m.id << ",\n"
+                         << "      \"address\": \"" << EscapeJson(WideToUtf8(m.address)) << "\",\n"
+                         << "      \"body\": \"" << EscapeJson(WideToUtf8(m.body)) << "\",\n"
+                         << "      \"timestamp\": " << m.timestamp << ",\n"
+                         << "      \"isOutgoing\": " << (m.isOutgoing ? "true" : "false") << ",\n"
+                         << "      \"isRead\": " << (m.isRead ? "true" : "false");
+
+                    if (!m.attachments.empty()) {
+                        file << ",\n      \"attachments\": [\n";
+                        for (size_t j = 0; j < m.attachments.size(); ++j) {
+                            const auto& a = m.attachments[j];
+                            file << "        {"
+                                 << "\"fileName\": \"" << EscapeJson(WideToUtf8(a.fileName)) << "\", "
+                                 << "\"mimeType\": \"" << EscapeJson(WideToUtf8(a.mimeType)) << "\", "
+                                 << "\"localFilePath\": \"" << EscapeJson(WideToUtf8(a.localFilePath)) << "\", "
+                                 << "\"fileSize\": " << a.fileSize
+                                 << "}" << (j + 1 < m.attachments.size() ? "," : "") << "\n";
+                        }
+                        file << "      ]\n";
+                    } else {
+                        file << "\n";
+                    }
+
+                    file << "    }" << (i + 1 < conv.messages.size() ? "," : "") << "\n";
+                }
+                file << "  ]\n}\n";
+                file.close();
+            }
+        }
+
+        MoveFileExW(tmpPath.c_str(), filePath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
     }
 
     void SmsDaemon::SaveMessagesBatchToDisk(const std::vector<Message>& messages) {
@@ -877,7 +1351,11 @@ namespace KDEConnect {
             } else if (!msg.address.empty() && msg.address.size() > conv.address.size() && conv.contactName == conv.address) {
                 conv.address = msg.address;
             }
-            if (conv.contactName.empty()) {
+
+            std::wstring resolvedName = ResolveContactNameForAddressLocked(conv.address);
+            if (!resolvedName.empty()) {
+                conv.contactName = resolvedName;
+            } else if (conv.contactName.empty()) {
                 conv.contactName = conv.address.empty() ? (L"Fil #" + std::to_wstring(msg.threadId)) : conv.address;
             }
 
@@ -890,6 +1368,7 @@ namespace KDEConnect {
                     existing.isOutgoing = msg.isOutgoing;
                     existing.isRead = msg.isRead;
                     if (!msg.address.empty()) existing.address = msg.address;
+                    if (!msg.attachments.empty()) existing.attachments = msg.attachments;
                     updated = true;
                     break;
                 }
@@ -899,6 +1378,9 @@ namespace KDEConnect {
                     existing.id = msg.id;
                     existing.timestamp = msg.timestamp;
                     existing.isRead = msg.isRead;
+                    if (existing.attachments.empty() && !msg.attachments.empty()) {
+                        existing.attachments = msg.attachments;
+                    }
                     updated = true;
                     break;
                 }
@@ -934,39 +1416,12 @@ namespace KDEConnect {
             }
             if (!conv.messages.empty()) {
                 conv.lastTimestamp = conv.messages.back().timestamp;
-                conv.snippet = conv.messages.back().body;
+                conv.snippet = conv.messages.back().body.empty() && !conv.messages.back().attachments.empty()
+                    ? L"[Image]"
+                    : conv.messages.back().body;
             }
 
-            std::wstring filePath = m_watchDir + L"\\thread_" + std::to_wstring(tid) + L".json";
-            std::wstring tmpPath = filePath + L".tmp";
-
-            {
-                std::filesystem::path fsTmpPath(tmpPath);
-                std::ofstream file(fsTmpPath, std::ios::out | std::ios::trunc);
-                if (file.is_open()) {
-                    file << "{\n"
-                         << "  \"threadId\": " << conv.threadId << ",\n"
-                         << "  \"address\": \"" << EscapeJson(WideToUtf8(conv.address)) << "\",\n"
-                         << "  \"contactName\": \"" << EscapeJson(WideToUtf8(conv.contactName)) << "\",\n"
-                         << "  \"messages\": [\n";
-
-                    for (size_t i = 0; i < conv.messages.size(); ++i) {
-                        const auto& m = conv.messages[i];
-                        file << "    {\n"
-                             << "      \"id\": " << m.id << ",\n"
-                             << "      \"address\": \"" << EscapeJson(WideToUtf8(m.address)) << "\",\n"
-                             << "      \"body\": \"" << EscapeJson(WideToUtf8(m.body)) << "\",\n"
-                             << "      \"timestamp\": " << m.timestamp << ",\n"
-                             << "      \"isOutgoing\": " << (m.isOutgoing ? "true" : "false") << ",\n"
-                             << "      \"isRead\": " << (m.isRead ? "true" : "false") << "\n"
-                             << "    }" << (i + 1 < conv.messages.size() ? "," : "") << "\n";
-                    }
-                    file << "  ]\n}\n";
-                    file.close();
-                }
-            }
-
-            MoveFileExW(tmpPath.c_str(), filePath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+            WriteConversationJsonLocked(conv);
         }
     }
 
@@ -1000,7 +1455,11 @@ namespace KDEConnect {
 
                 if (conv.threadId <= 0) continue;
                 if (m_deletedThreads.find(conv.threadId) != m_deletedThreads.end()) continue;
-                if (conv.contactName.empty()) {
+
+                std::wstring resolved = ResolveContactNameForAddressLocked(conv.address);
+                if (!resolved.empty()) {
+                    conv.contactName = resolved;
+                } else if (conv.contactName.empty()) {
                     conv.contactName = conv.address.empty() ? (L"Fil #" + std::to_wstring(conv.threadId)) : conv.address;
                 }
 
@@ -1009,6 +1468,7 @@ namespace KDEConnect {
                         Message m;
                         m.threadId = conv.threadId;
                         m.address = conv.address;
+                        std::string attsArr;
                         ForEachJsonObjectField(msgObj, [&](const std::string& key, const std::string& val, bool) {
                             if (key == "id") m.id = std::strtoll(val.c_str(), nullptr, 10);
                             else if (key == "address") m.address = Utf8ToWide(UnescapeJsonString(val));
@@ -1016,8 +1476,23 @@ namespace KDEConnect {
                             else if (key == "timestamp") m.timestamp = std::strtoll(val.c_str(), nullptr, 10);
                             else if (key == "isOutgoing") m.isOutgoing = (val == "true" || val == "1");
                             else if (key == "isRead") m.isRead = (val == "true" || val == "1");
+                            else if (key == "attachments") attsArr = val;
                         });
-                        if (m.timestamp > 0 || !m.body.empty()) {
+                        if (!attsArr.empty()) {
+                            ForEachJsonArrayObject(attsArr, [&](const std::string& attObj) {
+                                Attachment att;
+                                ForEachJsonObjectField(attObj, [&](const std::string& aKey, const std::string& aVal, bool) {
+                                    if (aKey == "fileName") att.fileName = Utf8ToWide(UnescapeJsonString(aVal));
+                                    else if (aKey == "mimeType") att.mimeType = Utf8ToWide(UnescapeJsonString(aVal));
+                                    else if (aKey == "localFilePath") att.localFilePath = Utf8ToWide(UnescapeJsonString(aVal));
+                                    else if (aKey == "fileSize") att.fileSize = std::strtoull(aVal.c_str(), nullptr, 10);
+                                });
+                                if (!att.localFilePath.empty() || !att.fileName.empty()) {
+                                    m.attachments.push_back(std::move(att));
+                                }
+                            });
+                        }
+                        if (m.timestamp > 0 || !m.body.empty() || !m.attachments.empty()) {
                             conv.messages.push_back(std::move(m));
                         }
                     });
@@ -1030,7 +1505,9 @@ namespace KDEConnect {
 
                 if (!conv.messages.empty()) {
                     conv.lastTimestamp = conv.messages.back().timestamp;
-                    conv.snippet = conv.messages.back().body;
+                    conv.snippet = conv.messages.back().body.empty() && !conv.messages.back().attachments.empty()
+                        ? L"[Image]"
+                        : conv.messages.back().body;
                 }
                 for (const auto& m : conv.messages) {
                     if (!m.isOutgoing && !m.isRead) conv.unreadCount++;
@@ -1076,8 +1553,13 @@ namespace KDEConnect {
         return {};
     }
 
-    bool SmsDaemon::SendOutgoingSms(const std::wstring& phoneNumber, const std::wstring& text, int64_t preferredThreadId) {
-        if (phoneNumber.empty() || text.empty()) return false;
+    bool SmsDaemon::SendOutgoingSms(
+        const std::wstring& phoneNumber,
+        const std::wstring& text,
+        int64_t preferredThreadId,
+        const std::wstring& attachmentPath
+    ) {
+        if (phoneNumber.empty() || (text.empty() && attachmentPath.empty())) return false;
 
         int64_t threadId = preferredThreadId;
         if (threadId <= 0) {
@@ -1095,6 +1577,40 @@ namespace KDEConnect {
             threadId = static_cast<int64_t>(std::hash<std::string>{}(WideToUtf8(phoneNumber)) % 100000) + 1;
         }
 
+        std::vector<Attachment> atts;
+        if (!attachmentPath.empty()) {
+            std::filesystem::path fsAtt(attachmentPath);
+            std::error_code ec;
+            if (!std::filesystem::exists(fsAtt, ec) || !std::filesystem::is_regular_file(fsAtt, ec)) {
+                return false;
+            }
+            Attachment att;
+            att.localFilePath = attachmentPath;
+            att.fileName = fsAtt.filename().wstring();
+            att.mimeType = GuessMimeTypeWide(attachmentPath);
+            att.fileSize = std::filesystem::file_size(fsAtt, ec);
+            atts.push_back(std::move(att));
+        }
+
+        bool sentOk = false;
+        if (m_isClientMode) {
+            std::string resp;
+            if (!atts.empty()) {
+                std::string cmd = "SEND_MMS|" + HexEncode(WideToUtf8(phoneNumber)) + "|" +
+                                  HexEncode(WideToUtf8(text)) + "|" + HexEncode(WideToUtf8(attachmentPath)) + "\n";
+                sentOk = SendIpcCommand(cmd, &resp) && (resp.find("\"ok\"") != std::string::npos);
+            } else {
+                std::string cmd = "SEND_SMS|" + HexEncode(WideToUtf8(phoneNumber)) + "|" + HexEncode(WideToUtf8(text)) + "\n";
+                sentOk = SendIpcCommand(cmd, &resp) && (resp.find("\"ok\"") != std::string::npos);
+            }
+        } else {
+            sentOk = m_protocol.SendSms(DeviceInfo{}, phoneNumber, text, atts);
+        }
+
+        if (!sentOk) {
+            return false;
+        }
+
         Message msg;
         msg.id = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         msg.threadId = threadId;
@@ -1103,16 +1619,11 @@ namespace KDEConnect {
         msg.timestamp = msg.id;
         msg.isOutgoing = true;
         msg.isRead = true;
+        msg.attachments = std::move(atts);
 
         SaveMessageToDisk(msg);
         NotifyConversationsUpdated();
-
-        if (m_isClientMode) {
-            std::string cmd = "SEND_SMS|" + HexEncode(WideToUtf8(phoneNumber)) + "|" + HexEncode(WideToUtf8(text)) + "\n";
-            return SendIpcCommand(cmd);
-        }
-
-        return m_protocol.SendSms(DeviceInfo{}, phoneNumber, text);
+        return true;
     }
 
 } // namespace KDEConnect

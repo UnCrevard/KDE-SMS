@@ -31,8 +31,13 @@ namespace KDEConnect {
         bool RequestConversationsSync();
         bool RequestThreadSync(int64_t threadId);
 
-        // Send SMS to paired phone via protocol or daemon IPC
-        bool SendOutgoingSms(const std::wstring& phoneNumber, const std::wstring& text, int64_t preferredThreadId = -1);
+        // Send SMS or MMS (with optional image attachment) to paired phone via protocol or daemon IPC
+        bool SendOutgoingSms(
+            const std::wstring& phoneNumber,
+            const std::wstring& text,
+            int64_t preferredThreadId = -1,
+            const std::wstring& attachmentPath = L""
+        );
 
         // UI notification hook
         void SetOnConversationsUpdated(ConversationsUpdatedCallback cb);
@@ -48,6 +53,13 @@ namespace KDEConnect {
         void ReloadStorageDirectory();
 
     private:
+        struct CachedContact {
+            std::string uid;
+            int64_t timestamp = 0;
+            std::wstring name;
+            std::vector<std::wstring> phones;
+        };
+
         SmsDaemon();
         ~SmsDaemon();
 
@@ -56,9 +68,16 @@ namespace KDEConnect {
         void ProcessFolderChangeNotification();
         void HandleIncomingKdePacket(const DeviceInfo& device, const KDEPacket& packet);
         void SaveMessagesBatchToDisk(const std::vector<Message>& messages);
+        void WriteConversationJsonLocked(const Conversation& conv);
         void LoadAllConversationsFromDiskLocked();
         void LoadDeletedThreadsLocked();
         void SaveDeletedThreadsLocked();
+        void LoadContactsCacheLocked();
+        void SaveContactsCacheLocked();
+        void IndexContactLocked(const CachedContact& contact);
+        std::wstring ResolveSingleContactLocked(const std::wstring& rawAddress) const;
+        std::wstring ResolveContactNameForAddressLocked(const std::wstring& rawAddress) const;
+        bool ApplyContactsToConversationsLocked();
         bool SendIpcCommand(const std::string& command, std::string* outResponse = nullptr);
         void NotifyConversationsUpdated();
 
@@ -76,6 +95,9 @@ namespace KDEConnect {
         std::map<int64_t, Conversation> m_conversations;
         std::map<int64_t, int64_t> m_deletedThreads;
         std::set<int64_t> m_requestedThreads;
+        std::map<std::string, int64_t> m_contactUidTimestamps;
+        std::map<std::wstring, std::wstring> m_phoneToContactName;
+        std::map<std::string, CachedContact> m_contactsCache;
 
         std::mutex m_callbackMutex;
         ConversationsUpdatedCallback m_onConversationsUpdated;

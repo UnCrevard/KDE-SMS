@@ -3,6 +3,7 @@
 #include "direct2d_renderer.h"
 #include "toast_notifier.h"
 #include "daemon.h"
+#include <filesystem>
 
 using namespace KDEConnect;
 
@@ -20,6 +21,8 @@ static float g_sidebarWidth = 320.0f;
 static float g_sidebarScroll = 0.0f;
 static float g_threadScroll = 0.0f;
 static std::vector<BubbleLayout> g_currentBubbleLayouts;
+static std::wstring g_pendingAttachmentPath;
+static std::wstring g_pendingAttachmentName;
 
 // Network bind IP
 static std::wstring g_bindIp = L"";
@@ -122,7 +125,8 @@ static void ScrollThreadToBottom(HWND hwnd) {
     float totalWidth = static_cast<float>(rc.right - rc.left);
     float totalHeight = static_cast<float>(rc.bottom - rc.top);
     float threadWidth = std::max(200.0f, totalWidth - g_sidebarWidth);
-    float visibleThreadHeight = std::max(100.0f, totalHeight - 54.0f - 54.0f);
+    float extraBarH = g_pendingAttachmentName.empty() ? 0.0f : 30.0f;
+    float visibleThreadHeight = std::max(100.0f, totalHeight - 54.0f - 54.0f - extraBarH);
 
     float contentHeight = g_renderer.CalculateTotalThreadHeight(*active, threadWidth);
     g_threadScroll = std::max(0.0f, contentHeight - visibleThreadHeight);
@@ -313,20 +317,35 @@ void LayoutChildControls(HWND hwnd) {
     }
 }
 
+static void ClearPendingAttachment(HWND hwnd) {
+    g_pendingAttachmentPath.clear();
+    g_pendingAttachmentName.clear();
+    if (g_hwndAttachButton) {
+        SetWindowTextW(g_hwndAttachButton, L"📎");
+    }
+    if (hwnd) {
+        InvalidateRect(hwnd, nullptr, FALSE);
+    }
+}
+
 void OnSendMessage(HWND hwnd) {
     int length = GetWindowTextLengthW(g_hwndComposerEdit);
-    if (length <= 0) return;
+    std::wstring text;
+    if (length > 0) {
+        text.resize(length + 1, 0);
+        GetWindowTextW(g_hwndComposerEdit, &text[0], length + 1);
+        text.resize(length);
 
-    std::wstring text(length + 1, 0);
-    GetWindowTextW(g_hwndComposerEdit, &text[0], length + 1);
-    text.resize(length);
-
-    // Trim trailing CR/LF/whitespace
-    while (!text.empty() && (text.back() == L'\r' || text.back() == L'\n' || text.back() == L' ' || text.back() == L'\t')) {
-        text.pop_back();
+        // Trim trailing CR/LF/whitespace
+        while (!text.empty() && (text.back() == L'\r' || text.back() == L'\n' || text.back() == L' ' || text.back() == L'\t')) {
+            text.pop_back();
+        }
     }
-    if (text.empty()) {
-        SetWindowTextW(g_hwndComposerEdit, L"");
+
+    if (text.empty() && g_pendingAttachmentPath.empty()) {
+        if (length > 0) {
+            SetWindowTextW(g_hwndComposerEdit, L"");
+        }
         return;
     }
 
@@ -336,10 +355,20 @@ void OnSendMessage(HWND hwnd) {
     }
 
     // Send via daemon (host TLS or IPC to background daemon)
-    SmsDaemon::Instance().SendOutgoingSms(active->address, text, active->threadId);
+    bool sentOk = SmsDaemon::Instance().SendOutgoingSms(active->address, text, active->threadId, g_pendingAttachmentPath);
+    if (!sentOk) {
+        MessageBoxW(
+            hwnd,
+            L"Impossible d'envoyer le message ou l'image.\nVerifiez que le telephone est connecte et appaire, et que le fichier image est accessible.",
+            L"Echec d'envoi",
+            MB_OK | MB_ICONERROR
+        );
+        return;
+    }
 
-    // Clear composer edit box
+    // Clear composer edit box and pending image
     SetWindowTextW(g_hwndComposerEdit, L"");
+    ClearPendingAttachment(nullptr);
 
     // Reload conversation and scroll to newest bubble
     ReloadConversations(hwnd, true, true);
@@ -514,6 +543,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_threadScroll,
                     g_currentBubbleLayouts
                 );
+
+                if (!g_pendingAttachmentName.empty()) {
+                    g_renderer.RenderPendingAttachmentBar(
+                        g_sidebarWidth,
+                        threadWidth,
+                        totalHeight - composerH,
+                        g_pendingAttachmentName
+                    );
+                }
             } else {
                 g_lastEmptyStatus = SmsDaemon::Instance().GetConnectionStatusText();
                 std::wstring emptyMsg = L"Aucune conversation SMS chargee.\n\n"
@@ -608,6 +646,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_LBUTTONDOWN: {
             int x = GET_X_LPARAM(lParam);
             int y = GET_Y_LPARAM(lParam);
+
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            int width = rc.right - rc.left;
+            int height = rc.bottom - rc.top;
+
+            // Click on [x] button inside the pending attachment preview bar
+            if (!g_pendingAttachmentName.empty() &&
+                x >= width - 40 && x <= width - 6 &&
+                y >= height - 84 && y <= height - 54) {
+                ClearPendingAttachment(hwnd);
+                return 0;
+            }
 
             // Clicked inside sidebar list area (below 54px search bar)
             if (x < static_cast<int>(g_sidebarWidth) && y >= 54) {
@@ -727,11 +778,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     ofn.hwndOwner = hwnd;
                     ofn.lpstrFile = szFile;
                     ofn.nMaxFile = sizeof(szFile) / sizeof(wchar_t);
-                    ofn.lpstrFilter = L"Images (*.png;*.jpg;*.jpeg;*.gif)\0*.png;*.jpg;*.jpeg;*.gif\0All Files\0*.*\0";
+                    ofn.lpstrFilter = L"Images (*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp)\0*.png;*.jpg;*.jpeg;*.gif;*.webp;*.bmp\0Tous les fichiers (*.*)\0*.*\0";
                     ofn.nFilterIndex = 1;
-                    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+                    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_NOCHANGEDIR;
                     if (GetOpenFileNameW(&ofn)) {
-                        // Attach and prepare MMS preview
+                        g_pendingAttachmentPath = szFile;
+                        g_pendingAttachmentName = std::filesystem::path(szFile).filename().wstring();
+                        if (g_hwndAttachButton) {
+                            SetWindowTextW(g_hwndAttachButton, L"📎✓");
+                        }
+                        if (g_hwndComposerEdit) {
+                            SetFocus(g_hwndComposerEdit);
+                        }
+                        InvalidateRect(hwnd, nullptr, FALSE);
                     }
                     break;
                 }
@@ -789,8 +848,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR pCmd
     if (pCmdLine && wcslen(pCmdLine) > 0) {
         std::wstring cmd(pCmdLine);
         size_t ipPos = cmd.find(L"--ip");
-        if (ipPos == std::string::npos) ipPos = cmd.find(L"--bind");
-        if (ipPos != std::string::npos) {
+        if (ipPos == std::wstring::npos) ipPos = cmd.find(L"--bind");
+        if (ipPos != std::wstring::npos) {
             size_t space = cmd.find_first_of(L" \t", ipPos);
             if (space != std::string::npos) {
                 size_t valStart = cmd.find_first_not_of(L" \t", space);

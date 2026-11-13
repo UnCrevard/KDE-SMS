@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <fstream>
 #include <filesystem>
+#include <cctype>
+#include <cwctype>
 
 namespace KDEConnect {
 
@@ -129,6 +131,51 @@ namespace KDEConnect {
             if (ch != '\r') outLine.push_back(ch);
         }
         return false;
+    }
+
+    static std::string Base64EncodeBytes(const std::vector<uint8_t>& data) {
+        static const char kB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        std::string out;
+        out.reserve(((data.size() + 2) / 3) * 4);
+        size_t i = 0;
+        while (i + 2 < data.size()) {
+            uint32_t v = (static_cast<uint32_t>(data[i]) << 16) |
+                         (static_cast<uint32_t>(data[i + 1]) << 8) |
+                         static_cast<uint32_t>(data[i + 2]);
+            out.push_back(kB64[(v >> 18) & 0x3F]);
+            out.push_back(kB64[(v >> 12) & 0x3F]);
+            out.push_back(kB64[(v >> 6) & 0x3F]);
+            out.push_back(kB64[v & 0x3F]);
+            i += 3;
+        }
+        size_t rem = data.size() - i;
+        if (rem == 1) {
+            uint32_t v = static_cast<uint32_t>(data[i]) << 16;
+            out.push_back(kB64[(v >> 18) & 0x3F]);
+            out.push_back(kB64[(v >> 12) & 0x3F]);
+            out.push_back('=');
+            out.push_back('=');
+        } else if (rem == 2) {
+            uint32_t v = (static_cast<uint32_t>(data[i]) << 16) |
+                         (static_cast<uint32_t>(data[i + 1]) << 8);
+            out.push_back(kB64[(v >> 18) & 0x3F]);
+            out.push_back(kB64[(v >> 12) & 0x3F]);
+            out.push_back(kB64[(v >> 6) & 0x3F]);
+            out.push_back('=');
+        }
+        return out;
+    }
+
+    static std::string GuessMimeTypeFromPath(const std::wstring& filePath) {
+        std::wstring ext = std::filesystem::path(filePath).extension().wstring();
+        for (auto& ch : ext) ch = static_cast<wchar_t>(::towlower(ch));
+        if (ext == L".jpg" || ext == L".jpeg") return "image/jpeg";
+        if (ext == L".png") return "image/png";
+        if (ext == L".gif") return "image/gif";
+        if (ext == L".webp") return "image/webp";
+        if (ext == L".bmp") return "image/bmp";
+        if (ext == L".heic") return "image/heic";
+        return "application/octet-stream";
     }
 
     std::string KDEPacket::Serialize() const {
@@ -883,6 +930,8 @@ namespace KDEConnect {
            << "\"kdeconnect.sms\","
            << "\"kdeconnect.sms.messages\","
            << "\"kdeconnect.sms.attachment_file\","
+           << "\"kdeconnect.contacts.response_uids_timestamps\","
+           << "\"kdeconnect.contacts.response_vcards\","
            << "\"kdeconnect.battery\""
            << "],"
            << "\"outgoingCapabilities\":["
@@ -890,7 +939,10 @@ namespace KDEConnect {
            << "\"kdeconnect.sms.request\","
            << "\"kdeconnect.sms.request_conversations\","
            << "\"kdeconnect.sms.request_conversation\","
-           << "\"kdeconnect.sms.request_attachment\""
+           << "\"kdeconnect.sms.request_attachment\","
+           << "\"kdeconnect.sms.delete_conversation\","
+           << "\"kdeconnect.contacts.request_all_uids_timestamps\","
+           << "\"kdeconnect.contacts.request_vcards_by_uid\""
            << "]"
            << "}";
         pkt.bodyJson = ss.str();
@@ -1264,7 +1316,9 @@ namespace KDEConnect {
                         pingReply.type = "kdeconnect.ping";
                         pingReply.bodyJson = "{}";
                         TlsSendAll(*session, pingReply.Serialize());
-                    } else if (pkt.type.rfind("kdeconnect.sms", 0) == 0 || pkt.type == "kdeconnect.telephony") {
+                    } else if (pkt.type.rfind("kdeconnect.sms", 0) == 0 ||
+                               pkt.type.rfind("kdeconnect.contacts", 0) == 0 ||
+                               pkt.type == "kdeconnect.telephony") {
                         if (!dev.isPaired) {
                             MarkDevicePaired(dev.deviceId, true);
                             dev.isPaired = true;
@@ -1478,7 +1532,51 @@ namespace KDEConnect {
         return SendPacket(device, pkt);
     }
 
-    bool ProtocolHandler::SendSms(const DeviceInfo& device, const std::wstring& phoneNumber, const std::wstring& text) {
+    bool ProtocolHandler::RequestDeleteConversation(const DeviceInfo& device, int64_t threadId) {
+        if (threadId <= 0) return false;
+        KDEPacket pkt;
+        pkt.id = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        pkt.type = "kdeconnect.sms.delete_conversation";
+        std::ostringstream ss;
+        ss << "{\"threadID\":" << threadId << "}";
+        pkt.bodyJson = ss.str();
+        bool sent = SendPacket(device, pkt);
+        if (sent) {
+            std::wcout << L"[SMS Delete] Ordre de suppression envoye pour thread " << threadId << std::endl;
+        }
+        return sent;
+    }
+
+    bool ProtocolHandler::RequestAllContacts(const DeviceInfo& device) {
+        KDEPacket pkt;
+        pkt.id = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        pkt.type = "kdeconnect.contacts.request_all_uids_timestamps";
+        pkt.bodyJson = "{}";
+        return SendPacket(device, pkt);
+    }
+
+    bool ProtocolHandler::RequestContactsVcards(const DeviceInfo& device, const std::vector<std::string>& uids) {
+        if (uids.empty()) return true;
+        KDEPacket pkt;
+        pkt.id = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        pkt.type = "kdeconnect.contacts.request_vcards_by_uid";
+        std::ostringstream ss;
+        ss << "{\"uids\":[";
+        for (size_t i = 0; i < uids.size(); ++i) {
+            if (i > 0) ss << ",";
+            ss << "\"" << EscapeJsonString(uids[i]) << "\"";
+        }
+        ss << "]}";
+        pkt.bodyJson = ss.str();
+        return SendPacket(device, pkt);
+    }
+
+    bool ProtocolHandler::SendSms(
+        const DeviceInfo& device,
+        const std::wstring& phoneNumber,
+        const std::wstring& text,
+        const std::vector<Attachment>& attachments
+    ) {
         KDEPacket pkt;
         pkt.id = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         pkt.type = "kdeconnect.sms.request";
@@ -1486,16 +1584,64 @@ namespace KDEConnect {
         std::string escapedPhone = EscapeJsonString(WideToUtf8(phoneNumber));
         std::string escapedBody = EscapeJsonString(WideToUtf8(text));
 
+        std::ostringstream attStream;
+        bool hasAnyAttachment = false;
+        if (!attachments.empty()) {
+            attStream << "[";
+            for (const auto& att : attachments) {
+                if (att.localFilePath.empty()) continue;
+                std::filesystem::path fsPath(att.localFilePath);
+                std::ifstream file(fsPath, std::ios::in | std::ios::binary | std::ios::ate);
+                if (!file.is_open()) {
+                    std::wcerr << L"[ERREUR MMS] Impossible d'ouvrir l'image: " << att.localFilePath << std::endl;
+                    return false;
+                }
+                std::streamsize sz = file.tellg();
+                if (sz <= 0 || sz > 20 * 1024 * 1024) {
+                    std::wcerr << L"[ERREUR MMS] Taille de fichier invalide (" << sz << L" octets)." << std::endl;
+                    return false;
+                }
+                file.seekg(0, std::ios::beg);
+                std::vector<uint8_t> rawBytes(static_cast<size_t>(sz));
+                if (!file.read(reinterpret_cast<char*>(rawBytes.data()), sz)) {
+                    std::wcerr << L"[ERREUR MMS] Echec de lecture du fichier: " << att.localFilePath << std::endl;
+                    return false;
+                }
+
+                std::wstring fileName = att.fileName.empty() ? fsPath.filename().wstring() : att.fileName;
+                std::string mimeType = att.mimeType.empty() ? GuessMimeTypeFromPath(att.localFilePath) : WideToUtf8(att.mimeType);
+                std::string b64 = Base64EncodeBytes(rawBytes);
+
+                if (hasAnyAttachment) attStream << ",";
+                attStream << "{"
+                          << "\"fileName\":\"" << EscapeJsonString(WideToUtf8(fileName)) << "\","
+                          << "\"base64EncodedFile\":\"" << b64 << "\","
+                          << "\"mimeType\":\"" << EscapeJsonString(mimeType) << "\""
+                          << "}";
+                hasAnyAttachment = true;
+            }
+            attStream << "]";
+        }
+
         std::ostringstream ss;
         ss << "{"
            << "\"sendSms\":true,"
            << "\"phoneNumber\":\"" << escapedPhone << "\","
            << "\"addresses\":[{\"address\":\"" << escapedPhone << "\"}],"
-           << "\"messageBody\":\"" << escapedBody << "\","
+           << "\"messageBody\":\"" << escapedBody << "\"";
+        if (hasAnyAttachment) {
+            ss << ",\"attachments\":" << attStream.str();
+        }
+        ss << ",\"subID\":-1,"
            << "\"version\":2"
            << "}";
         pkt.bodyJson = ss.str();
-        return SendPacket(device, pkt);
+
+        bool ok = SendPacket(device, pkt);
+        if (hasAnyAttachment) {
+            std::wcout << (ok ? L"[MMS Envoye] " : L"[ERREUR MMS] Echec envoi ") << phoneNumber << std::endl;
+        }
+        return ok;
     }
 
 } // namespace KDEConnect

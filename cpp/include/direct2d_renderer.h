@@ -47,6 +47,13 @@ namespace KDEConnect {
             std::vector<BubbleLayout>& outBubbleLayouts
         );
 
+        void RenderPendingAttachmentBar(
+            float startX,
+            float width,
+            float composerTopY,
+            const std::wstring& attachmentName
+        );
+
         void RenderEmptyState(float startX, float width, float height, const std::wstring& message);
 
         // Attachment image management

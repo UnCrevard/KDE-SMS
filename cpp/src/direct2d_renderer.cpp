@@ -531,6 +531,35 @@ namespace KDEConnect {
         m_renderTarget->PopAxisAlignedClip();
     }
 
+    void Direct2DRenderer::RenderPendingAttachmentBar(
+        float startX,
+        float width,
+        float composerTopY,
+        const std::wstring& attachmentName
+    ) {
+        if (!m_renderTarget || attachmentName.empty()) return;
+
+        float barH = 30.0f;
+        float topY = composerTopY - barH;
+        D2D1_RECT_F barRect = D2D1::RectF(startX, topY, startX + width, composerTopY);
+        m_renderTarget->FillRectangle(barRect, m_brushSidebarSelected);
+        m_renderTarget->DrawLine(D2D1::Point2F(startX, topY), D2D1::Point2F(startX + width, topY), m_brushDivider, 1.0f);
+
+        std::wstring label = L"📎 Image prete a envoyer : " + attachmentName;
+        D2D1_RECT_F textRect = D2D1::RectF(startX + 16.0f, topY + 5.0f, startX + width - 44.0f, composerTopY - 4.0f);
+        m_renderTarget->DrawText(
+            label.c_str(),
+            static_cast<UINT32>(label.length()),
+            m_fontCaption,
+            textRect,
+            m_brushTextPrimary,
+            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT
+        );
+
+        D2D1_RECT_F clearRect = D2D1::RectF(startX + width - 34.0f, topY + 4.0f, startX + width - 10.0f, composerTopY - 4.0f);
+        m_renderTarget->DrawText(L"×", 1, m_fontHeading, clearRect, m_brushTextSecondary);
+    }
+
     void Direct2DRenderer::RenderEmptyState(float startX, float width, float height, const std::wstring& message) {
         if (!m_renderTarget) return;
 
@@ -558,7 +587,15 @@ namespace KDEConnect {
             float bubbleH = std::max(textH + 30.0f, 46.0f);
 
             if (!msg.attachments.empty()) {
-                bubbleH += 180.0f; // estimated image preview height
+                ID2D1Bitmap* bmp = LoadImageFromFile(msg.attachments[0].localFilePath);
+                if (bmp) {
+                    D2D1_SIZE_F imgSize = bmp->GetSize();
+                    float imgW = std::min(imgSize.width, maxBubbleWidth - 20.0f);
+                    float imgH = std::min(imgSize.height * (imgW / std::max(1.0f, imgSize.width)), 280.0f);
+                    bubbleH += imgH + 10.0f;
+                } else {
+                    bubbleH += 180.0f;
+                }
             }
 
             totalHeight += bubbleH + 12.0f;

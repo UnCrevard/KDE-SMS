@@ -46,10 +46,14 @@ namespace KDEConnect {
         bool SendPacket(const DeviceInfo& device, const KDEPacket& packet);
         bool SendPairRequest(const DeviceInfo& device);
 
-        // High-level SMS commands
+        // High-level SMS & Contacts commands
         bool RequestAllConversations(const DeviceInfo& device = DeviceInfo{});
         bool RequestConversationMessages(const DeviceInfo& device, int64_t threadId, int64_t rangeStart = -1);
-        bool SendSms(const DeviceInfo& device, const std::wstring& phoneNumber, const std::wstring& text);
+        bool RequestDeleteConversation(const DeviceInfo& device, int64_t threadId);
+        bool SendSms(const DeviceInfo& device, const std::wstring& phoneNumber, const std::wstring& text, const std::vector<Attachment>& attachments = {});
+
+        bool RequestAllContacts(const DeviceInfo& device = DeviceInfo{});
+        bool RequestContactsVcards(const DeviceInfo& device, const std::vector<std::string>& uids);
 
         void SetOnPacketReceived(PacketCallback cb) { m_onPacketReceived = cb; }
         void SetOnDeviceDiscovered(DeviceDiscoveredCallback cb) { m_onDeviceDiscovered = cb; }
