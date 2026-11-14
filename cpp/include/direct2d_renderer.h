@@ -69,6 +69,13 @@ namespace KDEConnect {
         HRESULT CreateDeviceIndependentResources();
         HRESULT CreateDeviceResources();
         void UpdateBrushes(const ThemeColors& colors);
+        void DrawAvatarCircle(
+            float centerX,
+            float centerY,
+            float radius,
+            const std::wstring& avatarPath,
+            const std::wstring& fallbackName
+        );
 
         HWND m_hwnd = nullptr;
         ID2D1Factory1* m_d2dFactory = nullptr;

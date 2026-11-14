@@ -75,6 +75,7 @@ static UINT g_msgTaskbarCreated = 0;
 #define IDC_SET_STARTHIDDEN_CHK  3011
 #define IDC_SET_SAVE_BTN         3012
 #define IDC_SET_CANCEL_BTN       3013
+#define IDC_SET_SKIPDEL_CHK      3014
 
 // Forward declarations
 void OnSendMessage(HWND hwnd);
@@ -156,7 +157,7 @@ static std::wstring NormalizePhoneSuffixLocal(const std::wstring& phone) {
 static bool ContactsSnapshotEqual(const std::vector<ContactSummary>& a, const std::vector<ContactSummary>& b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
-        if (a[i].name != b[i].name || a[i].phone != b[i].phone) {
+        if (a[i].name != b[i].name || a[i].phone != b[i].phone || a[i].avatarPath != b[i].avatarPath) {
             return false;
         }
     }
@@ -170,6 +171,7 @@ static bool ConversationsSnapshotEqual(const std::vector<Conversation>& a, const
             a[i].lastTimestamp != b[i].lastTimestamp ||
             a[i].messages.size() != b[i].messages.size() ||
             a[i].contactName != b[i].contactName ||
+            a[i].avatarPath != b[i].avatarPath ||
             a[i].snippet != b[i].snippet) {
             return false;
         }
@@ -262,6 +264,7 @@ static void ApplySearchFilter() {
         contactEntry.threadId = -100000 - static_cast<int64_t>(i);
         contactEntry.contactName = c.name;
         contactEntry.address = c.phone;
+        contactEntry.avatarPath = c.avatarPath;
         contactEntry.snippet = L"Contact \u00B7 " + c.phone;
         contactEntry.lastTimestamp = 0;
         g_visibleConversations.push_back(std::move(contactEntry));
@@ -335,7 +338,8 @@ static void PerformDeleteConversation(HWND hwnd, int idx, bool askConfirm) {
     Conversation target = g_visibleConversations[idx];
     if (target.threadId <= 0) return;
 
-    if (askConfirm) {
+    bool skipConfirm = (ReadIniInt(L"App", L"SkipDeleteConfirmation", 0) != 0);
+    if (askConfirm && !skipConfirm) {
         std::wstring label = target.contactName.empty() ? target.address : target.contactName;
         std::wstring prompt = L"Effacer la conversation avec \"" + label + L"\" de la liste ?";
         if (MessageBoxW(hwnd, prompt.c_str(), L"Supprimer la conversation", MB_YESNO | MB_ICONQUESTION) != IDYES) {
@@ -432,6 +436,7 @@ struct SettingsModalState {
     HWND minTrayChk = nullptr;
     HWND notifyChk = nullptr;
     HWND startHiddenChk = nullptr;
+    HWND skipDeleteChk = nullptr;
 
     std::vector<std::wstring> bindIpValues;
     std::vector<int> syncSecValues;
@@ -445,6 +450,7 @@ struct SettingsModalState {
     int resMinToTray = 1;
     int resEnableNotifs = 1;
     int resStartHidden = 0;
+    int resSkipDeleteConfirm = 0;
 
     bool saved = false;
     bool closed = false;
@@ -512,6 +518,7 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 st->resMinToTray = (SendMessageW(st->minTrayChk, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
                 st->resEnableNotifs = (SendMessageW(st->notifyChk, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
                 st->resStartHidden = (SendMessageW(st->startHiddenChk, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
+                st->resSkipDeleteConfirm = (SendMessageW(st->skipDeleteChk, BM_GETCHECK, 0, 0) == BST_CHECKED) ? 1 : 0;
 
                 st->saved = true;
                 st->closed = true;
@@ -564,7 +571,7 @@ void ShowSettingsDialog(HWND parent) {
     }
 
     const int clientW = 540;
-    const int clientH = 514;
+    const int clientH = 540;
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     RECT winRc{ 0, 0, clientW, clientH };
     AdjustWindowRectEx(&winRc, style, FALSE, 0);
@@ -642,7 +649,7 @@ void ShowSettingsDialog(HWND parent) {
     state.devNameEdit = addCtrl(L"EDIT", GetConfiguredDeviceName().c_str(), ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 32, 248, 476, 24, IDC_SET_DEVNAME_EDIT);
 
     // Group 3: Application preferences
-    addCtrl(L"BUTTON", L"Reglages de l'application", BS_GROUPBOX, 0, 18, 292, 504, 166, 0);
+    addCtrl(L"BUTTON", L"Reglages de l'application", BS_GROUPBOX, 0, 18, 292, 504, 192, 0);
 
     addCtrl(L"STATIC", L"Theme de l'interface :", 0, 0, 32, 316, 170, 20, 0);
     state.themeCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 210, 313, 298, 140, IDC_SET_THEME_COMBO);
@@ -681,10 +688,13 @@ void ShowSettingsDialog(HWND parent) {
     state.startHiddenChk = addCtrl(L"BUTTON", L"Demarrer l'application reduite dans la zone de notification", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 430, 476, 22, IDC_SET_STARTHIDDEN_CHK);
     SendMessageW(state.startHiddenChk, BM_SETCHECK, ReadIniInt(L"App", L"StartHidden", 0) != 0 ? BST_CHECKED : BST_UNCHECKED, 0);
 
+    state.skipDeleteChk = addCtrl(L"BUTTON", L"Ne pas demander de confirmation lors de la suppression d'une conversation", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 456, 476, 22, IDC_SET_SKIPDEL_CHK);
+    SendMessageW(state.skipDeleteChk, BM_SETCHECK, ReadIniInt(L"App", L"SkipDeleteConfirmation", 0) != 0 ? BST_CHECKED : BST_UNCHECKED, 0);
+
     // Bottom status & actions
-    addCtrl(L"STATIC", L"Fichier INI : KDEConnectSMS.ini", 0, 0, 18, 475, 290, 20, 0);
-    addCtrl(L"BUTTON", L"Enregistrer", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 316, 469, 100, 30, IDC_SET_SAVE_BTN);
-    addCtrl(L"BUTTON", L"Annuler", BS_PUSHBUTTON | WS_TABSTOP, 0, 422, 469, 100, 30, IDC_SET_CANCEL_BTN);
+    addCtrl(L"STATIC", L"Fichier INI : KDEConnectSMS.ini", 0, 0, 18, 501, 290, 20, 0);
+    addCtrl(L"BUTTON", L"Enregistrer", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 316, 495, 100, 30, IDC_SET_SAVE_BTN);
+    addCtrl(L"BUTTON", L"Annuler", BS_PUSHBUTTON | WS_TABSTOP, 0, 422, 495, 100, 30, IDC_SET_CANCEL_BTN);
 
     if (parent) EnableWindow(parent, FALSE);
     ShowWindow(hDlg, SW_SHOW);
@@ -726,6 +736,7 @@ void ShowSettingsDialog(HWND parent) {
         WriteIniInt(L"App", L"MinimizeToTrayOnClose", state.resMinToTray);
         WriteIniInt(L"App", L"EnableNotifications", state.resEnableNotifs);
         WriteIniInt(L"App", L"StartHidden", state.resStartHidden);
+        WriteIniInt(L"App", L"SkipDeleteConfirmation", state.resSkipDeleteConfirm);
 
         ThemeManager::Instance().SetMode(state.resThemeMode);
         if (parent) {

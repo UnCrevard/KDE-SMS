@@ -60,6 +60,7 @@ namespace KDEConnect {
             int64_t timestamp = 0;
             std::wstring name;
             std::vector<std::wstring> phones;
+            std::wstring avatarPath;
         };
 
         SmsDaemon();
@@ -80,6 +81,8 @@ namespace KDEConnect {
         void IndexContactLocked(const CachedContact& contact);
         std::wstring ResolveSingleContactLocked(const std::wstring& rawAddress) const;
         std::wstring ResolveContactNameForAddressLocked(const std::wstring& rawAddress) const;
+        std::wstring ResolveSingleAvatarLocked(const std::wstring& rawAddress) const;
+        std::wstring ResolveAvatarForAddressLocked(const std::wstring& rawAddress) const;
         bool ApplyContactsToConversationsLocked();
         bool SendIpcCommand(const std::string& command, std::string* outResponse = nullptr);
         void NotifyConversationsUpdated();
@@ -101,6 +104,7 @@ namespace KDEConnect {
         std::set<int64_t> m_requestedThreads;
         std::map<std::string, int64_t> m_contactUidTimestamps;
         std::map<std::wstring, std::wstring> m_phoneToContactName;
+        std::map<std::wstring, std::wstring> m_phoneToAvatarPath;
         std::map<std::string, CachedContact> m_contactsCache;
 
         std::mutex m_notifyMutex;

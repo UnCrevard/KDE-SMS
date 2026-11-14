@@ -271,6 +271,53 @@ namespace KDEConnect {
         return metrics.height;
     }
 
+    void Direct2DRenderer::DrawAvatarCircle(
+        float centerX,
+        float centerY,
+        float radius,
+        const std::wstring& avatarPath,
+        const std::wstring& fallbackName
+    ) {
+        if (!m_renderTarget) return;
+        D2D1_ELLIPSE avatarEllipse = D2D1::Ellipse(D2D1::Point2F(centerX, centerY), radius, radius);
+
+        ID2D1Bitmap* avatarBitmap = LoadImageFromFile(avatarPath);
+        if (avatarBitmap) {
+            D2D1_SIZE_F bmpSize = avatarBitmap->GetSize();
+            if (bmpSize.width > 0.0f && bmpSize.height > 0.0f) {
+                float diam = radius * 2.0f;
+                float scale = std::max(diam / bmpSize.width, diam / bmpSize.height);
+                float scaledW = bmpSize.width * scale;
+                float scaledH = bmpSize.height * scale;
+                float ox = centerX - scaledW * 0.5f;
+                float oy = centerY - scaledH * 0.5f;
+
+                D2D1_BITMAP_BRUSH_PROPERTIES bbp = D2D1::BitmapBrushProperties(
+                    D2D1_EXTEND_MODE_CLAMP,
+                    D2D1_EXTEND_MODE_CLAMP,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR
+                );
+                ID2D1BitmapBrush* bitmapBrush = nullptr;
+                if (SUCCEEDED(m_renderTarget->CreateBitmapBrush(avatarBitmap, &bbp, nullptr, &bitmapBrush)) && bitmapBrush) {
+                    bitmapBrush->SetTransform(
+                        D2D1::Matrix3x2F::Scale(scale, scale) * D2D1::Matrix3x2F::Translation(ox, oy)
+                    );
+                    m_renderTarget->FillEllipse(avatarEllipse, bitmapBrush);
+                    m_renderTarget->DrawEllipse(avatarEllipse, m_brushDivider, 1.0f);
+                    bitmapBrush->Release();
+                    return;
+                }
+            }
+        }
+
+        // Fallback initial letter inside themed circle
+        m_renderTarget->FillEllipse(avatarEllipse, m_brushDivider);
+        std::wstring initial = fallbackName.empty() ? L"#" : fallbackName.substr(0, 1);
+        std::transform(initial.begin(), initial.end(), initial.begin(), ::towupper);
+        D2D1_RECT_F avatarTextRect = D2D1::RectF(centerX - 6.0f, centerY - 10.0f, centerX + radius, centerY + 10.0f);
+        m_renderTarget->DrawText(initial.c_str(), static_cast<UINT32>(initial.length()), m_fontBodyBold, avatarTextRect, m_brushTextPrimary);
+    }
+
     void Direct2DRenderer::RenderSidebar(
         const std::vector<Conversation>& conversations,
         int64_t selectedThreadId,
@@ -311,18 +358,12 @@ namespace KDEConnect {
                     m_renderTarget->FillRectangle(itemRect, m_brushSidebarHover);
                 }
 
-                // Avatar circle
+                // Avatar circle (contact photo if synced, otherwise initial)
                 float avatarX = 18.0f;
                 float avatarY = currentY + itemHeight / 2.0f;
                 float avatarRadius = 18.0f;
-                D2D1_ELLIPSE avatarEllipse = D2D1::Ellipse(D2D1::Point2F(avatarX + avatarRadius, avatarY), avatarRadius, avatarRadius);
-                m_renderTarget->FillEllipse(avatarEllipse, m_brushDivider);
-
-                // Avatar initial letter
-                std::wstring initial = conv.contactName.empty() ? L"#" : conv.contactName.substr(0, 1);
-                std::transform(initial.begin(), initial.end(), initial.begin(), ::towupper);
-                D2D1_RECT_F avatarTextRect = D2D1::RectF(avatarX + 11.0f, avatarY - 10.0f, avatarX + avatarRadius * 2.0f, avatarY + 10.0f);
-                m_renderTarget->DrawText(initial.c_str(), static_cast<UINT32>(initial.length()), m_fontBodyBold, avatarTextRect, m_brushTextPrimary);
+                std::wstring avatarFallback = conv.contactName.empty() ? conv.address : conv.contactName;
+                DrawAvatarCircle(avatarX + avatarRadius, avatarY, avatarRadius, conv.avatarPath, avatarFallback);
 
                 // Contact Name / Number
                 float textStartX = avatarX + avatarRadius * 2.0f + 12.0f;
@@ -409,10 +450,11 @@ namespace KDEConnect {
         m_renderTarget->DrawLine(D2D1::Point2F(startX, headerH), D2D1::Point2F(startX + width, headerH), m_brushDivider, 1.0f);
 
         std::wstring title = conversation.contactName.empty() ? conversation.address : conversation.contactName;
+        DrawAvatarCircle(startX + 36.0f, headerH * 0.5f, 17.0f, conversation.avatarPath, title);
         if (!conversation.address.empty() && conversation.contactName != conversation.address) {
             title += L"  (" + conversation.address + L")";
         }
-        D2D1_RECT_F titleRect = D2D1::RectF(startX + 20.0f, 15.0f, startX + width - 190.0f, 40.0f);
+        D2D1_RECT_F titleRect = D2D1::RectF(startX + 64.0f, 15.0f, startX + width - 190.0f, 40.0f);
         m_renderTarget->DrawText(title.c_str(), static_cast<UINT32>(title.length()), m_fontHeading, titleRect, m_brushTextPrimary);
 
         // Background of message panel

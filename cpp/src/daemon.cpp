@@ -434,6 +434,87 @@ namespace KDEConnect {
             return out;
         }
 
+        std::wstring DetectImageExtFromBytes(const std::vector<uint8_t>& bytes, const std::string& upperHeader) {
+            if (bytes.size() >= 8 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47) {
+                return L".png";
+            }
+            if (bytes.size() >= 4 && bytes[0] == 'G' && bytes[1] == 'I' && bytes[2] == 'F') {
+                return L".gif";
+            }
+            if (bytes.size() >= 12 && bytes[0] == 'R' && bytes[1] == 'I' && bytes[2] == 'F' && bytes[3] == 'F' &&
+                bytes[8] == 'W' && bytes[9] == 'E' && bytes[10] == 'B' && bytes[11] == 'P') {
+                return L".webp";
+            }
+            if (bytes.size() >= 2 && bytes[0] == 'B' && bytes[1] == 'M') {
+                return L".bmp";
+            }
+            if (bytes.size() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) {
+                return L".jpg";
+            }
+            if (upperHeader.find("PNG") != std::string::npos) return L".png";
+            if (upperHeader.find("GIF") != std::string::npos) return L".gif";
+            if (upperHeader.find("WEBP") != std::string::npos) return L".webp";
+            return L".jpg";
+        }
+
+        std::wstring SaveContactAvatarToDisk(const std::string& uid, const std::vector<uint8_t>& bytes, const std::wstring& ext) {
+            if (bytes.size() < 32) return L"";
+            std::wstring avatarDir = GetAppDataDirectory() + L"\\ContactAvatars";
+            SHCreateDirectoryExW(nullptr, avatarDir.c_str(), nullptr);
+
+            std::wstring safeUid;
+            for (unsigned char ch : uid) {
+                if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-') {
+                    safeUid.push_back(static_cast<wchar_t>(ch));
+                }
+            }
+            if (safeUid.empty()) {
+                safeUid = Utf8ToWide(HexEncode(uid));
+            }
+            if (safeUid.size() > 48) {
+                safeUid.resize(48);
+            }
+
+            uint32_t hash = 2166136261u;
+            for (uint8_t b : bytes) {
+                hash ^= b;
+                hash *= 16777619u;
+            }
+            wchar_t hexBuf[9]{};
+            static const wchar_t* kHexDigits = L"0123456789abcdef";
+            for (int shift = 28, idx = 0; shift >= 0; shift -= 4, ++idx) {
+                hexBuf[idx] = kHexDigits[(hash >> shift) & 0x0Fu];
+            }
+
+            std::wstring prefix = L"avatar_" + safeUid + L"_";
+            std::wstring fileName = prefix + hexBuf + (ext.empty() ? L".jpg" : ext);
+            std::wstring destPath = avatarDir + L"\\" + fileName;
+
+            try {
+                std::error_code ec;
+                if (!std::filesystem::exists(std::filesystem::path(destPath), ec)) {
+                    for (const auto& entry : std::filesystem::directory_iterator(std::filesystem::path(avatarDir), ec)) {
+                        if (!entry.is_regular_file(ec)) continue;
+                        std::wstring existingName = entry.path().filename().wstring();
+                        if (existingName.rfind(prefix, 0) == 0 && existingName != fileName) {
+                            std::filesystem::remove(entry.path(), ec);
+                        }
+                    }
+                    std::ofstream out(std::filesystem::path(destPath), std::ios::out | std::ios::binary | std::ios::trunc);
+                    if (out.is_open()) {
+                        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+                        out.close();
+                    }
+                }
+                if (std::filesystem::exists(std::filesystem::path(destPath), ec)) {
+                    return destPath;
+                }
+            } catch (...) {
+                return L"";
+            }
+            return L"";
+        }
+
         bool HeaderHasQuotedPrintable(const std::string& line) {
             size_t colonPos = line.find(':');
             if (colonPos == std::string::npos) return false;
@@ -442,9 +523,17 @@ namespace KDEConnect {
             return upperHdr.find("QUOTED-PRINTABLE") != std::string::npos;
         }
 
-        void ParseVCardFields(const std::string& vcardRaw, std::wstring& outName, std::vector<std::wstring>& outPhones) {
+        void ParseVCardFields(
+            const std::string& vcardRaw,
+            std::wstring& outName,
+            std::vector<std::wstring>& outPhones,
+            std::vector<uint8_t>* outPhotoBytes = nullptr,
+            std::wstring* outPhotoExt = nullptr
+        ) {
             outName.clear();
             outPhones.clear();
+            if (outPhotoBytes) outPhotoBytes->clear();
+            if (outPhotoExt) outPhotoExt->clear();
 
             // Normalize CRLF -> LF first
             std::string normalized;
@@ -540,6 +629,22 @@ namespace KDEConnect {
                     }
                     if (!cleanTel.empty()) {
                         outPhones.push_back(VCardBytesToWide(cleanTel, preferLatin1));
+                    }
+                } else if (propName == "PHOTO" && outPhotoBytes && outPhotoBytes->empty()) {
+                    std::string lowerVal = value;
+                    for (char& ch : lowerVal) ch = static_cast<char>(::tolower(static_cast<unsigned char>(ch)));
+                    size_t b64Pos = lowerVal.find("base64,");
+                    bool hasBase64Hdr = (upperHeader.find("BASE64") != std::string::npos ||
+                                         upperHeader.find("ENCODING=B") != std::string::npos);
+                    if (b64Pos != std::string::npos || hasBase64Hdr) {
+                        std::string b64Slice = (b64Pos != std::string::npos) ? value.substr(b64Pos + 7) : value;
+                        std::vector<uint8_t> decoded = Base64DecodeBytes(b64Slice);
+                        if (decoded.size() >= 32) {
+                            if (outPhotoExt) {
+                                *outPhotoExt = DetectImageExtFromBytes(decoded, upperHeader);
+                            }
+                            *outPhotoBytes = std::move(decoded);
+                        }
                     }
                 }
             }
@@ -1287,6 +1392,7 @@ namespace KDEConnect {
             }
         } else if (packet.type == "kdeconnect.contacts.response_vcards") {
             size_t addedCount = 0;
+            size_t avatarCount = 0;
             bool anyConversationUpdated = false;
             {
                 std::lock_guard<std::mutex> lock(m_storageMutex);
@@ -1298,8 +1404,15 @@ namespace KDEConnect {
                     contact.uid = key;
                     auto tsIt = m_contactUidTimestamps.find(key);
                     contact.timestamp = (tsIt != m_contactUidTimestamps.end()) ? tsIt->second : 0;
-                    ParseVCardFields(rawVCard, contact.name, contact.phones);
+
+                    std::vector<uint8_t> photoBytes;
+                    std::wstring photoExt;
+                    ParseVCardFields(rawVCard, contact.name, contact.phones, &photoBytes, &photoExt);
                     if (!contact.name.empty() && !contact.phones.empty()) {
+                        if (!photoBytes.empty()) {
+                            contact.avatarPath = SaveContactAvatarToDisk(contact.uid, photoBytes, photoExt);
+                            if (!contact.avatarPath.empty()) avatarCount++;
+                        }
                         m_contactsCache[contact.uid] = contact;
                         IndexContactLocked(contact);
                         addedCount++;
@@ -1312,7 +1425,8 @@ namespace KDEConnect {
                 }
             }
 
-            std::wcout << L"[Contacts Sync] " << addedCount << L" vCard(s) contact(s) importee(s)." << std::endl;
+            std::wcout << L"[Contacts Sync] " << addedCount << L" vCard(s) contact(s) importee(s), "
+                       << avatarCount << L" photo(s) avatar." << std::endl;
             if (addedCount > 0 || anyConversationUpdated) {
                 NotifyConversationsUpdated();
             }
@@ -1380,9 +1494,15 @@ namespace KDEConnect {
             std::wstring digits = NormalizePhoneDigits(phone);
             if (digits.empty()) continue;
             m_phoneToContactName[L"exact:" + digits] = contact.name;
+            if (!contact.avatarPath.empty()) {
+                m_phoneToAvatarPath[L"exact:" + digits] = contact.avatarPath;
+            }
             if (digits.size() >= 8) {
                 std::wstring suf = digits.size() > 9 ? digits.substr(digits.size() - 9) : digits;
                 m_phoneToContactName[L"suf:" + suf] = contact.name;
+                if (!contact.avatarPath.empty()) {
+                    m_phoneToAvatarPath[L"suf:" + suf] = contact.avatarPath;
+                }
             }
         }
     }
@@ -1423,10 +1543,43 @@ namespace KDEConnect {
         return anyResolved ? combined : L"";
     }
 
+    std::wstring SmsDaemon::ResolveSingleAvatarLocked(const std::wstring& rawAddress) const {
+        std::wstring digits = NormalizePhoneDigits(rawAddress);
+        if (digits.empty()) return L"";
+        auto itExact = m_phoneToAvatarPath.find(L"exact:" + digits);
+        if (itExact != m_phoneToAvatarPath.end()) return itExact->second;
+        if (digits.size() >= 8) {
+            std::wstring suf = digits.size() > 9 ? digits.substr(digits.size() - 9) : digits;
+            auto itSuf = m_phoneToAvatarPath.find(L"suf:" + suf);
+            if (itSuf != m_phoneToAvatarPath.end()) return itSuf->second;
+        }
+        return L"";
+    }
+
+    std::wstring SmsDaemon::ResolveAvatarForAddressLocked(const std::wstring& rawAddress) const {
+        if (rawAddress.empty()) return L"";
+        if (rawAddress.find_first_of(L",;") == std::wstring::npos) {
+            return ResolveSingleAvatarLocked(rawAddress);
+        }
+        size_t start = 0;
+        while (start < rawAddress.size()) {
+            size_t sep = rawAddress.find_first_of(L",;", start);
+            std::wstring part = (sep == std::wstring::npos) ? rawAddress.substr(start) : rawAddress.substr(start, sep - start);
+            while (!part.empty() && part.front() == L' ') part.erase(part.begin());
+            while (!part.empty() && part.back() == L' ') part.pop_back();
+            std::wstring resolved = ResolveSingleAvatarLocked(part);
+            if (!resolved.empty()) return resolved;
+            if (sep == std::wstring::npos) break;
+            start = sep + 1;
+        }
+        return L"";
+    }
+
     void SmsDaemon::LoadContactsCacheLocked() {
         m_contactsCache.clear();
         m_contactUidTimestamps.clear();
         m_phoneToContactName.clear();
+        m_phoneToAvatarPath.clear();
 
         std::wstring path = GetAppDataDirectory() + L"\\contacts_cache.txt";
         std::filesystem::path fsPath(path);
@@ -1436,17 +1589,20 @@ namespace KDEConnect {
         std::string line;
         while (std::getline(file, line)) {
             if (line.empty()) continue;
-            // Format: uid|timestamp|nameHex|phonesCommaSeparatedHex
+            // Format: uid|timestamp|nameHex|phonesCommaSeparatedHex|avatarPathHex
             size_t p1 = line.find('|');
             size_t p2 = (p1 != std::string::npos) ? line.find('|', p1 + 1) : std::string::npos;
             size_t p3 = (p2 != std::string::npos) ? line.find('|', p2 + 1) : std::string::npos;
             if (p1 == std::string::npos || p2 == std::string::npos || p3 == std::string::npos) continue;
 
+            size_t p4 = line.find('|', p3 + 1);
+            bool hasAvatarCol = (p4 != std::string::npos);
+
             CachedContact c;
             c.uid = line.substr(0, p1);
             c.timestamp = std::strtoll(line.substr(p1 + 1, p2 - p1 - 1).c_str(), nullptr, 10);
             c.name = Utf8ToWide(HexDecode(line.substr(p2 + 1, p3 - p2 - 1)));
-            std::string phonesField = line.substr(p3 + 1);
+            std::string phonesField = hasAvatarCol ? line.substr(p3 + 1, p4 - p3 - 1) : line.substr(p3 + 1);
             size_t pos = 0;
             while (pos < phonesField.size()) {
                 size_t comma = phonesField.find(',', pos);
@@ -1455,9 +1611,16 @@ namespace KDEConnect {
                 if (comma == std::string::npos) break;
                 pos = comma + 1;
             }
+            if (hasAvatarCol) {
+                std::wstring av = Utf8ToWide(HexDecode(line.substr(p4 + 1)));
+                if (!av.empty() && GetFileAttributesW(av.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    c.avatarPath = std::move(av);
+                }
+            }
 
             if (!c.uid.empty() && !c.name.empty()) {
-                m_contactUidTimestamps[c.uid] = c.timestamp;
+                // Force one-time vCard re-fetch for legacy cache rows lacking the avatar column
+                m_contactUidTimestamps[c.uid] = hasAvatarCol ? c.timestamp : 0;
                 m_contactsCache[c.uid] = c;
                 IndexContactLocked(c);
             }
@@ -1476,7 +1639,7 @@ namespace KDEConnect {
                 if (i > 0) file << ",";
                 file << HexEncode(WideToUtf8(c.phones[i]));
             }
-            file << "\n";
+            file << "|" << HexEncode(WideToUtf8(c.avatarPath)) << "\n";
         }
     }
 
@@ -1488,19 +1651,34 @@ namespace KDEConnect {
         for (auto& kv : m_conversations) {
             Conversation& conv = kv.second;
             std::wstring resolved = ResolveContactNameForAddressLocked(conv.address);
-            if (resolved.empty()) {
+            std::wstring resolvedAvatar = ResolveAvatarForAddressLocked(conv.address);
+            if (resolved.empty() || resolvedAvatar.empty()) {
                 for (auto it = conv.messages.rbegin(); it != conv.messages.rend(); ++it) {
                     if (!it->address.empty()) {
-                        resolved = ResolveContactNameForAddressLocked(it->address);
-                        if (!resolved.empty()) {
-                            if (conv.address.empty()) conv.address = it->address;
-                            break;
+                        if (resolved.empty()) {
+                            resolved = ResolveContactNameForAddressLocked(it->address);
+                            if (!resolved.empty() && conv.address.empty()) {
+                                conv.address = it->address;
+                            }
                         }
+                        if (resolvedAvatar.empty()) {
+                            resolvedAvatar = ResolveAvatarForAddressLocked(it->address);
+                        }
+                        if (!resolved.empty() && !resolvedAvatar.empty()) break;
                     }
                 }
             }
+
+            bool dirty = false;
             if (!resolved.empty() && conv.contactName != resolved) {
                 conv.contactName = resolved;
+                dirty = true;
+            }
+            if (!resolvedAvatar.empty() && conv.avatarPath != resolvedAvatar) {
+                conv.avatarPath = resolvedAvatar;
+                dirty = true;
+            }
+            if (dirty) {
                 m_ignoreWatcherUntilMs = nowMs + 350;
                 WriteConversationJsonLocked(conv);
                 changed = true;
@@ -1587,6 +1765,7 @@ namespace KDEConnect {
                      << "  \"threadId\": " << conv.threadId << ",\n"
                      << "  \"address\": \"" << EscapeJson(WideToUtf8(conv.address)) << "\",\n"
                      << "  \"contactName\": \"" << EscapeJson(WideToUtf8(conv.contactName)) << "\",\n"
+                     << "  \"avatarPath\": \"" << EscapeJson(WideToUtf8(conv.avatarPath)) << "\",\n"
                      << "  \"messages\": [\n";
 
                 for (size_t i = 0; i < conv.messages.size(); ++i) {
@@ -1656,6 +1835,10 @@ namespace KDEConnect {
                 conv.contactName = resolvedName;
             } else if (conv.contactName.empty()) {
                 conv.contactName = conv.address.empty() ? (L"Fil #" + std::to_wstring(msg.threadId)) : conv.address;
+            }
+            std::wstring resolvedAvatar = ResolveAvatarForAddressLocked(conv.address);
+            if (!resolvedAvatar.empty()) {
+                conv.avatarPath = resolvedAvatar;
             }
 
             // Deduplicate by real Android _id or matching optimistic outgoing message
@@ -1752,6 +1935,7 @@ namespace KDEConnect {
                     if (key == "threadId") conv.threadId = std::strtoll(val.c_str(), nullptr, 10);
                     else if (key == "address") conv.address = Utf8ToWide(UnescapeJsonString(val));
                     else if (key == "contactName") conv.contactName = Utf8ToWide(UnescapeJsonString(val));
+                    else if (key == "avatarPath") conv.avatarPath = Utf8ToWide(UnescapeJsonString(val));
                     else if (key == "messages") messagesArr = val;
                 });
 
@@ -1763,6 +1947,12 @@ namespace KDEConnect {
                     conv.contactName = resolved;
                 } else if (conv.contactName.empty()) {
                     conv.contactName = conv.address.empty() ? (L"Fil #" + std::to_wstring(conv.threadId)) : conv.address;
+                }
+                std::wstring resolvedAvatar = ResolveAvatarForAddressLocked(conv.address);
+                if (!resolvedAvatar.empty()) {
+                    conv.avatarPath = resolvedAvatar;
+                } else if (!conv.avatarPath.empty() && GetFileAttributesW(conv.avatarPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                    conv.avatarPath.clear();
                 }
 
                 if (!messagesArr.empty()) {
@@ -1867,6 +2057,7 @@ namespace KDEConnect {
                         ContactSummary item;
                         item.name = c.name;
                         item.phone = phone;
+                        item.avatarPath = c.avatarPath;
                         result.push_back(std::move(item));
                     }
                 }

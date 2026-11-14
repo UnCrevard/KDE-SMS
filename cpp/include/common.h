@@ -102,6 +102,7 @@ namespace KDEConnect {
         int64_t threadId = 0;
         std::wstring address;
         std::wstring contactName;
+        std::wstring avatarPath;
         std::wstring snippet;
         int64_t lastTimestamp = 0;
         int32_t unreadCount = 0;
@@ -112,6 +113,7 @@ namespace KDEConnect {
     struct ContactSummary {
         std::wstring name;
         std::wstring phone;
+        std::wstring avatarPath;
     };
 
     // Device status for KDE Connect link
