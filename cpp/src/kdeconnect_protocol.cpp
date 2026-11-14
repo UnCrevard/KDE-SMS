@@ -1008,41 +1008,124 @@ namespace KDEConnect {
         return pkt.Serialize();
     }
 
-    std::vector<std::wstring> ProtocolHandler::GetLocalIpAddresses() {
-        std::vector<std::wstring> ips;
-        char hostname[256];
-        if (gethostname(hostname, sizeof(hostname)) == 0) {
-            addrinfo hints{};
-            hints.ai_family = AF_INET;
-            hints.ai_socktype = SOCK_STREAM;
-            addrinfo* res = nullptr;
-            if (getaddrinfo(hostname, nullptr, &hints, &res) == 0) {
-                for (addrinfo* ptr = res; ptr != nullptr; ptr = ptr->ai_next) {
-                    sockaddr_in* s = reinterpret_cast<sockaddr_in*>(ptr->ai_addr);
-                    char ipStr[INET_ADDRSTRLEN];
-                    if (inet_ntop(AF_INET, &s->sin_addr, ipStr, sizeof(ipStr))) {
-                        std::string str(ipStr);
-                        if (str != "127.0.0.1") {
-                            std::wstring wIp = Utf8ToWide(str);
-                            if (std::find(ips.begin(), ips.end(), wIp) == ips.end()) {
-                                ips.push_back(std::move(wIp));
+    struct LocalInterfaceEntry {
+        std::wstring ip;
+        uint32_t ipHostOrder = 0;
+        uint32_t maskHostOrder = 0xFFFFFF00u;
+    };
+
+    static std::vector<LocalInterfaceEntry> QueryActiveIpv4Interfaces() {
+        std::vector<LocalInterfaceEntry> result;
+
+        SOCKET probe = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (probe != INVALID_SOCKET) {
+            INTERFACE_INFO ifaces[64]{};
+            DWORD bytesReturned = 0;
+            if (WSAIoctl(probe, SIO_GET_INTERFACE_LIST, nullptr, 0, ifaces, sizeof(ifaces), &bytesReturned, nullptr, nullptr) == 0) {
+                int count = static_cast<int>(bytesReturned / sizeof(INTERFACE_INFO));
+                for (int i = 0; i < count; ++i) {
+                    if ((ifaces[i].iiFlags & IFF_UP) == 0) continue;
+                    if ((ifaces[i].iiFlags & IFF_LOOPBACK) != 0) continue;
+                    if (ifaces[i].iiAddress.AddressIn.sin_family != AF_INET) continue;
+
+                    char ipStr[INET_ADDRSTRLEN]{};
+                    if (!inet_ntop(AF_INET, &ifaces[i].iiAddress.AddressIn.sin_addr, ipStr, sizeof(ipStr))) continue;
+                    std::string str(ipStr);
+                    if (str == "127.0.0.1" || str == "0.0.0.0") continue;
+
+                    std::wstring wIp = Utf8ToWide(str);
+                    bool dup = false;
+                    for (const auto& e : result) {
+                        if (e.ip == wIp) { dup = true; break; }
+                    }
+                    if (!dup) {
+                        LocalInterfaceEntry entry;
+                        entry.ip = std::move(wIp);
+                        entry.ipHostOrder = ntohl(ifaces[i].iiAddress.AddressIn.sin_addr.s_addr);
+                        uint32_t mask = ntohl(ifaces[i].iiNetmask.AddressIn.sin_addr.s_addr);
+                        entry.maskHostOrder = (mask != 0) ? mask : 0xFFFFFF00u;
+                        result.push_back(std::move(entry));
+                    }
+                }
+            }
+            closesocket(probe);
+        }
+
+        if (result.empty()) {
+            char hostname[256];
+            if (gethostname(hostname, sizeof(hostname)) == 0) {
+                addrinfo hints{};
+                hints.ai_family = AF_INET;
+                hints.ai_socktype = SOCK_STREAM;
+                addrinfo* res = nullptr;
+                if (getaddrinfo(hostname, nullptr, &hints, &res) == 0) {
+                    for (addrinfo* ptr = res; ptr != nullptr; ptr = ptr->ai_next) {
+                        sockaddr_in* s = reinterpret_cast<sockaddr_in*>(ptr->ai_addr);
+                        char ipStr[INET_ADDRSTRLEN];
+                        if (inet_ntop(AF_INET, &s->sin_addr, ipStr, sizeof(ipStr))) {
+                            std::string str(ipStr);
+                            if (str != "127.0.0.1" && str != "0.0.0.0") {
+                                std::wstring wIp = Utf8ToWide(str);
+                                bool dup = false;
+                                for (const auto& e : result) {
+                                    if (e.ip == wIp) { dup = true; break; }
+                                }
+                                if (!dup) {
+                                    LocalInterfaceEntry entry;
+                                    entry.ip = std::move(wIp);
+                                    entry.ipHostOrder = ntohl(s->sin_addr.s_addr);
+                                    entry.maskHostOrder = 0xFFFFFF00u;
+                                    result.push_back(std::move(entry));
+                                }
                             }
                         }
                     }
+                    freeaddrinfo(res);
                 }
-                freeaddrinfo(res);
             }
+        }
+        return result;
+    }
+
+    static std::wstring TrimBindIpWide(std::wstring s) {
+        while (!s.empty() && (s.front() == L' ' || s.front() == L'\t' || s.front() == L'\r' || s.front() == L'\n')) {
+            s.erase(s.begin());
+        }
+        while (!s.empty() && (s.back() == L' ' || s.back() == L'\t' || s.back() == L'\r' || s.back() == L'\n')) {
+            s.pop_back();
+        }
+        return s;
+    }
+
+    std::vector<std::wstring> ProtocolHandler::GetLocalIpAddresses() {
+        std::vector<std::wstring> ips;
+        auto entries = QueryActiveIpv4Interfaces();
+        ips.reserve(entries.size());
+        for (auto& e : entries) {
+            ips.push_back(std::move(e.ip));
         }
         return ips;
     }
 
     bool ProtocolHandler::Start(const std::wstring& bindIp, uint16_t port) {
-        m_bindIp = bindIp;
+        m_bindIp = TrimBindIpWide(bindIp);
+        m_effectiveBindIp.clear();
         m_port = port;
         m_running = true;
 
         if (!EnsureLocalCertificate()) {
             std::wcerr << L"[AVERTISSEMENT] Impossible de generer le certificat TLS local !" << std::endl;
+        }
+
+        in_addr explicitBindIn{};
+        bool hasExplicitBind = false;
+        if (!m_bindIp.empty() && m_bindIp != L"0.0.0.0") {
+            std::string bindUtf8 = WideToUtf8(m_bindIp);
+            if (inet_pton(AF_INET, bindUtf8.c_str(), &explicitBindIn) == 1) {
+                hasExplicitBind = true;
+            } else {
+                std::wcerr << L"[Reseau] Adresse IP de bind invalide '" << m_bindIp << L"', utilisation de 0.0.0.0." << std::endl;
+            }
         }
 
         m_udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -1055,24 +1138,40 @@ namespace KDEConnect {
         setsockopt(m_udpSocket, SOL_SOCKET, SO_BROADCAST, (char*)&opt, sizeof(opt));
         setsockopt(m_udpSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
 
-        // On Windows, the UDP listening socket MUST bind to INADDR_ANY (0.0.0.0) to receive broadcasts
         sockaddr_in bindAddr{};
         bindAddr.sin_family = AF_INET;
         bindAddr.sin_port = htons(m_port);
-        bindAddr.sin_addr.s_addr = INADDR_ANY;
+        bindAddr.sin_addr.s_addr = hasExplicitBind ? explicitBindIn.s_addr : INADDR_ANY;
 
         if (bind(m_udpSocket, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
             int err = WSAGetLastError();
-            std::wcerr << L"[ERREUR UDP] Echec bind sur 0.0.0.0:" << m_port << L" (code " << err << L")" << std::endl;
-            if (err == 10048) {
-                std::wcerr << L"             -> Le port 1716 est deja utilise ! Fermez l'application KDE Connect officielle." << std::endl;
+            if (hasExplicitBind && err == WSAEADDRNOTAVAIL) {
+                std::wcerr << L"[AVERTISSEMENT UDP] Adresse " << m_bindIp << L":" << m_port
+                           << L" indisponible sur cet ordinateur (code " << err << L"), repli sur 0.0.0.0." << std::endl;
+                hasExplicitBind = false;
+                bindAddr.sin_addr.s_addr = INADDR_ANY;
+                if (bind(m_udpSocket, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
+                    err = WSAGetLastError();
+                } else {
+                    err = 0;
+                }
             }
-            closesocket(m_udpSocket);
-            m_udpSocket = INVALID_SOCKET;
-            return false;
-        } else {
-            std::wcout << L"[UDP Serveur] Ecoute active sur 0.0.0.0:" << m_port << L" (Reception diffusions OK)" << std::endl;
+            if (err != 0) {
+                std::wcerr << L"[ERREUR UDP] Echec bind sur "
+                           << (hasExplicitBind ? m_bindIp : L"0.0.0.0") << L":" << m_port
+                           << L" (code " << err << L")" << std::endl;
+                if (err == 10048) {
+                    std::wcerr << L"             -> Le port 1716 est deja utilise !" << std::endl;
+                }
+                closesocket(m_udpSocket);
+                m_udpSocket = INVALID_SOCKET;
+                return false;
+            }
         }
+
+        m_effectiveBindIp = hasExplicitBind ? m_bindIp : L"";
+        std::wcout << L"[UDP Serveur] Ecoute active sur "
+                   << (hasExplicitBind ? m_effectiveBindIp : L"0.0.0.0") << L":" << m_port << std::endl;
 
         m_tcpListenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (m_tcpListenSocket != INVALID_SOCKET) {
@@ -1080,13 +1179,24 @@ namespace KDEConnect {
             sockaddr_in tcpBindAddr{};
             tcpBindAddr.sin_family = AF_INET;
             tcpBindAddr.sin_port = htons(m_port);
-            tcpBindAddr.sin_addr.s_addr = INADDR_ANY;
+            tcpBindAddr.sin_addr.s_addr = hasExplicitBind ? explicitBindIn.s_addr : INADDR_ANY;
 
             if (bind(m_tcpListenSocket, (sockaddr*)&tcpBindAddr, sizeof(tcpBindAddr)) == SOCKET_ERROR) {
-                std::wcerr << L"[ERREUR TCP] Echec bind sur port " << m_port << L" (code " << WSAGetLastError() << L")" << std::endl;
+                std::wcerr << L"[ERREUR TCP] Echec bind sur "
+                           << (hasExplicitBind ? m_effectiveBindIp : L"0.0.0.0") << L":" << m_port
+                           << L" (code " << WSAGetLastError() << L")" << std::endl;
+                closesocket(m_tcpListenSocket);
+                m_tcpListenSocket = INVALID_SOCKET;
+                if (!hasExplicitBind) {
+                    closesocket(m_udpSocket);
+                    m_udpSocket = INVALID_SOCKET;
+                    return false;
+                }
             } else {
                 listen(m_tcpListenSocket, SOMAXCONN);
-                std::wcout << L"[TCP Serveur] Ecoute active sur 0.0.0.0:" << m_port << L" (Pret pour TLS & appairage)" << std::endl;
+                std::wcout << L"[TCP Serveur] Ecoute active sur "
+                           << (hasExplicitBind ? m_effectiveBindIp : L"0.0.0.0") << L":" << m_port
+                           << L" (Pret pour TLS & appairage)" << std::endl;
             }
         }
 
@@ -1139,61 +1249,91 @@ namespace KDEConnect {
         if (m_udpSocket == INVALID_SOCKET) return;
 
         std::string raw = BuildIdentityPacket();
+        auto interfaces = QueryActiveIpv4Interfaces();
 
-        std::vector<std::string> targetIps;
-        if (!m_bindIp.empty()) {
-            targetIps.push_back(WideToUtf8(m_bindIp));
-        } else {
-            auto ips = GetLocalIpAddresses();
-            for (const auto& w : ips) targetIps.push_back(WideToUtf8(w));
-        }
+        auto findMaskForIp = [&](uint32_t hostOrderIp) -> uint32_t {
+            for (const auto& iface : interfaces) {
+                if (iface.ipHostOrder == hostOrderIp) return iface.maskHostOrder;
+            }
+            return 0xFFFFFF00u;
+        };
 
-        for (const auto& ipUtf8 : targetIps) {
+        if (!m_effectiveBindIp.empty()) {
             in_addr localInAddr{};
+            std::string ipUtf8 = WideToUtf8(m_effectiveBindIp);
             if (inet_pton(AF_INET, ipUtf8.c_str(), &localInAddr) == 1) {
                 uint32_t hostOrderIp = ntohl(localInAddr.s_addr);
-                uint32_t subnetBcast = (hostOrderIp & 0xFFFFFF00) | 0x000000FF;
+                uint32_t mask = findMaskForIp(hostOrderIp);
+                uint32_t subnetBcast = (hostOrderIp & mask) | (~mask);
 
                 in_addr bcastAddrIn{};
                 bcastAddrIn.s_addr = htonl(subnetBcast);
-                char bcastIpStr[INET_ADDRSTRLEN];
+                char bcastIpStr[INET_ADDRSTRLEN]{};
                 inet_ntop(AF_INET, &bcastAddrIn, bcastIpStr, sizeof(bcastIpStr));
 
-                SOCKET senderSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-                if (senderSock != INVALID_SOCKET) {
-                    BOOL opt = TRUE;
-                    setsockopt(senderSock, SOL_SOCKET, SO_BROADCAST, (char*)&opt, sizeof(opt));
+                sockaddr_in destSubnet{};
+                destSubnet.sin_family = AF_INET;
+                destSubnet.sin_port = htons(m_port);
+                destSubnet.sin_addr.s_addr = htonl(subnetBcast);
 
-                    sockaddr_in ifAddr{};
-                    ifAddr.sin_family = AF_INET;
-                    ifAddr.sin_port = 0;
-                    ifAddr.sin_addr = localInAddr;
-
-                    if (bind(senderSock, (sockaddr*)&ifAddr, sizeof(ifAddr)) != SOCKET_ERROR) {
-                        sockaddr_in destSubnet{};
-                        destSubnet.sin_family = AF_INET;
-                        destSubnet.sin_port = htons(m_port);
-                        destSubnet.sin_addr.s_addr = htonl(subnetBcast);
-
-                        int res = sendto(senderSock, raw.c_str(), static_cast<int>(raw.length()), 0,
-                                         (sockaddr*)&destSubnet, sizeof(destSubnet));
-                        if (res != SOCKET_ERROR) {
-                            std::wcout << L"[UDP Annonce] Envoyee sur " << Utf8ToWide(bcastIpStr)
-                                       << L":" << m_port << L" (via " << Utf8ToWide(ipUtf8) << L") [OK]" << std::endl;
-                        } else {
-                            std::wcout << L"[UDP Annonce] Echec sur " << Utf8ToWide(bcastIpStr)
-                                       << L" (code " << WSAGetLastError() << L")" << std::endl;
-                        }
-
-                        sockaddr_in destGlobal{};
-                        destGlobal.sin_family = AF_INET;
-                        destGlobal.sin_port = htons(m_port);
-                        destGlobal.sin_addr.s_addr = INADDR_BROADCAST;
-                        sendto(senderSock, raw.c_str(), static_cast<int>(raw.length()), 0,
-                               (sockaddr*)&destGlobal, sizeof(destGlobal));
-                    }
-                    closesocket(senderSock);
+                int res = sendto(m_udpSocket, raw.c_str(), static_cast<int>(raw.length()), 0,
+                                 (sockaddr*)&destSubnet, sizeof(destSubnet));
+                if (res != SOCKET_ERROR) {
+                    std::wcout << L"[UDP Annonce] Envoyee sur " << Utf8ToWide(bcastIpStr)
+                               << L":" << m_port << L" (via " << m_effectiveBindIp << L") [OK]" << std::endl;
                 }
+
+                sockaddr_in destGlobal{};
+                destGlobal.sin_family = AF_INET;
+                destGlobal.sin_port = htons(m_port);
+                destGlobal.sin_addr.s_addr = INADDR_BROADCAST;
+                sendto(m_udpSocket, raw.c_str(), static_cast<int>(raw.length()), 0,
+                       (sockaddr*)&destGlobal, sizeof(destGlobal));
+            }
+            return;
+        }
+
+        for (const auto& iface : interfaces) {
+            in_addr localInAddr{};
+            localInAddr.s_addr = htonl(iface.ipHostOrder);
+            uint32_t subnetBcast = (iface.ipHostOrder & iface.maskHostOrder) | (~iface.maskHostOrder);
+
+            in_addr bcastAddrIn{};
+            bcastAddrIn.s_addr = htonl(subnetBcast);
+            char bcastIpStr[INET_ADDRSTRLEN]{};
+            inet_ntop(AF_INET, &bcastAddrIn, bcastIpStr, sizeof(bcastIpStr));
+
+            SOCKET senderSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            if (senderSock != INVALID_SOCKET) {
+                BOOL opt = TRUE;
+                setsockopt(senderSock, SOL_SOCKET, SO_BROADCAST, (char*)&opt, sizeof(opt));
+
+                sockaddr_in ifAddr{};
+                ifAddr.sin_family = AF_INET;
+                ifAddr.sin_port = 0;
+                ifAddr.sin_addr = localInAddr;
+
+                if (bind(senderSock, (sockaddr*)&ifAddr, sizeof(ifAddr)) != SOCKET_ERROR) {
+                    sockaddr_in destSubnet{};
+                    destSubnet.sin_family = AF_INET;
+                    destSubnet.sin_port = htons(m_port);
+                    destSubnet.sin_addr.s_addr = htonl(subnetBcast);
+
+                    int res = sendto(senderSock, raw.c_str(), static_cast<int>(raw.length()), 0,
+                                     (sockaddr*)&destSubnet, sizeof(destSubnet));
+                    if (res != SOCKET_ERROR) {
+                        std::wcout << L"[UDP Annonce] Envoyee sur " << Utf8ToWide(bcastIpStr)
+                                   << L":" << m_port << L" (via " << iface.ip << L") [OK]" << std::endl;
+                    }
+
+                    sockaddr_in destGlobal{};
+                    destGlobal.sin_family = AF_INET;
+                    destGlobal.sin_port = htons(m_port);
+                    destGlobal.sin_addr.s_addr = INADDR_BROADCAST;
+                    sendto(senderSock, raw.c_str(), static_cast<int>(raw.length()), 0,
+                           (sockaddr*)&destGlobal, sizeof(destGlobal));
+                }
+                closesocket(senderSock);
             }
         }
 
@@ -1419,6 +1559,21 @@ namespace KDEConnect {
 
         SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (sock == INVALID_SOCKET) return;
+
+        if (!m_effectiveBindIp.empty()) {
+            in_addr localBindIn{};
+            std::string bindUtf8 = WideToUtf8(m_effectiveBindIp);
+            if (inet_pton(AF_INET, bindUtf8.c_str(), &localBindIn) == 1) {
+                sockaddr_in localAddr{};
+                localAddr.sin_family = AF_INET;
+                localAddr.sin_port = 0;
+                localAddr.sin_addr = localBindIn;
+                if (bind(sock, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr)) == SOCKET_ERROR) {
+                    std::wcerr << L"[TCP Sortant] Echec bind source sur " << m_effectiveBindIp
+                               << L" (code " << WSAGetLastError() << L")" << std::endl;
+                }
+            }
+        }
 
         DWORD timeoutMs = 15000;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));

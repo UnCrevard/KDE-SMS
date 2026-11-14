@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <map>
 #include <set>
+#include <cwctype>
 
 using namespace KDEConnect;
 
@@ -151,16 +152,43 @@ static bool IsMultiRecipientAddressLocal(const std::wstring& address) {
     return address.find(L',') != std::wstring::npos || address.find(L';') != std::wstring::npos;
 }
 
+static std::wstring TrimWideLocal(std::wstring s) {
+    while (!s.empty() && (s.front() == L' ' || s.front() == L'\t' || s.front() == L'\r' || s.front() == L'\n')) {
+        s.erase(s.begin());
+    }
+    while (!s.empty() && (s.back() == L' ' || s.back() == L'\t' || s.back() == L'\r' || s.back() == L'\n')) {
+        s.pop_back();
+    }
+    return s;
+}
+
 static std::wstring CanonicalSinglePhoneKeyLocal(const std::wstring& phone) {
-    if (IsMultiRecipientAddressLocal(phone)) return L"";
-    std::wstring digits = ExtractDigitsLocal(phone);
-    if (digits.size() >= 8) {
-        return (digits.size() > 9) ? digits.substr(digits.size() - 9) : digits;
+    std::wstring trimmed = TrimWideLocal(phone);
+    if (trimmed.empty() || IsMultiRecipientAddressLocal(trimmed)) return L"";
+
+    std::wstring check = trimmed;
+    if (check.size() > 4 && ToLowerCopy(check.substr(0, 4)) == L"tel:") {
+        check = TrimWideLocal(check.substr(4));
     }
-    if (!digits.empty()) {
-        return L"exact:" + digits;
+
+    bool hasAlpha = false;
+    for (wchar_t ch : check) {
+        if ((ch >= L'A' && ch <= L'Z') || (ch >= L'a' && ch <= L'z') || ::iswalpha(ch)) {
+            hasAlpha = true;
+            break;
+        }
     }
-    return L"";
+
+    if (!hasAlpha) {
+        std::wstring digits = ExtractDigitsLocal(check);
+        if (!digits.empty()) {
+            if (digits.size() >= 8) {
+                return L"suf:" + ((digits.size() > 9) ? digits.substr(digits.size() - 9) : digits);
+            }
+            return L"exact:" + digits;
+        }
+    }
+    return L"text:" + ToLowerCopy(check);
 }
 
 static bool ContactsSnapshotEqual(const std::vector<ContactSummary>& a, const std::vector<ContactSummary>& b) {
@@ -304,12 +332,10 @@ static void ApplySearchFilter() {
 
 static void ReloadConversations(HWND hwnd, bool autoScrollIfNewOrActive, bool forceRepaint = false) {
     size_t prevSelectedCount = 0;
-    std::wstring activeSyntheticPhoneKey;
+    std::wstring activePhoneKey;
     if (Conversation* prev = FindActiveConversation()) {
         prevSelectedCount = prev->messages.size();
-        if (prev->threadId <= -100000) {
-            activeSyntheticPhoneKey = CanonicalSinglePhoneKeyLocal(prev->address);
-        }
+        activePhoneKey = CanonicalSinglePhoneKeyLocal(prev->address);
     }
 
     std::vector<Conversation> fresh = SmsDaemon::Instance().LoadAllConversations();
@@ -334,9 +360,9 @@ static void ReloadConversations(HWND hwnd, bool autoScrollIfNewOrActive, bool fo
     g_allContacts = std::move(freshContacts);
 
     // If the user had a synthetic contact selected and a real conversation now exists for that number, switch to it
-    if (g_selectedThreadId <= -100000 && !activeSyntheticPhoneKey.empty()) {
+    if (g_selectedThreadId <= -100000 && !activePhoneKey.empty()) {
         for (const auto& c : g_allConversations) {
-            if (CanonicalSinglePhoneKeyLocal(c.address) == activeSyntheticPhoneKey) {
+            if (CanonicalSinglePhoneKeyLocal(c.address) == activePhoneKey) {
                 g_selectedThreadId = c.threadId;
                 break;
             }
@@ -351,6 +377,15 @@ static void ReloadConversations(HWND hwnd, bool autoScrollIfNewOrActive, bool fo
         if (c.threadId == g_selectedThreadId) {
             selectedExists = true;
             break;
+        }
+    }
+    if (!selectedExists && !activePhoneKey.empty()) {
+        for (const auto& c : g_allConversations) {
+            if (CanonicalSinglePhoneKeyLocal(c.address) == activePhoneKey) {
+                g_selectedThreadId = c.threadId;
+                selectedExists = true;
+                break;
+            }
         }
     }
     if (!selectedExists && g_selectedThreadId <= -100000) {
@@ -1521,8 +1556,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR pCmd
     PromptFirstRunStorageSetup();
 
     if (g_bindIp.empty()) {
-        g_bindIp = ReadIniString(L"Network", L"BindIp", L"");
+        g_bindIp = TrimWideLocal(ReadIniString(L"Network", L"BindIp", L""));
     } else {
+        g_bindIp = TrimWideLocal(g_bindIp);
         WriteIniString(L"Network", L"BindIp", g_bindIp.c_str());
     }
 

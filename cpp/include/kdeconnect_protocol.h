@@ -98,6 +98,7 @@ namespace KDEConnect {
         std::atomic<bool> m_running{false};
         uint16_t m_port = 1716;
         std::wstring m_bindIp;
+        std::wstring m_effectiveBindIp;
 
         SOCKET m_udpSocket = INVALID_SOCKET;
         SOCKET m_tcpListenSocket = INVALID_SOCKET;
