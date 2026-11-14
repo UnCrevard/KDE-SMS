@@ -74,7 +74,14 @@ namespace KDEConnect {
             return cachedDir;
         }
 
-        void EnsureIniFileUtf16Bom(const std::wstring& iniPath) {
+        void ClearReadOnlyAttribute(const std::wstring& path) {
+            DWORD attrs = GetFileAttributesW(path.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY) != 0) {
+                SetFileAttributesW(path.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+            }
+        }
+
+        void EnsureIniFileReadyForWin32(const std::wstring& iniPath) {
             DWORD attrs = GetFileAttributesW(iniPath.c_str());
             if (attrs == INVALID_FILE_ATTRIBUTES) {
                 HANDLE hFile = CreateFileW(
@@ -92,6 +99,70 @@ namespace KDEConnect {
                     WriteFile(hFile, bom, sizeof(bom), &written, nullptr);
                     CloseHandle(hFile);
                 }
+                return;
+            }
+
+            // Convert UTF-8 BOM (EF BB BF) or bare UTF-8 INI files to UTF-16LE so GetPrivateProfileStringW never fails
+            HANDLE hRead = CreateFileW(
+                iniPath.c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr
+            );
+            if (hRead == INVALID_HANDLE_VALUE) return;
+
+            LARGE_INTEGER fileSize{};
+            if (!GetFileSizeEx(hRead, &fileSize) || fileSize.QuadPart <= 0 || fileSize.QuadPart > 1024 * 1024) {
+                CloseHandle(hRead);
+                return;
+            }
+
+            std::string raw(static_cast<size_t>(fileSize.QuadPart), '\0');
+            DWORD bytesRead = 0;
+            BOOL readOk = ReadFile(hRead, &raw[0], static_cast<DWORD>(raw.size()), &bytesRead, nullptr);
+            CloseHandle(hRead);
+            if (!readOk || bytesRead < 3) return;
+            raw.resize(bytesRead);
+
+            const unsigned char* u = reinterpret_cast<const unsigned char*>(raw.data());
+            if (u[0] == 0xFF && u[1] == 0xFE) {
+                return; // Already UTF-16LE BOM
+            }
+            bool hasUtf8Bom = (bytesRead >= 3 && u[0] == 0xEF && u[1] == 0xBB && u[2] == 0xBF);
+            if (!hasUtf8Bom) {
+                return; // Plain ANSI/ASCII INI is already handled natively by Win32 INI APIs
+            }
+
+            std::string utf8Content = raw.substr(3);
+            int wideLen = MultiByteToWideChar(CP_UTF8, 0, utf8Content.data(), static_cast<int>(utf8Content.size()), nullptr, 0);
+            if (wideLen < 0) return;
+            std::wstring wideContent(static_cast<size_t>(wideLen), L'\0');
+            if (wideLen > 0) {
+                MultiByteToWideChar(CP_UTF8, 0, utf8Content.data(), static_cast<int>(utf8Content.size()), &wideContent[0], wideLen);
+            }
+
+            ClearReadOnlyAttribute(iniPath);
+            HANDLE hWrite = CreateFileW(
+                iniPath.c_str(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ,
+                nullptr,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr
+            );
+            if (hWrite != INVALID_HANDLE_VALUE) {
+                const unsigned char bom[2] = { 0xFF, 0xFE };
+                DWORD written = 0;
+                WriteFile(hWrite, bom, sizeof(bom), &written, nullptr);
+                if (!wideContent.empty()) {
+                    WriteFile(hWrite, wideContent.data(), static_cast<DWORD>(wideContent.size() * sizeof(wchar_t)), &written, nullptr);
+                }
+                CloseHandle(hWrite);
+                WritePrivateProfileStringW(nullptr, nullptr, nullptr, iniPath.c_str());
             }
         }
 
@@ -112,6 +183,9 @@ namespace KDEConnect {
 
     std::wstring ReadIniString(const wchar_t* section, const wchar_t* key, const wchar_t* defaultValue) {
         std::wstring iniPath = GetSettingsIniPath();
+        if (FileExistsWin32(iniPath)) {
+            EnsureIniFileReadyForWin32(iniPath);
+        }
         wchar_t buffer[2048]{};
         DWORD count = GetPrivateProfileStringW(
             section,
@@ -124,22 +198,33 @@ namespace KDEConnect {
         return std::wstring(buffer, count);
     }
 
-    void WriteIniString(const wchar_t* section, const wchar_t* key, const wchar_t* value) {
+    bool WriteIniString(const wchar_t* section, const wchar_t* key, const wchar_t* value) {
         std::wstring iniPath = GetSettingsIniPath();
-        EnsureIniFileUtf16Bom(iniPath);
-        WritePrivateProfileStringW(section, key, value ? value : L"", iniPath.c_str());
+        EnsureDirectoryExistsRecursive(GetAppDataDirectory());
+        EnsureIniFileReadyForWin32(iniPath);
+        ClearReadOnlyAttribute(iniPath);
+        BOOL ok = WritePrivateProfileStringW(section, key, value ? value : L"", iniPath.c_str());
+        WritePrivateProfileStringW(nullptr, nullptr, nullptr, iniPath.c_str());
+        return ok != FALSE;
     }
 
     void DeleteIniKey(const wchar_t* section, const wchar_t* key) {
         if (!section || !key) return;
         std::wstring iniPath = GetSettingsIniPath();
+        if (!FileExistsWin32(iniPath)) return;
+        EnsureIniFileReadyForWin32(iniPath);
+        ClearReadOnlyAttribute(iniPath);
         WritePrivateProfileStringW(section, key, nullptr, iniPath.c_str());
+        WritePrivateProfileStringW(nullptr, nullptr, nullptr, iniPath.c_str());
     }
 
     std::vector<std::pair<std::wstring, std::wstring>> ReadIniSectionPairs(const wchar_t* section) {
         std::vector<std::pair<std::wstring, std::wstring>> pairs;
         if (!section) return pairs;
         std::wstring iniPath = GetSettingsIniPath();
+        if (FileExistsWin32(iniPath)) {
+            EnsureIniFileReadyForWin32(iniPath);
+        }
         std::vector<wchar_t> buffer(16384, L'\0');
         DWORD copied = GetPrivateProfileSectionW(
             section,
@@ -163,6 +248,9 @@ namespace KDEConnect {
 
     int ReadIniInt(const wchar_t* section, const wchar_t* key, int defaultValue) {
         std::wstring iniPath = GetSettingsIniPath();
+        if (FileExistsWin32(iniPath)) {
+            EnsureIniFileReadyForWin32(iniPath);
+        }
         return static_cast<int>(GetPrivateProfileIntW(section, key, defaultValue, iniPath.c_str()));
     }
 

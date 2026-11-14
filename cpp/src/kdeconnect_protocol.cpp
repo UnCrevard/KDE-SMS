@@ -1052,7 +1052,8 @@ namespace KDEConnect {
             closesocket(probe);
         }
 
-        if (result.empty()) {
+        // Merge any non-duplicate local IPv4 addresses reported by gethostname/getaddrinfo
+        {
             char hostname[256];
             if (gethostname(hostname, sizeof(hostname)) == 0) {
                 addrinfo hints{};
@@ -1410,9 +1411,10 @@ namespace KDEConnect {
             return 0xFFFFFF00u;
         };
 
-        if (!m_effectiveBindIp.empty()) {
+        std::wstring effectiveBind = GetEffectiveBindIp();
+        if (!effectiveBind.empty()) {
             in_addr localInAddr{};
-            std::string ipUtf8 = WideToUtf8(m_effectiveBindIp);
+            std::string ipUtf8 = WideToUtf8(effectiveBind);
             if (inet_pton(AF_INET, ipUtf8.c_str(), &localInAddr) == 1) {
                 uint32_t hostOrderIp = ntohl(localInAddr.s_addr);
                 uint32_t mask = findMaskForIp(hostOrderIp);
@@ -1432,7 +1434,7 @@ namespace KDEConnect {
                                  (sockaddr*)&destSubnet, sizeof(destSubnet));
                 if (res != SOCKET_ERROR) {
                     std::wcout << L"[UDP Annonce] Envoyee sur " << Utf8ToWide(bcastIpStr)
-                               << L":" << m_port << L" (via " << m_effectiveBindIp << L") [OK]" << std::endl;
+                               << L":" << m_port << L" (via " << effectiveBind << L") [OK]" << std::endl;
                 }
 
                 sockaddr_in destGlobal{};
@@ -1712,18 +1714,23 @@ namespace KDEConnect {
         SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (sock == INVALID_SOCKET) return;
 
-        if (!m_effectiveBindIp.empty()) {
+        std::wstring effectiveBind = GetEffectiveBindIp();
+        if (!effectiveBind.empty()) {
             in_addr localBindIn{};
-            std::string bindUtf8 = WideToUtf8(m_effectiveBindIp);
-            if (inet_pton(AF_INET, bindUtf8.c_str(), &localBindIn) == 1) {
-                sockaddr_in localAddr{};
-                localAddr.sin_family = AF_INET;
-                localAddr.sin_port = 0;
-                localAddr.sin_addr = localBindIn;
-                if (bind(sock, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr)) == SOCKET_ERROR) {
-                    std::wcerr << L"[TCP Sortant] Echec bind source sur " << m_effectiveBindIp
-                               << L" (code " << WSAGetLastError() << L")" << std::endl;
-                }
+            std::string bindUtf8 = WideToUtf8(effectiveBind);
+            if (inet_pton(AF_INET, bindUtf8.c_str(), &localBindIn) != 1) {
+                closesocket(sock);
+                return;
+            }
+            sockaddr_in localAddr{};
+            localAddr.sin_family = AF_INET;
+            localAddr.sin_port = 0;
+            localAddr.sin_addr = localBindIn;
+            if (bind(sock, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr)) == SOCKET_ERROR) {
+                std::wcerr << L"[TCP Sortant] Echec bind source sur " << effectiveBind
+                           << L" (code " << WSAGetLastError() << L")" << std::endl;
+                closesocket(sock);
+                return;
             }
         }
 

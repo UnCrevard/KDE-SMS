@@ -551,6 +551,7 @@ struct SettingsModalState {
 
     std::vector<std::wstring> bindIpValues;
     std::vector<int> syncSecValues;
+    int selectedBindIdx = 0;
 
     std::wstring resConvDir;
     std::wstring resRecvDir;
@@ -590,7 +591,15 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         case WM_COMMAND: {
             if (!st) break;
             int id = LOWORD(wParam);
-            if (id == IDC_SET_CONV_BROWSE) {
+            int code = HIWORD(wParam);
+            if (id == IDC_SET_BIND_COMBO && code == CBN_SELCHANGE) {
+                int sel = static_cast<int>(SendMessageW(st->bindCombo, CB_GETCURSEL, 0, 0));
+                if (sel >= 0 && sel < static_cast<int>(st->bindIpValues.size())) {
+                    st->selectedBindIdx = sel;
+                    st->resBindIp = st->bindIpValues[static_cast<size_t>(sel)];
+                }
+                return 0;
+            } else if (id == IDC_SET_CONV_BROWSE) {
                 std::wstring cur = GetWindowTextSafe(st->convEdit);
                 std::wstring picked;
                 if (PromptSelectStorageFolder(hwnd, L"Choisir le dossier des conversations", cur.empty() ? GetMessagesDirectory() : cur, picked)) {
@@ -610,10 +619,11 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 st->resDeviceName = GetWindowTextSafe(st->devNameEdit);
 
                 int bindSel = static_cast<int>(SendMessageW(st->bindCombo, CB_GETCURSEL, 0, 0));
+                if (bindSel == CB_ERR) {
+                    bindSel = st->selectedBindIdx;
+                }
                 if (bindSel >= 0 && bindSel < static_cast<int>(st->bindIpValues.size())) {
                     st->resBindIp = st->bindIpValues[static_cast<size_t>(bindSel)];
-                } else {
-                    st->resBindIp = L"";
                 }
 
                 int themeSel = static_cast<int>(SendMessageW(st->themeCombo, CB_GETCURSEL, 0, 0));
@@ -739,7 +749,16 @@ void ShowSettingsDialog(HWND parent) {
 
     state.bindIpValues.push_back(L"");
     SendMessageW(state.bindCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Toutes les interfaces (0.0.0.0 - automatique)"));
-    std::wstring configuredBind = (g_bindIp == L"0.0.0.0") ? L"" : g_bindIp;
+    std::wstring configuredBind = TrimWideLocal(ReadIniString(L"Network", L"BindIp", L""));
+    if (configuredBind.empty()) {
+        configuredBind = TrimWideLocal(ReadIniString(L"Network", L"BindUP", L""));
+    }
+    if (configuredBind.empty()) {
+        configuredBind = g_bindIp;
+    }
+    if (configuredBind == L"0.0.0.0") configuredBind.clear();
+    state.resBindIp = configuredBind;
+
     std::vector<std::wstring> localIps = ProtocolHandler::GetLocalIpAddresses();
     int selectedBindIdx = 0;
     for (const auto& ip : localIps) {
@@ -755,15 +774,18 @@ void ShowSettingsDialog(HWND parent) {
         SendMessageW(state.bindCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(customLabel.c_str()));
         selectedBindIdx = static_cast<int>(state.bindIpValues.size()) - 1;
     }
+    state.selectedBindIdx = selectedBindIdx;
     SendMessageW(state.bindCombo, CB_SETCURSEL, static_cast<WPARAM>(selectedBindIdx), 0);
 
     std::wstring activeEndpoint = SmsDaemon::Instance().GetBoundEndpointSummary();
     std::wstring activeBindErr = SmsDaemon::Instance().GetLastBindError();
+    std::wstring iniBindLabel = configuredBind.empty() ? L"0.0.0.0 (auto)" : configuredBind;
     std::wstring bindStatusLine;
     if (!activeBindErr.empty()) {
-        bindStatusLine = L"Etat actuel : " + activeBindErr;
+        bindStatusLine = L"INI : " + iniBindLabel + L" | Erreur : " + activeBindErr;
     } else {
-        bindStatusLine = L"Ecoute active : " + (activeEndpoint.empty() ? L"inactive" : activeEndpoint);
+        bindStatusLine = L"Ecoute active : " + (activeEndpoint.empty() ? L"inactive" : activeEndpoint) +
+                         L"  |  INI BindIp : " + iniBindLabel;
     }
     addCtrl(L"STATIC", bindStatusLine.c_str(), SS_ENDELLIPSIS, 0, 32, 228, 476, 18, 0);
 
@@ -853,7 +875,11 @@ void ShowSettingsDialog(HWND parent) {
 
         g_bindIp = TrimWideLocal(state.resBindIp);
         if (g_bindIp == L"0.0.0.0") g_bindIp.clear();
-        WriteIniString(L"Network", L"BindIp", g_bindIp.c_str());
+        bool iniWriteOk = WriteIniString(L"Network", L"BindIp", g_bindIp.c_str());
+        DeleteIniKey(L"Network", L"BindUP");
+        std::wstring persistedBind = TrimWideLocal(ReadIniString(L"Network", L"BindIp", L""));
+        if (persistedBind == L"0.0.0.0") persistedBind.clear();
+
         SetConfiguredDeviceName(state.resDeviceName);
 
         WriteIniInt(L"App", L"AutoSyncIntervalSec", state.resSyncSec);
@@ -876,6 +902,11 @@ void ShowSettingsDialog(HWND parent) {
             g_lastEmptyStatus = SmsDaemon::Instance().GetConnectionStatusText();
             ReloadConversations(parent, true, true);
             InvalidateRect(parent, nullptr, FALSE);
+        }
+        if (!iniWriteOk || persistedBind != g_bindIp) {
+            std::wstring iniErr = L"Impossible d'enregistrer l'adresse BindIp dans :\n" + GetSettingsIniPath() +
+                                  L"\n\nVerifiez que le dossier est accessible en ecriture et que le fichier n'est pas verrouille.";
+            MessageBoxW(parent, iniErr.c_str(), L"Erreur d'ecriture INI", MB_OK | MB_ICONERROR);
         }
         if (!reloadOk) {
             std::wstring bindErr = SmsDaemon::Instance().GetLastBindError();
@@ -1491,6 +1522,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_APP_RESTORE_WINDOW: {
             RestoreFromTray(hwnd);
+            std::wstring iniBind = TrimWideLocal(ReadIniString(L"Network", L"BindIp", L""));
+            if (iniBind.empty()) {
+                iniBind = TrimWideLocal(ReadIniString(L"Network", L"BindUP", L""));
+            }
+            if (iniBind == L"0.0.0.0") iniBind.clear();
+            std::wstring activeBind = SmsDaemon::Instance().GetProtocol().GetEffectiveBindIp();
+            if (iniBind != activeBind || !SmsDaemon::Instance().GetProtocol().IsListening()) {
+                g_bindIp = iniBind;
+                bool reloadOk = SmsDaemon::Instance().ApplySettingsReload(g_bindIp, GetConfiguredDeviceName());
+                UpdateMainWindowTitle(hwnd);
+                g_lastEmptyStatus = SmsDaemon::Instance().GetConnectionStatusText();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                if (!reloadOk) {
+                    PostMessageW(hwnd, WM_APP_BIND_ALERT, 0, 0);
+                }
+            }
             return 0;
         }
 

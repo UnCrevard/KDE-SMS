@@ -31,17 +31,16 @@ SRC_DIR = cpp/src
 INC_DIR = cpp/include
 RES_DIR = cpp/resources
 OBJ_DIR = obj
-BIN_DIR = build
 
 # Compiler & Linker Flags
-CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -DUNICODE -D_UNICODE -DNOMINMAX -DWIN32_LEAN_AND_MEAN -I$(INC_DIR)
+CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -MMD -MP -DUNICODE -D_UNICODE -DNOMINMAX -DWIN32_LEAN_AND_MEAN -I$(INC_DIR)
 LDFLAGS_COMMON = -s -lws2_32 -lcrypt32 -lsecur32 -lshlwapi -lole32 -lshell32 -luuid -lcomdlg32 -ladvapi32 -ldwmapi -lgdi32
 LDFLAGS_UI = -mwindows -municode -ld2d1 -ldwrite -lwindowscodecs -lcomctl32 $(LDFLAGS_COMMON)
 LDFLAGS_DAEMON = -municode $(LDFLAGS_COMMON)
 
 # Target executables
-TARGET_UI = $(BIN_DIR)/KDEConnectSMS.exe
-TARGET_DAEMON = $(BIN_DIR)/KDEConnectDaemon.exe
+TARGET_UI = KDEConnectSMS.exe
+TARGET_DAEMON = KDEConnectDaemon.exe
 
 # Sources
 CORE_SRCS = $(SRC_DIR)/theme_manager.cpp \
@@ -54,10 +53,11 @@ UI_SRCS = $(SRC_DIR)/direct2d_renderer.cpp \
 
 DAEMON_SRCS = $(SRC_DIR)/main_daemon.cpp
 
-# Object files
+# Object & dependency files
 CORE_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(CORE_SRCS))
 UI_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(UI_SRCS))
 DAEMON_OBJS = $(patsubst $(SRC_DIR)/%.cpp,$(OBJ_DIR)/%.o,$(DAEMON_SRCS))
+DEPS = $(patsubst %.o,%.d,$(CORE_OBJS) $(UI_OBJS) $(DAEMON_OBJS))
 RES_OBJ = $(OBJ_DIR)/app_res.o
 
 # Phony targets
@@ -85,6 +85,8 @@ $(RES_OBJ): $(RES_DIR)/app.rc $(RES_DIR)/app.manifest | dirs
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp | dirs
 	@echo [CXX] $<
 	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+-include $(DEPS)
 
 # Link: Win32 Direct2D GUI Client
 $(TARGET_UI): $(UI_OBJS) $(CORE_OBJS) $(RES_OBJ) | dirs
