@@ -103,12 +103,24 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wcout << L"[*] Listening on UDP 1716 (Discovery) & TCP 1716 (Data)..." << std::endl;
     std::wcout << L"[*] Periodic identity broadcast active (every 4s)..." << std::endl;
 
-    if (!daemon.Start(targetBindIp)) {
-        std::wcerr << L"[!] Failed to start sync daemon." << std::endl;
+    if (!daemon.Start(targetBindIp) || !daemon.GetProtocol().IsListening()) {
+        std::wstring err = daemon.GetLastBindError();
+        if (daemon.IsClientMode()) {
+            std::wcerr << L"[!] Port 1716 deja utilise par une autre instance KDEConnectDaemon." << std::endl;
+        } else if (!err.empty()) {
+            std::wcerr << L"[!] " << err << std::endl;
+        } else {
+            std::wcerr << L"[!] Failed to start sync daemon." << std::endl;
+        }
+        daemon.Stop();
+        ToastNotifier::Instance().Shutdown();
+        CoUninitialize();
+        WSACleanup();
         return 1;
     }
 
-    std::wcout << L"[+] Daemon active and syncing. Press Ctrl+C to terminate." << std::endl;
+    std::wcout << L"[+] Daemon active on " << daemon.GetBoundEndpointSummary()
+               << L" and syncing. Press Ctrl+C to terminate." << std::endl;
 
     HANDLE hStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     WaitForSingleObject(hStopEvent, INFINITE);

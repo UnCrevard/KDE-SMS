@@ -46,6 +46,8 @@ namespace KDEConnect {
 
         // Status info for UI
         std::wstring GetConnectionStatusText() const;
+        std::wstring GetBoundEndpointSummary() const;
+        std::wstring GetLastBindError() const;
 
         // Protocol access
         ProtocolHandler& GetProtocol() { return m_protocol; }
@@ -86,6 +88,8 @@ namespace KDEConnect {
         std::wstring ResolveAvatarForAddressLocked(const std::wstring& rawAddress) const;
         int64_t FindConversationByPhoneLocked(const std::wstring& rawAddress) const;
         bool ApplyContactsToConversationsLocked();
+        bool IsDaemonIpcAvailable() const;
+        void RefreshClientStatusFromDaemon();
         bool SendIpcCommand(const std::string& command, std::string* outResponse = nullptr);
         void NotifyConversationsUpdated();
 
@@ -100,6 +104,9 @@ namespace KDEConnect {
         std::thread m_ipcThread;
 
         ProtocolHandler m_protocol;
+        mutable std::mutex m_netStatusMutex;
+        std::wstring m_lastBindError;
+        std::wstring m_clientBoundEndpoint;
         mutable std::mutex m_storageMutex;
         std::map<int64_t, Conversation> m_conversations;
         std::map<int64_t, int64_t> m_deletedThreads;

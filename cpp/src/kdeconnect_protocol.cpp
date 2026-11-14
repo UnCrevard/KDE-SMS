@@ -546,6 +546,7 @@ namespace KDEConnect {
     }
 
     void ProtocolHandler::CleanupTlsSession(TlsSession& session) {
+        std::lock_guard<std::mutex> lock(session.sendMutex);
         if (session.hasCtx) {
             DeleteSecurityContext(&session.hCtx);
             session.hasCtx = false;
@@ -1107,10 +1108,73 @@ namespace KDEConnect {
         return ips;
     }
 
+    std::wstring ProtocolHandler::GetEffectiveBindIp() const {
+        std::lock_guard<std::mutex> lock(m_statusMutex);
+        return m_effectiveBindIp;
+    }
+
+    std::wstring ProtocolHandler::GetBoundEndpointSummary() const {
+        std::lock_guard<std::mutex> lock(m_statusMutex);
+        if (!m_listening.load()) {
+            return L"";
+        }
+        if (!m_actualTcpEndpoint.empty()) {
+            return m_actualTcpEndpoint;
+        }
+        return m_actualUdpEndpoint;
+    }
+
+    std::wstring ProtocolHandler::GetLastBindError() const {
+        std::lock_guard<std::mutex> lock(m_statusMutex);
+        return m_lastBindError;
+    }
+
+    static std::wstring FormatWsaBindError(const std::wstring& proto, const std::wstring& ip, uint16_t port, int wsaErr) {
+        std::wstring msg = L"Echec bind " + proto + L" sur " + ip + L":" + std::to_wstring(port) +
+                           L" (code WSA " + std::to_wstring(wsaErr) + L")";
+        if (wsaErr == WSAEADDRINUSE) {
+            msg += L" - port " + std::to_wstring(port) + L" deja utilise par un autre processus";
+        } else if (wsaErr == WSAEADDRNOTAVAIL) {
+            msg += L" - adresse IP introuvable sur cette machine";
+        } else if (wsaErr == WSAEACCES) {
+            msg += L" - acces refuse (pare-feu ou reservation de port)";
+        }
+        return msg;
+    }
+
+    static std::wstring QuerySocketBoundIp(SOCKET sock, uint16_t& outPort) {
+        sockaddr_in boundAddr{};
+        int addrLen = sizeof(boundAddr);
+        if (getsockname(sock, reinterpret_cast<sockaddr*>(&boundAddr), &addrLen) == 0 &&
+            boundAddr.sin_family == AF_INET) {
+            outPort = ntohs(boundAddr.sin_port);
+            char ipBuf[INET_ADDRSTRLEN]{};
+            if (inet_ntop(AF_INET, &boundAddr.sin_addr, ipBuf, sizeof(ipBuf))) {
+                return Utf8ToWide(ipBuf);
+            }
+        }
+        return L"";
+    }
+
     bool ProtocolHandler::Start(const std::wstring& bindIp, uint16_t port) {
+        if (m_running || m_udpSocket != INVALID_SOCKET || m_tcpListenSocket != INVALID_SOCKET) {
+            Stop();
+        }
+
         m_bindIp = TrimBindIpWide(bindIp);
-        m_effectiveBindIp.clear();
+        if (m_bindIp == L"0.0.0.0") {
+            m_bindIp.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_statusMutex);
+            m_effectiveBindIp.clear();
+            m_actualUdpEndpoint.clear();
+            m_actualTcpEndpoint.clear();
+            m_lastBindError.clear();
+        }
+
         m_port = port;
+        m_listening = false;
         m_running = true;
 
         if (!EnsureLocalCertificate()) {
@@ -1119,86 +1183,154 @@ namespace KDEConnect {
 
         in_addr explicitBindIn{};
         bool hasExplicitBind = false;
-        if (!m_bindIp.empty() && m_bindIp != L"0.0.0.0") {
+        if (!m_bindIp.empty()) {
             std::string bindUtf8 = WideToUtf8(m_bindIp);
             if (inet_pton(AF_INET, bindUtf8.c_str(), &explicitBindIn) == 1) {
                 hasExplicitBind = true;
             } else {
-                std::wcerr << L"[Reseau] Adresse IP de bind invalide '" << m_bindIp << L"', utilisation de 0.0.0.0." << std::endl;
+                std::wstring errMsg = L"Adresse IPv4 de bind invalide : '" + m_bindIp + L"'";
+                std::wcerr << L"[Reseau] " << errMsg << std::endl;
+                {
+                    std::lock_guard<std::mutex> lock(m_statusMutex);
+                    m_lastBindError = errMsg;
+                }
+                m_running = false;
+                return false;
             }
         }
 
+        const std::wstring targetDisplayIp = hasExplicitBind ? m_bindIp : L"0.0.0.0";
+
+        auto bindWithRetry = [](SOCKET s, const sockaddr_in& addr, int& outErr) -> bool {
+            outErr = 0;
+            for (int attempt = 0; attempt < 4; ++attempt) {
+                if (bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != SOCKET_ERROR) {
+                    return true;
+                }
+                outErr = WSAGetLastError();
+                if (outErr != WSAEADDRINUSE && outErr != WSAEACCES) {
+                    return false;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            }
+            return false;
+        };
+
         m_udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (m_udpSocket == INVALID_SOCKET) {
-            std::wcerr << L"[ERREUR UDP] Impossible de creer le socket UDP (code " << WSAGetLastError() << L")" << std::endl;
+            int err = WSAGetLastError();
+            std::wstring errMsg = L"Impossible de creer le socket UDP (code WSA " + std::to_wstring(err) + L")";
+            std::wcerr << L"[ERREUR UDP] " << errMsg << std::endl;
+            {
+                std::lock_guard<std::mutex> lock(m_statusMutex);
+                m_lastBindError = errMsg;
+            }
+            m_running = false;
             return false;
         }
 
-        BOOL opt = TRUE;
-        setsockopt(m_udpSocket, SOL_SOCKET, SO_BROADCAST, (char*)&opt, sizeof(opt));
-        setsockopt(m_udpSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+        BOOL bcastOpt = TRUE;
+        setsockopt(m_udpSocket, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&bcastOpt), sizeof(bcastOpt));
+#ifdef SO_EXCLUSIVEADDRUSE
+        BOOL exclOpt = TRUE;
+        setsockopt(m_udpSocket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclOpt), sizeof(exclOpt));
+#endif
 
         sockaddr_in bindAddr{};
         bindAddr.sin_family = AF_INET;
         bindAddr.sin_port = htons(m_port);
         bindAddr.sin_addr.s_addr = hasExplicitBind ? explicitBindIn.s_addr : INADDR_ANY;
 
-        if (bind(m_udpSocket, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
-            int err = WSAGetLastError();
-            if (hasExplicitBind && err == WSAEADDRNOTAVAIL) {
-                std::wcerr << L"[AVERTISSEMENT UDP] Adresse " << m_bindIp << L":" << m_port
-                           << L" indisponible sur cet ordinateur (code " << err << L"), repli sur 0.0.0.0." << std::endl;
-                hasExplicitBind = false;
-                bindAddr.sin_addr.s_addr = INADDR_ANY;
-                if (bind(m_udpSocket, (sockaddr*)&bindAddr, sizeof(bindAddr)) == SOCKET_ERROR) {
-                    err = WSAGetLastError();
-                } else {
-                    err = 0;
-                }
+        int udpErr = 0;
+        if (!bindWithRetry(m_udpSocket, bindAddr, udpErr)) {
+            std::wstring errMsg = FormatWsaBindError(L"UDP", targetDisplayIp, m_port, udpErr);
+            std::wcerr << L"[ERREUR UDP] " << errMsg << std::endl;
+            {
+                std::lock_guard<std::mutex> lock(m_statusMutex);
+                m_lastBindError = errMsg;
             }
-            if (err != 0) {
-                std::wcerr << L"[ERREUR UDP] Echec bind sur "
-                           << (hasExplicitBind ? m_bindIp : L"0.0.0.0") << L":" << m_port
-                           << L" (code " << err << L")" << std::endl;
-                if (err == 10048) {
-                    std::wcerr << L"             -> Le port 1716 est deja utilise !" << std::endl;
-                }
-                closesocket(m_udpSocket);
-                m_udpSocket = INVALID_SOCKET;
-                return false;
-            }
+            closesocket(m_udpSocket);
+            m_udpSocket = INVALID_SOCKET;
+            m_running = false;
+            return false;
         }
 
-        m_effectiveBindIp = hasExplicitBind ? m_bindIp : L"";
-        std::wcout << L"[UDP Serveur] Ecoute active sur "
-                   << (hasExplicitBind ? m_effectiveBindIp : L"0.0.0.0") << L":" << m_port << std::endl;
+        uint16_t boundUdpPort = m_port;
+        std::wstring boundUdpIp = QuerySocketBoundIp(m_udpSocket, boundUdpPort);
+        if (boundUdpIp.empty()) boundUdpIp = targetDisplayIp;
 
         m_tcpListenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-        if (m_tcpListenSocket != INVALID_SOCKET) {
-            setsockopt(m_tcpListenSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
-            sockaddr_in tcpBindAddr{};
-            tcpBindAddr.sin_family = AF_INET;
-            tcpBindAddr.sin_port = htons(m_port);
-            tcpBindAddr.sin_addr.s_addr = hasExplicitBind ? explicitBindIn.s_addr : INADDR_ANY;
-
-            if (bind(m_tcpListenSocket, (sockaddr*)&tcpBindAddr, sizeof(tcpBindAddr)) == SOCKET_ERROR) {
-                std::wcerr << L"[ERREUR TCP] Echec bind sur "
-                           << (hasExplicitBind ? m_effectiveBindIp : L"0.0.0.0") << L":" << m_port
-                           << L" (code " << WSAGetLastError() << L")" << std::endl;
-                closesocket(m_tcpListenSocket);
-                m_tcpListenSocket = INVALID_SOCKET;
-                if (!hasExplicitBind) {
-                    closesocket(m_udpSocket);
-                    m_udpSocket = INVALID_SOCKET;
-                    return false;
-                }
-            } else {
-                listen(m_tcpListenSocket, SOMAXCONN);
-                std::wcout << L"[TCP Serveur] Ecoute active sur "
-                           << (hasExplicitBind ? m_effectiveBindIp : L"0.0.0.0") << L":" << m_port
-                           << L" (Pret pour TLS & appairage)" << std::endl;
+        if (m_tcpListenSocket == INVALID_SOCKET) {
+            int err = WSAGetLastError();
+            std::wstring errMsg = L"Impossible de creer le socket TCP (code WSA " + std::to_wstring(err) + L")";
+            std::wcerr << L"[ERREUR TCP] " << errMsg << std::endl;
+            {
+                std::lock_guard<std::mutex> lock(m_statusMutex);
+                m_lastBindError = errMsg;
             }
+            closesocket(m_udpSocket);
+            m_udpSocket = INVALID_SOCKET;
+            m_running = false;
+            return false;
         }
+
+#ifdef SO_EXCLUSIVEADDRUSE
+        setsockopt(m_tcpListenSocket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, reinterpret_cast<const char*>(&exclOpt), sizeof(exclOpt));
+#endif
+        sockaddr_in tcpBindAddr{};
+        tcpBindAddr.sin_family = AF_INET;
+        tcpBindAddr.sin_port = htons(m_port);
+        tcpBindAddr.sin_addr.s_addr = hasExplicitBind ? explicitBindIn.s_addr : INADDR_ANY;
+
+        int tcpErr = 0;
+        if (!bindWithRetry(m_tcpListenSocket, tcpBindAddr, tcpErr)) {
+            std::wstring errMsg = FormatWsaBindError(L"TCP", targetDisplayIp, m_port, tcpErr);
+            std::wcerr << L"[ERREUR TCP] " << errMsg << std::endl;
+            {
+                std::lock_guard<std::mutex> lock(m_statusMutex);
+                m_lastBindError = errMsg;
+            }
+            closesocket(m_tcpListenSocket);
+            m_tcpListenSocket = INVALID_SOCKET;
+            closesocket(m_udpSocket);
+            m_udpSocket = INVALID_SOCKET;
+            m_running = false;
+            return false;
+        }
+
+        if (listen(m_tcpListenSocket, SOMAXCONN) == SOCKET_ERROR) {
+            int err = WSAGetLastError();
+            std::wstring errMsg = L"Echec listen TCP sur " + targetDisplayIp + L":" + std::to_wstring(m_port) +
+                                  L" (code WSA " + std::to_wstring(err) + L")";
+            std::wcerr << L"[ERREUR TCP] " << errMsg << std::endl;
+            {
+                std::lock_guard<std::mutex> lock(m_statusMutex);
+                m_lastBindError = errMsg;
+            }
+            closesocket(m_tcpListenSocket);
+            m_tcpListenSocket = INVALID_SOCKET;
+            closesocket(m_udpSocket);
+            m_udpSocket = INVALID_SOCKET;
+            m_running = false;
+            return false;
+        }
+
+        uint16_t boundTcpPort = m_port;
+        std::wstring boundTcpIp = QuerySocketBoundIp(m_tcpListenSocket, boundTcpPort);
+        if (boundTcpIp.empty()) boundTcpIp = targetDisplayIp;
+
+        {
+            std::lock_guard<std::mutex> lock(m_statusMutex);
+            m_effectiveBindIp = (boundTcpIp != L"0.0.0.0") ? boundTcpIp : (hasExplicitBind ? m_bindIp : L"");
+            m_actualUdpEndpoint = boundUdpIp + L":" + std::to_wstring(boundUdpPort);
+            m_actualTcpEndpoint = boundTcpIp + L":" + std::to_wstring(boundTcpPort);
+            m_lastBindError.clear();
+        }
+        m_listening = true;
+
+        std::wcout << L"[UDP Serveur] Ecoute active sur " << boundUdpIp << L":" << boundUdpPort << std::endl;
+        std::wcout << L"[TCP Serveur] Ecoute active sur " << boundTcpIp << L":" << boundTcpPort
+                   << L" (Pret pour TLS & appairage)" << std::endl;
 
         m_udpThread = std::thread(&ProtocolHandler::UdpDiscoveryThread, this);
         m_tcpThread = std::thread(&ProtocolHandler::TcpServerThread, this);
@@ -1210,6 +1342,7 @@ namespace KDEConnect {
 
     void ProtocolHandler::Stop() {
         m_running = false;
+        m_listening = false;
 
         if (m_udpSocket != INVALID_SOCKET) {
             closesocket(m_udpSocket);
@@ -1224,16 +1357,35 @@ namespace KDEConnect {
         {
             std::lock_guard<std::mutex> lock(m_connMutex);
             for (auto& kv : m_activeSessions) {
-                if (kv.second && kv.second->sock != INVALID_SOCKET) {
-                    closesocket(kv.second->sock);
+                if (kv.second) {
+                    std::lock_guard<std::mutex> sLock(kv.second->sendMutex);
+                    if (kv.second->sock != INVALID_SOCKET) {
+                        linger l{ 1, 0 };
+                        setsockopt(kv.second->sock, SOL_SOCKET, SO_LINGER, reinterpret_cast<const char*>(&l), sizeof(l));
+                        shutdown(kv.second->sock, SD_BOTH);
+                        closesocket(kv.second->sock);
+                        kv.second->sock = INVALID_SOCKET;
+                    }
                 }
             }
             m_activeSessions.clear();
+            m_lastTcpAttempt.clear();
         }
 
         if (m_broadcastThread.joinable()) m_broadcastThread.join();
         if (m_udpThread.joinable()) m_udpThread.join();
         if (m_tcpThread.joinable()) m_tcpThread.join();
+
+        {
+            std::lock_guard<std::mutex> lock(m_devicesMutex);
+            m_knownDevices.clear();
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_statusMutex);
+            m_effectiveBindIp.clear();
+            m_actualUdpEndpoint.clear();
+            m_actualTcpEndpoint.clear();
+        }
     }
 
     void ProtocolHandler::PeriodicBroadcastThread() {

@@ -64,6 +64,10 @@ namespace KDEConnect {
 
         const DeviceInfo& GetLocalIdentity() const { return m_localIdentity; }
         const std::wstring& GetBindIp() const { return m_bindIp; }
+        bool IsListening() const { return m_listening.load(); }
+        std::wstring GetEffectiveBindIp() const;
+        std::wstring GetBoundEndpointSummary() const;
+        std::wstring GetLastBindError() const;
         void UpdateDeviceName(const std::wstring& deviceName);
 
     private:
@@ -96,9 +100,14 @@ namespace KDEConnect {
         std::string BuildIdentityPacket() const;
 
         std::atomic<bool> m_running{false};
+        std::atomic<bool> m_listening{false};
         uint16_t m_port = 1716;
         std::wstring m_bindIp;
         std::wstring m_effectiveBindIp;
+        mutable std::mutex m_statusMutex;
+        std::wstring m_actualUdpEndpoint;
+        std::wstring m_actualTcpEndpoint;
+        std::wstring m_lastBindError;
 
         SOCKET m_udpSocket = INVALID_SOCKET;
         SOCKET m_tcpListenSocket = INVALID_SOCKET;

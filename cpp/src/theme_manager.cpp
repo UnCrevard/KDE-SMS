@@ -6,10 +6,40 @@ namespace KDEConnect {
 
     namespace {
 
+        std::wstring GetExecutableDirectory() {
+            std::wstring buf(MAX_PATH, L'\0');
+            for (;;) {
+                DWORD copied = GetModuleFileNameW(nullptr, &buf[0], static_cast<DWORD>(buf.size()));
+                if (copied == 0) return L"";
+                if (copied < buf.size() - 1) {
+                    buf.resize(copied);
+                    break;
+                }
+                if (buf.size() >= 32768) {
+                    buf.resize(copied);
+                    break;
+                }
+                buf.resize(buf.size() * 2, L'\0');
+            }
+            size_t slash = buf.find_last_of(L"\\/");
+            if (slash == std::wstring::npos) return L"";
+            if (slash == 2 && buf[1] == L':') {
+                return buf.substr(0, 3);
+            }
+            return buf.substr(0, slash);
+        }
+
+        bool FileExistsWin32(const std::wstring& path) {
+            if (path.empty()) return false;
+            DWORD attrs = GetFileAttributesW(path.c_str());
+            return (attrs != INVALID_FILE_ATTRIBUTES) && ((attrs & FILE_ATTRIBUTE_DIRECTORY) == 0);
+        }
+
         std::wstring ResolveInitialCurrentDirectory() {
             static std::wstring cachedDir;
             static std::once_flag once;
             std::call_once(once, []() {
+                std::wstring cwd;
                 DWORD len = GetCurrentDirectoryW(0, nullptr);
                 if (len > 0) {
                     std::wstring buf(len, L'\0');
@@ -19,11 +49,27 @@ namespace KDEConnect {
                         while (buf.size() > 3 && (buf.back() == L'\\' || buf.back() == L'/')) {
                             buf.pop_back();
                         }
-                        cachedDir = buf;
-                        return;
+                        cwd = buf;
                     }
                 }
-                cachedDir = L".";
+
+                std::wstring exeDir = GetExecutableDirectory();
+                std::wstring cwdIni = cwd.empty() ? L"" : (cwd + L"\\" + SETTINGS_INI_FILENAME);
+                std::wstring exeIni = exeDir.empty() ? L"" : (exeDir + L"\\" + SETTINGS_INI_FILENAME);
+
+                // Prefer an already-existing INI (exeDir first if both exist, or cwd if only cwd exists),
+                // and default new installs to exeDir so KDEConnectSMS.exe and KDEConnectDaemon.exe always share one INI.
+                if (FileExistsWin32(exeIni)) {
+                    cachedDir = exeDir;
+                } else if (FileExistsWin32(cwdIni)) {
+                    cachedDir = cwd;
+                } else if (!exeDir.empty()) {
+                    cachedDir = exeDir;
+                } else if (!cwd.empty()) {
+                    cachedDir = cwd;
+                } else {
+                    cachedDir = L".";
+                }
             });
             return cachedDir;
         }

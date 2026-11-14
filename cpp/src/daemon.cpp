@@ -824,23 +824,110 @@ namespace KDEConnect {
         }
     }
 
+    static std::wstring NormalizeBindIpForCompare(const std::wstring& ip) {
+        std::wstring clean = TrimWideCopy(ip);
+        if (clean == L"0.0.0.0") clean.clear();
+        return clean;
+    }
+
+    static std::string ExtractSimpleJsonStringField(const std::string& json, const std::string& field) {
+        std::string needle = "\"" + field + "\":\"";
+        size_t pos = json.find(needle);
+        if (pos == std::string::npos) return "";
+        size_t start = pos + needle.size();
+        size_t end = json.find('"', start);
+        if (end == std::string::npos) return "";
+        return json.substr(start, end - start);
+    }
+
+    bool SmsDaemon::IsDaemonIpcAvailable() const {
+        if (WaitNamedPipeW(IPC_PIPE_NAME, 150)) {
+            return true;
+        }
+        DWORD err = GetLastError();
+        return (err == ERROR_PIPE_BUSY);
+    }
+
+    void SmsDaemon::RefreshClientStatusFromDaemon() {
+        std::string resp;
+        if (!SendIpcCommand("STATUS\n", &resp)) return;
+        std::string bound = ExtractSimpleJsonStringField(resp, "bound");
+        std::string errHex = ExtractSimpleJsonStringField(resp, "error");
+        std::lock_guard<std::mutex> lock(m_netStatusMutex);
+        if (!bound.empty()) {
+            m_clientBoundEndpoint = Utf8ToWide(bound);
+        }
+        if (!errHex.empty()) {
+            m_lastBindError = Utf8ToWide(HexDecode(errHex));
+        } else if (!bound.empty()) {
+            m_lastBindError.clear();
+        }
+    }
+
+    std::wstring SmsDaemon::GetBoundEndpointSummary() const {
+        if (m_isClientMode) {
+            std::lock_guard<std::mutex> lock(m_netStatusMutex);
+            return m_clientBoundEndpoint;
+        }
+        return m_protocol.GetBoundEndpointSummary();
+    }
+
+    std::wstring SmsDaemon::GetLastBindError() const {
+        std::lock_guard<std::mutex> lock(m_netStatusMutex);
+        if (!m_lastBindError.empty()) {
+            return m_lastBindError;
+        }
+        return m_protocol.GetLastBindError();
+    }
+
     bool SmsDaemon::ApplySettingsReload(const std::wstring& newBindIp, const std::wstring& newDeviceName) {
         GetReceivedFilesDirectory();
         ReloadStorageDirectory();
 
-        std::wstring cleanBindIp = TrimWideCopy(newBindIp);
+        std::wstring cleanBindIp = NormalizeBindIpForCompare(newBindIp);
         if (m_isClientMode) {
             std::string cmd = "RELOAD_CONFIG|" + HexEncode(WideToUtf8(cleanBindIp)) + "|" +
                               HexEncode(WideToUtf8(newDeviceName)) + "\n";
-            return SendIpcCommand(cmd);
+            std::string resp;
+            if (!SendIpcCommand(cmd, &resp)) {
+                std::lock_guard<std::mutex> lock(m_netStatusMutex);
+                m_lastBindError = L"Impossible de joindre KDEConnectDaemon via IPC.";
+                return false;
+            }
+            std::string status = ExtractSimpleJsonStringField(resp, "status");
+            std::string bound = ExtractSimpleJsonStringField(resp, "bound");
+            std::string errHex = ExtractSimpleJsonStringField(resp, "error");
+            {
+                std::lock_guard<std::mutex> lock(m_netStatusMutex);
+                m_clientBoundEndpoint = Utf8ToWide(bound);
+                if (status == "error") {
+                    m_lastBindError = errHex.empty()
+                        ? L"Echec de liaison reseau sur le service Daemon."
+                        : Utf8ToWide(HexDecode(errHex));
+                } else {
+                    m_lastBindError.clear();
+                }
+            }
+            return status != "error";
         }
 
         m_protocol.UpdateDeviceName(newDeviceName);
-        if (m_running && cleanBindIp != m_protocol.GetBindIp()) {
+        std::wstring currentEffective = NormalizeBindIpForCompare(m_protocol.GetEffectiveBindIp());
+        if (m_running && (!m_protocol.IsListening() || cleanBindIp != currentEffective)) {
             m_protocol.Stop();
-            return m_protocol.Start(cleanBindIp);
+            bool started = m_protocol.Start(cleanBindIp);
+            if (!started) {
+                std::lock_guard<std::mutex> lock(m_netStatusMutex);
+                m_lastBindError = m_protocol.GetLastBindError();
+                return false;
+            }
+            {
+                std::lock_guard<std::mutex> lock(m_netStatusMutex);
+                m_lastBindError.clear();
+            }
+            return true;
         }
-        return true;
+        return m_protocol.IsListening();
     }
 
     bool SmsDaemon::Start(const std::wstring& bindIp) {
@@ -891,23 +978,36 @@ namespace KDEConnect {
         });
 
         // Start protocol handler on UDP 1716 and TCP 1716.
-        // If KDEConnectDaemon.exe already owns port 1716, seamlessly fall back to IPC Client Mode!
+        // Only enter IPC Client Mode if KDEConnectDaemon's Named Pipe is actually present.
         bool protocolStarted = m_protocol.Start(bindIp);
-        m_isClientMode = !protocolStarted;
-
-        if (!m_isClientMode) {
-            m_ipcThread = std::thread(&SmsDaemon::NamedPipeIpcThread, this);
-        } else {
+        if (!protocolStarted && IsDaemonIpcAvailable()) {
+            m_isClientMode = true;
+            {
+                std::lock_guard<std::mutex> lock(m_netStatusMutex);
+                m_lastBindError.clear();
+            }
             std::wcout << L"[IPC Client] Port 1716 occupe par KDEConnectDaemon. Mode client IPC active." << std::endl;
+        } else {
+            m_isClientMode = false;
+            if (!protocolStarted) {
+                std::lock_guard<std::mutex> lock(m_netStatusMutex);
+                m_lastBindError = m_protocol.GetLastBindError();
+            } else {
+                std::lock_guard<std::mutex> lock(m_netStatusMutex);
+                m_lastBindError.clear();
+            }
+            m_ipcThread = std::thread(&SmsDaemon::NamedPipeIpcThread, this);
         }
 
         m_watcherThread = std::thread(&SmsDaemon::DirectoryWatcherThread, this);
 
-        // If in client mode, kick off a SYNC command to the background daemon
+        // If in client mode, query daemon status and kick off a SYNC command
         if (m_isClientMode) {
             std::thread([this]() {
                 if (m_running) {
+                    RefreshClientStatusFromDaemon();
                     SendIpcCommand("SYNC\n");
+                    NotifyConversationsUpdated();
                 }
             }).detach();
         }
@@ -1153,7 +1253,6 @@ namespace KDEConnect {
                                 hasReloadArgs = true;
                             }
                         }
-                        response = "{\"status\":\"ok\"}\n";
                     } else if (cmd.rfind("SYNC_THREAD:", 0) == 0) {
                         int64_t tid = std::strtoll(cmd.substr(12).c_str(), nullptr, 10);
                         bool ok = RequestThreadSync(tid);
@@ -1197,8 +1296,26 @@ namespace KDEConnect {
                         }
                     } else if (cmd == "STATUS") {
                         auto connectedDevs = m_protocol.GetConnectedDevices();
+                        std::string bound = WideToUtf8(m_protocol.GetBoundEndpointSummary());
+                        std::string errHex = HexEncode(WideToUtf8(m_protocol.GetLastBindError()));
                         std::ostringstream ss;
-                        ss << "{\"status\":\"ok\",\"connected\":" << connectedDevs.size() << "}\n";
+                        ss << "{\"status\":\"ok\",\"connected\":" << connectedDevs.size()
+                           << ",\"bound\":\"" << bound << "\""
+                           << ",\"error\":\"" << errHex << "\"}\n";
+                        response = ss.str();
+                    }
+
+                    if (triggerReload) {
+                        bool reloadOk = ApplySettingsReload(
+                            hasReloadArgs ? reloadBindIp : ReadIniString(L"Network", L"BindIp", L""),
+                            (hasReloadArgs && !reloadDeviceName.empty()) ? reloadDeviceName : GetConfiguredDeviceName()
+                        );
+                        std::string bound = WideToUtf8(m_protocol.GetBoundEndpointSummary());
+                        std::string errHex = HexEncode(WideToUtf8(GetLastBindError()));
+                        std::ostringstream ss;
+                        ss << "{\"status\":\"" << (reloadOk ? "ok" : "error") << "\""
+                           << ",\"bound\":\"" << bound << "\""
+                           << ",\"error\":\"" << errHex << "\"}\n";
                         response = ss.str();
                     }
 
@@ -1207,13 +1324,6 @@ namespace KDEConnect {
                     DisconnectNamedPipe(pipe);
                     CloseHandle(pipe);
                     pipe = INVALID_HANDLE_VALUE;
-
-                    if (triggerReload) {
-                        ApplySettingsReload(
-                            hasReloadArgs ? reloadBindIp : ReadIniString(L"Network", L"BindIp", L""),
-                            (hasReloadArgs && !reloadDeviceName.empty()) ? reloadDeviceName : GetConfiguredDeviceName()
-                        );
-                    }
                     continue;
                 }
                 DisconnectNamedPipe(pipe);
@@ -1246,15 +1356,31 @@ namespace KDEConnect {
 
     std::wstring SmsDaemon::GetConnectionStatusText() const {
         if (m_isClientMode) {
+            std::wstring bound = GetBoundEndpointSummary();
+            std::wstring err = GetLastBindError();
+            if (!err.empty()) {
+                return L"Service Daemon (IPC) - " + err;
+            }
+            if (!bound.empty()) {
+                return L"Connecte au service Daemon (IPC actif - " + bound + L")";
+            }
             return L"Connecte au service Daemon (IPC actif)";
         }
+
+        if (!m_protocol.IsListening()) {
+            std::wstring err = GetLastBindError();
+            return err.empty() ? L"Ecoute reseau inactive (verifiez l'IP dans Reglages)" : err;
+        }
+
+        std::wstring bound = m_protocol.GetBoundEndpointSummary();
+        std::wstring bindSuffix = bound.empty() ? L"" : (L" [" + bound + L"]");
         auto devs = m_protocol.GetConnectedDevices();
         if (devs.empty()) {
-            return L"En attente de connexion du telephone sur le port 1716...";
+            return L"En attente de connexion du telephone sur " + (bound.empty() ? L"0.0.0.0:1716" : bound) + L"...";
         }
         const auto& d = devs.front();
         std::wstring name = d.deviceName.empty() ? d.ipAddress : d.deviceName;
-        return L"Connecte a " + name + (d.isPaired ? L" (Appaire)" : L" (En attente d'appairage)");
+        return L"Connecte a " + name + (d.isPaired ? L" (Appaire)" : L" (En attente d'appairage)") + bindSuffix;
     }
 
     void SmsDaemon::HandleIncomingKdePacket(const DeviceInfo& device, const KDEPacket& packet) {

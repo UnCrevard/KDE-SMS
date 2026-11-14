@@ -3,6 +3,7 @@
 #include "direct2d_renderer.h"
 #include "toast_notifier.h"
 #include "daemon.h"
+#include <shellapi.h>
 #include <filesystem>
 #include <map>
 #include <set>
@@ -58,10 +59,12 @@ static UINT g_msgTaskbarCreated = 0;
 #define IDC_SYNC_TIMER       1
 #define IDC_DEBOUNCE_TIMER   2
 #define IDM_DELETE_CONV      2001
-#define IDM_TRAY_SHOW        2002
-#define IDM_TRAY_EXIT        2003
-#define IDM_TRAY_SETTINGS    2004
-#define WM_APP_REFRESH_CONVS (WM_APP + 1)
+#define IDM_TRAY_SHOW         2002
+#define IDM_TRAY_EXIT         2003
+#define IDM_TRAY_SETTINGS     2004
+#define WM_APP_REFRESH_CONVS  (WM_APP + 1)
+#define WM_APP_RESTORE_WINDOW (WM_APP + 2)
+#define WM_APP_RELOAD_INI     (WM_APP + 3)
 
 // Settings modal control IDs
 #define IDC_SET_CONV_EDIT        3001
@@ -103,6 +106,22 @@ static void RestoreFromTray(HWND hwnd) {
         ShowWindow(hwnd, SW_SHOW);
     }
     SetForegroundWindow(hwnd);
+}
+
+static void UpdateMainWindowTitle(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return;
+    std::wstring base = L"KDE Connect SMS - Windows Win32";
+    std::wstring endpoint = SmsDaemon::Instance().GetBoundEndpointSummary();
+    std::wstring bindErr = SmsDaemon::Instance().GetLastBindError();
+    std::wstring title = base;
+    if (!bindErr.empty()) {
+        title += L" [Erreur reseau]";
+    } else if (SmsDaemon::Instance().IsClientMode()) {
+        title += endpoint.empty() ? L" [Daemon IPC]" : (L" [IPC - " + endpoint + L"]");
+    } else if (!endpoint.empty()) {
+        title += L" [" + endpoint + L"]";
+    }
+    SetWindowTextW(hwnd, title.c_str());
 }
 
 static LRESULT CALLBACK ComposerEditProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -662,7 +681,7 @@ void ShowSettingsDialog(HWND parent) {
     }
 
     const int clientW = 540;
-    const int clientH = 540;
+    const int clientH = 568;
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     RECT winRc{ 0, 0, clientW, clientH };
     AdjustWindowRectEx(&winRc, style, FALSE, 0);
@@ -713,44 +732,57 @@ void ShowSettingsDialog(HWND parent) {
     addCtrl(L"BUTTON", L"Parcourir...", BS_PUSHBUTTON | WS_TABSTOP, 0, 416, 105, 92, 26, IDC_SET_RECV_BROWSE);
 
     // Group 2: Network interface & device name
-    addCtrl(L"BUTTON", L"Reseau KDE Connect", BS_GROUPBOX, 0, 18, 156, 504, 126, 0);
+    addCtrl(L"BUTTON", L"Reseau KDE Connect", BS_GROUPBOX, 0, 18, 156, 504, 150, 0);
     addCtrl(L"STATIC", L"Interface reseau a utiliser (Bind IPv4) :", 0, 0, 32, 178, 476, 18, 0);
     state.bindCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 32, 198, 476, 180, IDC_SET_BIND_COMBO);
 
     state.bindIpValues.push_back(L"");
     SendMessageW(state.bindCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Toutes les interfaces (0.0.0.0 - automatique)"));
+    std::wstring configuredBind = (g_bindIp == L"0.0.0.0") ? L"" : g_bindIp;
     std::vector<std::wstring> localIps = ProtocolHandler::GetLocalIpAddresses();
     int selectedBindIdx = 0;
     for (const auto& ip : localIps) {
         state.bindIpValues.push_back(ip);
         SendMessageW(state.bindCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(ip.c_str()));
-        if (!g_bindIp.empty() && ip == g_bindIp) {
+        if (!configuredBind.empty() && ip == configuredBind) {
             selectedBindIdx = static_cast<int>(state.bindIpValues.size()) - 1;
         }
     }
-    if (!g_bindIp.empty() && selectedBindIdx == 0) {
-        state.bindIpValues.push_back(g_bindIp);
-        std::wstring customLabel = g_bindIp + L" (configuree)";
+    if (!configuredBind.empty() && selectedBindIdx == 0) {
+        state.bindIpValues.push_back(configuredBind);
+        std::wstring customLabel = configuredBind + L" (configuree - non detectee)";
         SendMessageW(state.bindCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(customLabel.c_str()));
         selectedBindIdx = static_cast<int>(state.bindIpValues.size()) - 1;
     }
     SendMessageW(state.bindCombo, CB_SETCURSEL, static_cast<WPARAM>(selectedBindIdx), 0);
 
-    addCtrl(L"STATIC", L"Nom de cet ordinateur sur KDE Connect :", 0, 0, 32, 228, 476, 18, 0);
-    state.devNameEdit = addCtrl(L"EDIT", GetConfiguredDeviceName().c_str(), ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 32, 248, 476, 24, IDC_SET_DEVNAME_EDIT);
+    std::wstring activeEndpoint = SmsDaemon::Instance().GetBoundEndpointSummary();
+    std::wstring activeBindErr = SmsDaemon::Instance().GetLastBindError();
+    std::wstring bindStatusLine;
+    if (!activeBindErr.empty()) {
+        bindStatusLine = L"Etat actuel : " + activeBindErr;
+    } else if (SmsDaemon::Instance().IsClientMode()) {
+        bindStatusLine = L"Etat actuel : Via KDEConnectDaemon IPC (" + (activeEndpoint.empty() ? L"en cours" : activeEndpoint) + L")";
+    } else {
+        bindStatusLine = L"Ecoute active : " + (activeEndpoint.empty() ? L"inactive" : activeEndpoint);
+    }
+    addCtrl(L"STATIC", bindStatusLine.c_str(), SS_ENDELLIPSIS, 0, 32, 228, 476, 18, 0);
+
+    addCtrl(L"STATIC", L"Nom de cet ordinateur sur KDE Connect :", 0, 0, 32, 250, 476, 18, 0);
+    state.devNameEdit = addCtrl(L"EDIT", GetConfiguredDeviceName().c_str(), ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 32, 270, 476, 24, IDC_SET_DEVNAME_EDIT);
 
     // Group 3: Application preferences
-    addCtrl(L"BUTTON", L"Reglages de l'application", BS_GROUPBOX, 0, 18, 292, 504, 192, 0);
+    addCtrl(L"BUTTON", L"Reglages de l'application", BS_GROUPBOX, 0, 18, 316, 504, 192, 0);
 
-    addCtrl(L"STATIC", L"Theme de l'interface :", 0, 0, 32, 316, 170, 20, 0);
-    state.themeCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 210, 313, 298, 140, IDC_SET_THEME_COMBO);
+    addCtrl(L"STATIC", L"Theme de l'interface :", 0, 0, 32, 340, 170, 20, 0);
+    state.themeCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 210, 337, 298, 140, IDC_SET_THEME_COMBO);
     SendMessageW(state.themeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Systeme (suivre Windows)"));
     SendMessageW(state.themeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Clair"));
     SendMessageW(state.themeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"Sombre"));
     SendMessageW(state.themeCombo, CB_SETCURSEL, static_cast<WPARAM>(ThemeManager::Instance().GetMode()), 0);
 
-    addCtrl(L"STATIC", L"Synchronisation auto :", 0, 0, 32, 346, 170, 20, 0);
-    state.syncCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 210, 343, 298, 160, IDC_SET_SYNC_COMBO);
+    addCtrl(L"STATIC", L"Synchronisation auto :", 0, 0, 32, 370, 170, 20, 0);
+    state.syncCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 210, 367, 298, 160, IDC_SET_SYNC_COMBO);
     const std::pair<int, const wchar_t*> syncOptions[] = {
         { 3, L"Toutes les 3 secondes" },
         { 5, L"Toutes les 5 secondes (par defaut)" },
@@ -770,22 +802,23 @@ void ShowSettingsDialog(HWND parent) {
     }
     SendMessageW(state.syncCombo, CB_SETCURSEL, static_cast<WPARAM>(syncSelIdx), 0);
 
-    state.minTrayChk = addCtrl(L"BUTTON", L"Reduire dans la zone de notification lors de la fermeture", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 378, 476, 22, IDC_SET_MINTRAY_CHK);
+    state.minTrayChk = addCtrl(L"BUTTON", L"Reduire dans la zone de notification lors de la fermeture", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 402, 476, 22, IDC_SET_MINTRAY_CHK);
     SendMessageW(state.minTrayChk, BM_SETCHECK, ReadIniInt(L"App", L"MinimizeToTrayOnClose", 1) != 0 ? BST_CHECKED : BST_UNCHECKED, 0);
 
-    state.notifyChk = addCtrl(L"BUTTON", L"Activer les notifications bureau pour les nouveaux SMS", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 404, 476, 22, IDC_SET_NOTIFY_CHK);
+    state.notifyChk = addCtrl(L"BUTTON", L"Activer les notifications bureau pour les nouveaux SMS", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 428, 476, 22, IDC_SET_NOTIFY_CHK);
     SendMessageW(state.notifyChk, BM_SETCHECK, ReadIniInt(L"App", L"EnableNotifications", 1) != 0 ? BST_CHECKED : BST_UNCHECKED, 0);
 
-    state.startHiddenChk = addCtrl(L"BUTTON", L"Demarrer l'application reduite dans la zone de notification", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 430, 476, 22, IDC_SET_STARTHIDDEN_CHK);
+    state.startHiddenChk = addCtrl(L"BUTTON", L"Demarrer l'application reduite dans la zone de notification", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 454, 476, 22, IDC_SET_STARTHIDDEN_CHK);
     SendMessageW(state.startHiddenChk, BM_SETCHECK, ReadIniInt(L"App", L"StartHidden", 0) != 0 ? BST_CHECKED : BST_UNCHECKED, 0);
 
-    state.skipDeleteChk = addCtrl(L"BUTTON", L"Ne pas demander de confirmation lors de la suppression d'une conversation", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 456, 476, 22, IDC_SET_SKIPDEL_CHK);
+    state.skipDeleteChk = addCtrl(L"BUTTON", L"Ne pas demander de confirmation lors de la suppression d'une conversation", BS_AUTOCHECKBOX | WS_TABSTOP, 0, 32, 480, 476, 22, IDC_SET_SKIPDEL_CHK);
     SendMessageW(state.skipDeleteChk, BM_SETCHECK, ReadIniInt(L"App", L"SkipDeleteConfirmation", 0) != 0 ? BST_CHECKED : BST_UNCHECKED, 0);
 
     // Bottom status & actions
-    addCtrl(L"STATIC", L"Fichier INI : KDEConnectSMS.ini", 0, 0, 18, 501, 290, 20, 0);
-    addCtrl(L"BUTTON", L"Enregistrer", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 316, 495, 100, 30, IDC_SET_SAVE_BTN);
-    addCtrl(L"BUTTON", L"Annuler", BS_PUSHBUTTON | WS_TABSTOP, 0, 422, 495, 100, 30, IDC_SET_CANCEL_BTN);
+    std::wstring iniDisplay = L"INI : " + GetSettingsIniPath();
+    addCtrl(L"STATIC", iniDisplay.c_str(), SS_PATHELLIPSIS, 0, 18, 526, 290, 20, 0);
+    addCtrl(L"BUTTON", L"Enregistrer", BS_DEFPUSHBUTTON | WS_TABSTOP, 0, 316, 520, 100, 30, IDC_SET_SAVE_BTN);
+    addCtrl(L"BUTTON", L"Annuler", BS_PUSHBUTTON | WS_TABSTOP, 0, 422, 520, 100, 30, IDC_SET_CANCEL_BTN);
 
     if (parent) EnableWindow(parent, FALSE);
     ShowWindow(hDlg, SW_SHOW);
@@ -819,7 +852,8 @@ void ShowSettingsDialog(HWND parent) {
         SetConversationsDirectory(state.resConvDir);
         SetReceivedFilesDirectory(state.resRecvDir);
 
-        g_bindIp = state.resBindIp;
+        g_bindIp = TrimWideLocal(state.resBindIp);
+        if (g_bindIp == L"0.0.0.0") g_bindIp.clear();
         WriteIniString(L"Network", L"BindIp", g_bindIp.c_str());
         SetConfiguredDeviceName(state.resDeviceName);
 
@@ -834,13 +868,22 @@ void ShowSettingsDialog(HWND parent) {
             ConfigureSyncTimer(parent);
         }
 
-        SmsDaemon::Instance().ApplySettingsReload(g_bindIp, state.resDeviceName);
+        bool reloadOk = SmsDaemon::Instance().ApplySettingsReload(g_bindIp, state.resDeviceName);
         if (prevConvDir != GetMessagesDirectory()) {
             SmsDaemon::Instance().RequestConversationsSync();
         }
         if (parent) {
+            UpdateMainWindowTitle(parent);
+            g_lastEmptyStatus = SmsDaemon::Instance().GetConnectionStatusText();
             ReloadConversations(parent, true, true);
             InvalidateRect(parent, nullptr, FALSE);
+        }
+        if (!reloadOk) {
+            std::wstring bindErr = SmsDaemon::Instance().GetLastBindError();
+            std::wstring errMsg = L"Les reglages ont ete enregistres dans :\n" + GetSettingsIniPath() +
+                                  L"\n\nCependant, la liaison reseau sur l'adresse choisie a echoue :\n\n" +
+                                  (bindErr.empty() ? L"Impossible de binder UDP/TCP sur le port 1716." : bindErr);
+            MessageBoxW(parent, errMsg.c_str(), L"Erreur de liaison reseau", MB_OK | MB_ICONWARNING);
         }
     }
 }
@@ -1001,6 +1044,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             // Start background sync daemon (or attach as IPC client if KDEConnectDaemon already runs)
             SmsDaemon::Instance().Start(g_bindIp);
+            UpdateMainWindowTitle(hwnd);
 
             // Create UI font
             g_hFont = CreateFontW(
@@ -1086,9 +1130,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_TIMER: {
             if (wParam == IDC_DEBOUNCE_TIMER) {
                 KillTimer(hwnd, IDC_DEBOUNCE_TIMER);
+                UpdateMainWindowTitle(hwnd);
                 ReloadConversations(hwnd, true);
             } else if (wParam == IDC_SYNC_TIMER) {
                 SmsDaemon::Instance().RequestConversationsSync();
+                UpdateMainWindowTitle(hwnd);
                 if (g_allConversations.empty()) {
                     std::wstring status = SmsDaemon::Instance().GetConnectionStatusText();
                     if (status != g_lastEmptyStatus) {
@@ -1441,6 +1487,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        case WM_APP_RESTORE_WINDOW: {
+            RestoreFromTray(hwnd);
+            return 0;
+        }
+
+        case WM_APP_RELOAD_INI: {
+            RestoreFromTray(hwnd);
+            g_bindIp = TrimWideLocal(ReadIniString(L"Network", L"BindIp", L""));
+            if (g_bindIp == L"0.0.0.0") g_bindIp.clear();
+            bool reloadOk = SmsDaemon::Instance().ApplySettingsReload(g_bindIp, GetConfiguredDeviceName());
+            UpdateMainWindowTitle(hwnd);
+            g_lastEmptyStatus = SmsDaemon::Instance().GetConnectionStatusText();
+            InvalidateRect(hwnd, nullptr, FALSE);
+            if (!reloadOk) {
+                std::wstring err = SmsDaemon::Instance().GetLastBindError();
+                if (!err.empty()) {
+                    MessageBoxW(hwnd, err.c_str(), L"Erreur de liaison reseau", MB_OK | MB_ICONWARNING);
+                }
+            }
+            return 0;
+        }
+
         case WM_OPEN_SMS_THREAD: {
             RestoreFromTray(hwnd);
             int64_t targetTid = static_cast<int64_t>(lParam);
@@ -1526,40 +1594,51 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 }
 
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR pCmdLine, int nCmdShow) {
-    if (pCmdLine && wcslen(pCmdLine) > 0) {
-        std::wstring cmd(pCmdLine);
-        size_t ipPos = cmd.find(L"--ip");
-        if (ipPos == std::wstring::npos) ipPos = cmd.find(L"--bind");
-        if (ipPos != std::wstring::npos) {
-            size_t space = cmd.find_first_of(L" \t", ipPos);
-            if (space != std::string::npos) {
-                size_t valStart = cmd.find_first_not_of(L" \t", space);
-                if (valStart != std::string::npos) {
-                    size_t valEnd = cmd.find_first_of(L" \t\r\n", valStart);
-                    g_bindIp = cmd.substr(valStart, valEnd - valStart);
-                }
-            }
-        } else {
-            size_t start = cmd.find_first_not_of(L" \t");
-            if (start != std::string::npos && cmd[start] != L'-') {
-                size_t end = cmd.find_first_of(L" \t\r\n", start);
-                g_bindIp = cmd.substr(start, end - start);
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR /*pCmdLine*/, int nCmdShow) {
+    bool hasCliBindIp = false;
+    int argc = 0;
+    if (LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc)) {
+        for (int i = 1; i < argc; ++i) {
+            std::wstring arg = TrimWideLocal(argv[i] ? argv[i] : L"");
+            if (arg.empty()) continue;
+            if ((arg == L"--ip" || arg == L"--bind" || arg == L"-b") && (i + 1 < argc)) {
+                g_bindIp = TrimWideLocal(argv[++i]);
+                hasCliBindIp = true;
+            } else if (arg.rfind(L"--ip=", 0) == 0) {
+                g_bindIp = TrimWideLocal(arg.substr(5));
+                hasCliBindIp = true;
+            } else if (arg.rfind(L"--bind=", 0) == 0) {
+                g_bindIp = TrimWideLocal(arg.substr(7));
+                hasCliBindIp = true;
+            } else if (arg[0] != L'-') {
+                g_bindIp = arg;
+                hasCliBindIp = true;
             }
         }
+        LocalFree(argv);
+    }
+    if (g_bindIp == L"0.0.0.0") {
+        g_bindIp.clear();
     }
 
     // Initialize COM for WIC, Shell & Folder Picker
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
-    // First-run prompt for conversation storage folder + create local INI in current directory
+    // First-run prompt for conversation storage folder + create local INI
     PromptFirstRunStorageSetup();
 
-    if (g_bindIp.empty()) {
-        g_bindIp = TrimWideLocal(ReadIniString(L"Network", L"BindIp", L""));
-    } else {
-        g_bindIp = TrimWideLocal(g_bindIp);
+    if (hasCliBindIp) {
         WriteIniString(L"Network", L"BindIp", g_bindIp.c_str());
+    } else {
+        g_bindIp = TrimWideLocal(ReadIniString(L"Network", L"BindIp", L""));
+        if (g_bindIp == L"0.0.0.0") g_bindIp.clear();
+    }
+
+    // Reuse already-running KDEConnectSMS instance (even if minimized to tray)
+    if (HWND hExisting = FindWindowW(WINDOW_CLASS_NAME, nullptr)) {
+        PostMessageW(hExisting, hasCliBindIp ? WM_APP_RELOAD_INI : WM_APP_RESTORE_WINDOW, 0, 0);
+        CoUninitialize();
+        return 0;
     }
 
     int initWidth = std::max(640, ReadIniInt(L"Window", L"Width", 960));
