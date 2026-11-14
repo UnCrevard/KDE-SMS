@@ -108,6 +108,12 @@ namespace KDEConnect {
         std::vector<Message> messages;
     };
 
+    // Synced phonebook contact entry for search & compose
+    struct ContactSummary {
+        std::wstring name;
+        std::wstring phone;
+    };
+
     // Device status for KDE Connect link
     struct DeviceInfo {
         std::wstring deviceId;

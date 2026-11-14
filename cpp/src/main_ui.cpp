@@ -4,6 +4,7 @@
 #include "toast_notifier.h"
 #include "daemon.h"
 #include <filesystem>
+#include <set>
 
 using namespace KDEConnect;
 
@@ -12,6 +13,7 @@ static const wchar_t* WINDOW_CLASS_NAME = L"KDEConnectSMSWin32";
 static Direct2DRenderer g_renderer;
 static std::vector<Conversation> g_allConversations;
 static std::vector<Conversation> g_visibleConversations;
+static std::vector<ContactSummary> g_allContacts;
 static std::wstring g_searchFilter;
 static std::wstring g_lastEmptyStatus;
 static int64_t g_selectedThreadId = -1;
@@ -34,7 +36,6 @@ static HWND g_hwndComposerEdit = nullptr;
 static HWND g_hwndSendButton = nullptr;
 static HWND g_hwndThemeButton = nullptr;
 static HWND g_hwndSyncButton = nullptr;
-static HWND g_hwndFolderButton = nullptr;
 static HWND g_hwndSettingsButton = nullptr;
 static HWND g_hwndAttachButton = nullptr;
 static HFONT g_hFont = nullptr;
@@ -51,7 +52,6 @@ static UINT g_msgTaskbarCreated = 0;
 #define IDC_THEME_BUTTON     1004
 #define IDC_ATTACH_BUTTON    1005
 #define IDC_SYNC_BUTTON      1006
-#define IDC_FOLDER_BUTTON    1007
 #define IDC_SETTINGS_BUTTON  1008
 #define IDC_SYNC_TIMER       1
 #define IDC_DEBOUNCE_TIMER   2
@@ -137,6 +137,32 @@ static Conversation* FindActiveConversation() {
     return nullptr;
 }
 
+static std::wstring ExtractDigitsLocal(const std::wstring& s) {
+    std::wstring digits;
+    for (wchar_t ch : s) {
+        if (ch >= L'0' && ch <= L'9') digits.push_back(ch);
+    }
+    return digits;
+}
+
+static std::wstring NormalizePhoneSuffixLocal(const std::wstring& phone) {
+    std::wstring digits = ExtractDigitsLocal(phone);
+    if (digits.size() > 9) {
+        return digits.substr(digits.size() - 9);
+    }
+    return digits;
+}
+
+static bool ContactsSnapshotEqual(const std::vector<ContactSummary>& a, const std::vector<ContactSummary>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].name != b[i].name || a[i].phone != b[i].phone) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ConversationsSnapshotEqual(const std::vector<Conversation>& a, const std::vector<Conversation>& b) {
     if (a.size() != b.size()) return false;
     for (size_t i = 0; i < a.size(); ++i) {
@@ -183,13 +209,62 @@ static void ApplySearchFilter() {
         g_visibleConversations = g_allConversations;
         return;
     }
+
     std::wstring q = ToLowerCopy(g_searchFilter);
+    std::wstring qDigits = ExtractDigitsLocal(g_searchFilter);
+    std::set<std::wstring> coveredPhones;
+
     for (const auto& conv : g_allConversations) {
-        if (ToLowerCopy(conv.contactName).find(q) != std::wstring::npos ||
-            ToLowerCopy(conv.address).find(q) != std::wstring::npos ||
-            ToLowerCopy(conv.snippet).find(q) != std::wstring::npos) {
-            g_visibleConversations.push_back(conv);
+        bool matched = (ToLowerCopy(conv.contactName).find(q) != std::wstring::npos ||
+                        ToLowerCopy(conv.address).find(q) != std::wstring::npos ||
+                        ToLowerCopy(conv.snippet).find(q) != std::wstring::npos);
+
+        if (!matched && qDigits.size() >= 3) {
+            if (ExtractDigitsLocal(conv.address).find(qDigits) != std::wstring::npos) {
+                matched = true;
+            }
         }
+        if (!matched) {
+            for (const auto& m : conv.messages) {
+                if (ToLowerCopy(m.body).find(q) != std::wstring::npos) {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+
+        if (matched) {
+            g_visibleConversations.push_back(conv);
+            std::wstring suf = NormalizePhoneSuffixLocal(conv.address);
+            if (!suf.empty()) coveredPhones.insert(suf);
+        }
+    }
+
+    // Append matching phonebook contacts not already covered by a conversation thread
+    for (size_t i = 0; i < g_allContacts.size(); ++i) {
+        const auto& c = g_allContacts[i];
+        bool matched = (ToLowerCopy(c.name).find(q) != std::wstring::npos ||
+                        ToLowerCopy(c.phone).find(q) != std::wstring::npos);
+        if (!matched && qDigits.size() >= 3) {
+            if (ExtractDigitsLocal(c.phone).find(qDigits) != std::wstring::npos) {
+                matched = true;
+            }
+        }
+        if (!matched) continue;
+
+        std::wstring suf = NormalizePhoneSuffixLocal(c.phone);
+        if (!suf.empty() && coveredPhones.find(suf) != coveredPhones.end()) {
+            continue;
+        }
+        if (!suf.empty()) coveredPhones.insert(suf);
+
+        Conversation contactEntry;
+        contactEntry.threadId = -100000 - static_cast<int64_t>(i);
+        contactEntry.contactName = c.name;
+        contactEntry.address = c.phone;
+        contactEntry.snippet = L"Contact \u00B7 " + c.phone;
+        contactEntry.lastTimestamp = 0;
+        g_visibleConversations.push_back(std::move(contactEntry));
     }
 }
 
@@ -200,12 +275,15 @@ static void ReloadConversations(HWND hwnd, bool autoScrollIfNewOrActive, bool fo
     }
 
     std::vector<Conversation> fresh = SmsDaemon::Instance().LoadAllConversations();
-    bool listChanged = !ConversationsSnapshotEqual(g_allConversations, fresh);
+    std::vector<ContactSummary> freshContacts = SmsDaemon::Instance().GetSyncedContacts();
+    bool listChanged = !ConversationsSnapshotEqual(g_allConversations, fresh) ||
+                       !ContactsSnapshotEqual(g_allContacts, freshContacts);
     if (!listChanged && !forceRepaint) {
         return;
     }
 
     g_allConversations = std::move(fresh);
+    g_allContacts = std::move(freshContacts);
     ApplySearchFilter();
     ClampSidebarScroll(hwnd);
 
@@ -216,13 +294,23 @@ static void ReloadConversations(HWND hwnd, bool autoScrollIfNewOrActive, bool fo
             break;
         }
     }
+    if (!selectedExists && g_selectedThreadId <= -100000) {
+        for (const auto& c : g_visibleConversations) {
+            if (c.threadId == g_selectedThreadId) {
+                selectedExists = true;
+                break;
+            }
+        }
+    }
 
     bool selectionChanged = false;
     if (!selectedExists) {
         if (!g_visibleConversations.empty()) {
             g_selectedThreadId = g_visibleConversations.front().threadId;
             selectionChanged = true;
-            SmsDaemon::Instance().RequestThreadSync(g_selectedThreadId);
+            if (g_selectedThreadId > 0) {
+                SmsDaemon::Instance().RequestThreadSync(g_selectedThreadId);
+            }
         } else {
             g_selectedThreadId = -1;
             selectionChanged = true;
@@ -245,6 +333,8 @@ static void PerformDeleteConversation(HWND hwnd, int idx, bool askConfirm) {
     if (idx < 0 || idx >= static_cast<int>(g_visibleConversations.size())) return;
 
     Conversation target = g_visibleConversations[idx];
+    if (target.threadId <= 0) return;
+
     if (askConfirm) {
         std::wstring label = target.contactName.empty() ? target.address : target.contactName;
         std::wstring prompt = L"Effacer la conversation avec \"" + label + L"\" de la liste ?";
@@ -624,6 +714,7 @@ void ShowSettingsDialog(HWND parent) {
     }
 
     if (state.saved) {
+        std::wstring prevConvDir = GetMessagesDirectory();
         SetConversationsDirectory(state.resConvDir);
         SetReceivedFilesDirectory(state.resRecvDir);
 
@@ -642,6 +733,9 @@ void ShowSettingsDialog(HWND parent) {
         }
 
         SmsDaemon::Instance().ApplySettingsReload(g_bindIp, state.resDeviceName);
+        if (prevConvDir != GetMessagesDirectory()) {
+            SmsDaemon::Instance().RequestConversationsSync();
+        }
         if (parent) {
             ReloadConversations(parent, true, true);
             InvalidateRect(parent, nullptr, FALSE);
@@ -681,11 +775,7 @@ void LayoutChildControls(HWND hwnd) {
     }
 
     if (g_hwndSettingsButton) {
-        SetWindowPos(g_hwndSettingsButton, nullptr, width - 164, 11, 34, 32, SWP_NOZORDER);
-    }
-
-    if (g_hwndFolderButton) {
-        SetWindowPos(g_hwndFolderButton, nullptr, width - 124, 11, 34, 32, SWP_NOZORDER);
+        SetWindowPos(g_hwndSettingsButton, nullptr, width - 180, 11, 90, 32, SWP_NOZORDER);
     }
 
     if (g_hwndSyncButton) {
@@ -734,8 +824,12 @@ void OnSendMessage(HWND hwnd) {
         return;
     }
 
+    bool wasSyntheticContact = (active->threadId <= -100000);
+    std::wstring targetAddress = active->address;
+    int64_t preferredThreadId = wasSyntheticContact ? -1 : active->threadId;
+
     // Send via daemon (host TLS or IPC to background daemon)
-    bool sentOk = SmsDaemon::Instance().SendOutgoingSms(active->address, text, active->threadId, g_pendingAttachmentPath);
+    bool sentOk = SmsDaemon::Instance().SendOutgoingSms(targetAddress, text, preferredThreadId, g_pendingAttachmentPath);
     if (!sentOk) {
         MessageBoxW(
             hwnd,
@@ -750,8 +844,19 @@ void OnSendMessage(HWND hwnd) {
     SetWindowTextW(g_hwndComposerEdit, L"");
     ClearPendingAttachment(nullptr);
 
-    // Reload conversation and scroll to newest bubble
+    // Reload conversation and keep focus on newly created or updated thread
     ReloadConversations(hwnd, true, true);
+    if (wasSyntheticContact) {
+        std::wstring suffix = NormalizePhoneSuffixLocal(targetAddress);
+        for (const auto& c : g_allConversations) {
+            if ((!suffix.empty() && NormalizePhoneSuffixLocal(c.address) == suffix) || c.address == targetAddress) {
+                g_selectedThreadId = c.threadId;
+                ScrollThreadToBottom(hwnd);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                break;
+            }
+        }
+    }
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -816,15 +921,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             );
 
             g_hwndSettingsButton = CreateWindowExW(
-                0, L"BUTTON", L"⚙",
+                0, L"BUTTON", L"\u2699 Reglages",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                730, 11, 34, 32, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SETTINGS_BUTTON)), GetModuleHandle(nullptr), nullptr
-            );
-
-            g_hwndFolderButton = CreateWindowExW(
-                0, L"BUTTON", L"📁",
-                WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                770, 11, 34, 32, hwnd, (HMENU)IDC_FOLDER_BUTTON, GetModuleHandle(nullptr), nullptr
+                674, 11, 90, 32, hwnd, reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_SETTINGS_BUTTON)), GetModuleHandle(nullptr), nullptr
             );
 
             g_hwndSyncButton = CreateWindowExW(
@@ -849,7 +948,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SendMessageW(g_hwndComposerEdit, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndSendButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndSettingsButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
-            SendMessageW(g_hwndFolderButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndSyncButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndThemeButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
             SendMessageW(g_hwndAttachButton, WM_SETFONT, (WPARAM)g_hFont, TRUE);
@@ -1061,15 +1159,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 int clickedIdx = static_cast<int>(relY / itemH);
                 if (clickedIdx >= 0 && clickedIdx < static_cast<int>(g_visibleConversations.size())) {
                     float rowLocalY = relY - static_cast<float>(clickedIdx) * itemH;
-                    bool hitDeleteBtn = (x >= static_cast<int>(g_sidebarWidth) - 32 &&
+                    int64_t clickedId = g_visibleConversations[clickedIdx].threadId;
+                    bool hitDeleteBtn = (clickedId > 0 &&
+                                         x >= static_cast<int>(g_sidebarWidth) - 32 &&
                                          x <= static_cast<int>(g_sidebarWidth) - 6 &&
                                          rowLocalY >= 33.0f && rowLocalY <= 59.0f);
                     if (hitDeleteBtn) {
                         PerformDeleteConversation(hwnd, clickedIdx, true);
                     } else {
-                        g_selectedThreadId = g_visibleConversations[clickedIdx].threadId;
+                        g_selectedThreadId = clickedId;
                         ScrollThreadToBottom(hwnd);
-                        SmsDaemon::Instance().RequestThreadSync(g_selectedThreadId);
+                        if (g_selectedThreadId > 0) {
+                            SmsDaemon::Instance().RequestThreadSync(g_selectedThreadId);
+                        }
                         InvalidateRect(hwnd, nullptr, FALSE);
                     }
                 }
@@ -1084,7 +1186,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (x >= 0 && x < static_cast<int>(g_sidebarWidth) && y >= 54) {
                 float itemH = 68.0f;
                 int clickedIdx = static_cast<int>((static_cast<float>(y) - 54.0f + g_sidebarScroll) / itemH);
-                if (clickedIdx >= 0 && clickedIdx < static_cast<int>(g_visibleConversations.size())) {
+                if (clickedIdx >= 0 && clickedIdx < static_cast<int>(g_visibleConversations.size()) &&
+                    g_visibleConversations[clickedIdx].threadId > 0) {
                     HMENU hMenu = CreatePopupMenu();
                     if (hMenu) {
                         AppendMenuW(hMenu, MF_STRING, IDM_DELETE_CONV, L"Supprimer la conversation");
@@ -1143,17 +1246,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 case IDC_SETTINGS_BUTTON:
                     ShowSettingsDialog(hwnd);
                     break;
-                case IDC_FOLDER_BUTTON: {
-                    std::wstring curDir = GetMessagesDirectory();
-                    std::wstring picked;
-                    if (PromptSelectStorageFolder(hwnd, L"Choisir le dossier de stockage des conversations", curDir, picked)) {
-                        SetConversationsDirectory(picked);
-                        SmsDaemon::Instance().ReloadStorageDirectory();
-                        SmsDaemon::Instance().RequestConversationsSync();
-                        ReloadConversations(hwnd, true, true);
-                    }
-                    break;
-                }
                 case IDC_SYNC_BUTTON:
                     SmsDaemon::Instance().RequestConversationsSync();
                     if (g_selectedThreadId > 0) {

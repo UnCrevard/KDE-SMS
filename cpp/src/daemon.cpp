@@ -416,6 +416,32 @@ namespace KDEConnect {
             return s;
         }
 
+        std::wstring VCardBytesToWide(const std::string& raw, bool preferLatin1) {
+            if (raw.empty()) return L"";
+            if (!preferLatin1) {
+                int len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw.data(), static_cast<int>(raw.size()), nullptr, 0);
+                if (len > 0) {
+                    std::wstring out(static_cast<size_t>(len), L'\0');
+                    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, raw.data(), static_cast<int>(raw.size()), &out[0], len);
+                    return out;
+                }
+            }
+            UINT cp = preferLatin1 ? 1252u : CP_ACP;
+            int len = MultiByteToWideChar(cp, 0, raw.data(), static_cast<int>(raw.size()), nullptr, 0);
+            if (len <= 0) return Utf8ToWide(raw);
+            std::wstring out(static_cast<size_t>(len), L'\0');
+            MultiByteToWideChar(cp, 0, raw.data(), static_cast<int>(raw.size()), &out[0], len);
+            return out;
+        }
+
+        bool HeaderHasQuotedPrintable(const std::string& line) {
+            size_t colonPos = line.find(':');
+            if (colonPos == std::string::npos) return false;
+            std::string upperHdr = line.substr(0, colonPos);
+            for (char& ch : upperHdr) ch = static_cast<char>(::toupper(static_cast<unsigned char>(ch)));
+            return upperHdr.find("QUOTED-PRINTABLE") != std::string::npos;
+        }
+
         void ParseVCardFields(const std::string& vcardRaw, std::wstring& outName, std::vector<std::wstring>& outPhones) {
             outName.clear();
             outPhones.clear();
@@ -432,7 +458,7 @@ namespace KDEConnect {
                 }
             }
 
-            // Unfold continuation lines (\n + space/tab, and quoted-printable soft breaks =\n)
+            // Unfold continuation lines (\n + space/tab, and quoted-printable soft breaks =\n ONLY on QP headers)
             std::vector<std::string> lines;
             std::istringstream ls(normalized);
             std::string rawLine;
@@ -445,13 +471,14 @@ namespace KDEConnect {
                 } else {
                     lines.push_back(rawLine);
                 }
-                prevEndsSoftBreak = (!lines.empty() && !lines.back().empty() && lines.back().back() == '=');
+                prevEndsSoftBreak = (!lines.empty() && !lines.back().empty() && lines.back().back() == '=' && HeaderHasQuotedPrintable(lines.back()));
                 if (prevEndsSoftBreak) {
                     lines.back().pop_back();
                 }
             }
 
             std::wstring fallbackStructuredName;
+            std::wstring fallbackOrgName;
             for (const auto& line : lines) {
                 size_t colonPos = line.find(':');
                 if (colonPos == std::string::npos) continue;
@@ -469,6 +496,9 @@ namespace KDEConnect {
                 std::string propName = (semiPos != std::string::npos) ? propAndParams.substr(0, semiPos) : propAndParams;
 
                 bool isQuotedPrintable = (upperHeader.find("QUOTED-PRINTABLE") != std::string::npos);
+                bool preferLatin1 = (upperHeader.find("ISO-8859-1") != std::string::npos ||
+                                     upperHeader.find("WINDOWS-1252") != std::string::npos ||
+                                     upperHeader.find("LATIN1") != std::string::npos);
                 if (isQuotedPrintable) {
                     value = DecodeQuotedPrintable(value);
                 }
@@ -476,7 +506,7 @@ namespace KDEConnect {
                 if (propName == "FN") {
                     std::string clean = TrimAscii(UnescapeVCardValue(value));
                     if (!clean.empty()) {
-                        outName = Utf8ToWide(clean);
+                        outName = VCardBytesToWide(clean, preferLatin1);
                     }
                 } else if (propName == "N" && fallbackStructuredName.empty()) {
                     // Format: Family;Given;Middle;Prefix;Suffix
@@ -490,23 +520,36 @@ namespace KDEConnect {
                     std::string given = parts.size() > 1 ? parts[1] : "";
                     std::string assembled = TrimAscii((!given.empty() && !family.empty()) ? (given + " " + family) : (given + family));
                     if (!assembled.empty()) {
-                        fallbackStructuredName = Utf8ToWide(assembled);
+                        fallbackStructuredName = VCardBytesToWide(assembled, preferLatin1);
+                    }
+                } else if (propName == "ORG" && fallbackOrgName.empty()) {
+                    std::string org = value;
+                    for (char& ch : org) {
+                        if (ch == ';') ch = ' ';
+                    }
+                    org = TrimAscii(UnescapeVCardValue(org));
+                    if (!org.empty()) {
+                        fallbackOrgName = VCardBytesToWide(org, preferLatin1);
                     }
                 } else if (propName == "TEL") {
-                    std::string cleanTel = TrimAscii(value);
+                    std::string cleanTel = TrimAscii(UnescapeVCardValue(value));
                     if (cleanTel.size() > 4) {
                         std::string prefix = cleanTel.substr(0, 4);
                         for (char& ch : prefix) ch = static_cast<char>(::tolower(static_cast<unsigned char>(ch)));
-                        if (prefix == "tel:") cleanTel = cleanTel.substr(4);
+                        if (prefix == "tel:") cleanTel = TrimAscii(cleanTel.substr(4));
                     }
                     if (!cleanTel.empty()) {
-                        outPhones.push_back(Utf8ToWide(cleanTel));
+                        outPhones.push_back(VCardBytesToWide(cleanTel, preferLatin1));
                     }
                 }
             }
 
-            if (outName.empty() && !fallbackStructuredName.empty()) {
-                outName = fallbackStructuredName;
+            if (outName.empty()) {
+                if (!fallbackStructuredName.empty()) {
+                    outName = fallbackStructuredName;
+                } else if (!fallbackOrgName.empty()) {
+                    outName = fallbackOrgName;
+                }
             }
         }
 
@@ -1193,15 +1236,21 @@ namespace KDEConnect {
             }
         } else if (packet.type == "kdeconnect.contacts.response_uids_timestamps") {
             std::vector<std::string> allUids;
+            std::set<std::string> allUidSet;
             std::map<std::string, int64_t> remoteTs;
             ForEachJsonObjectField(packet.bodyJson, [&](const std::string& key, const std::string& val, bool) {
                 if (key == "uids") {
                     ForEachJsonArrayString(val, [&](const std::string& uid) {
-                        if (!uid.empty()) allUids.push_back(uid);
+                        if (!uid.empty() && allUidSet.insert(uid).second) {
+                            allUids.push_back(uid);
+                        }
                     });
                 } else if (!key.empty()) {
                     int64_t ts = std::strtoll(val.c_str(), nullptr, 10);
                     remoteTs[key] = ts;
+                    if (allUidSet.insert(key).second) {
+                        allUids.push_back(key);
+                    }
                 }
             });
 
@@ -1214,7 +1263,8 @@ namespace KDEConnect {
                     if (rtIt != remoteTs.end()) rTs = rtIt->second;
 
                     auto cacheIt = m_contactUidTimestamps.find(uid);
-                    if (cacheIt == m_contactUidTimestamps.end() || (rTs > 0 && rTs > cacheIt->second)) {
+                    bool missingContact = (m_contactsCache.find(uid) == m_contactsCache.end());
+                    if (missingContact || cacheIt == m_contactUidTimestamps.end() || (rTs > 0 && rTs > cacheIt->second)) {
                         uidsToFetch.push_back(uid);
                         if (rTs > 0) m_contactUidTimestamps[uid] = rTs;
                     }
@@ -1263,7 +1313,7 @@ namespace KDEConnect {
             }
 
             std::wcout << L"[Contacts Sync] " << addedCount << L" vCard(s) contact(s) importee(s)." << std::endl;
-            if (anyConversationUpdated) {
+            if (addedCount > 0 || anyConversationUpdated) {
                 NotifyConversationsUpdated();
             }
         } else if (packet.type == "kdeconnect.telephony") {
@@ -1352,23 +1402,23 @@ namespace KDEConnect {
 
     std::wstring SmsDaemon::ResolveContactNameForAddressLocked(const std::wstring& rawAddress) const {
         if (rawAddress.empty()) return L"";
-        if (rawAddress.find(L',') == std::wstring::npos) {
+        if (rawAddress.find_first_of(L",;") == std::wstring::npos) {
             return ResolveSingleContactLocked(rawAddress);
         }
         std::wstring combined;
         bool anyResolved = false;
         size_t start = 0;
         while (start < rawAddress.size()) {
-            size_t comma = rawAddress.find(L',', start);
-            std::wstring part = (comma == std::wstring::npos) ? rawAddress.substr(start) : rawAddress.substr(start, comma - start);
+            size_t sep = rawAddress.find_first_of(L",;", start);
+            std::wstring part = (sep == std::wstring::npos) ? rawAddress.substr(start) : rawAddress.substr(start, sep - start);
             while (!part.empty() && part.front() == L' ') part.erase(part.begin());
             while (!part.empty() && part.back() == L' ') part.pop_back();
             std::wstring resolved = ResolveSingleContactLocked(part);
             if (!resolved.empty()) anyResolved = true;
             if (!combined.empty()) combined += L", ";
             combined += resolved.empty() ? part : resolved;
-            if (comma == std::wstring::npos) break;
-            start = comma + 1;
+            if (sep == std::wstring::npos) break;
+            start = sep + 1;
         }
         return anyResolved ? combined : L"";
     }
@@ -1438,6 +1488,17 @@ namespace KDEConnect {
         for (auto& kv : m_conversations) {
             Conversation& conv = kv.second;
             std::wstring resolved = ResolveContactNameForAddressLocked(conv.address);
+            if (resolved.empty()) {
+                for (auto it = conv.messages.rbegin(); it != conv.messages.rend(); ++it) {
+                    if (!it->address.empty()) {
+                        resolved = ResolveContactNameForAddressLocked(it->address);
+                        if (!resolved.empty()) {
+                            if (conv.address.empty()) conv.address = it->address;
+                            break;
+                        }
+                    }
+                }
+            }
             if (!resolved.empty() && conv.contactName != resolved) {
                 conv.contactName = resolved;
                 m_ignoreWatcherUntilMs = nowMs + 350;
@@ -1769,6 +1830,11 @@ namespace KDEConnect {
 
         if (m_conversations.empty()) {
             LoadAllConversationsFromDiskLocked();
+        } else if (m_isClientMode && m_contactsCache.empty()) {
+            LoadContactsCacheLocked();
+            if (!m_contactsCache.empty()) {
+                ApplyContactsToConversationsLocked();
+            }
         }
 
         std::vector<Conversation> result;
@@ -1782,6 +1848,42 @@ namespace KDEConnect {
             return a.lastTimestamp > b.lastTimestamp;
         });
 
+        return result;
+    }
+
+    std::vector<ContactSummary> SmsDaemon::GetSyncedContacts() const {
+        std::vector<ContactSummary> result;
+        std::set<std::wstring> seen;
+        {
+            std::lock_guard<std::mutex> lock(m_storageMutex);
+            for (const auto& kv : m_contactsCache) {
+                const auto& c = kv.second;
+                if (c.name.empty()) continue;
+                for (const auto& phone : c.phones) {
+                    if (phone.empty()) continue;
+                    std::wstring digits = NormalizePhoneDigits(phone);
+                    std::wstring key = c.name + L"|" + (digits.empty() ? phone : digits);
+                    if (seen.insert(key).second) {
+                        ContactSummary item;
+                        item.name = c.name;
+                        item.phone = phone;
+                        result.push_back(std::move(item));
+                    }
+                }
+            }
+        }
+
+        auto toLower = [](const std::wstring& s) {
+            std::wstring out = s;
+            for (auto& ch : out) ch = static_cast<wchar_t>(::towlower(ch));
+            return out;
+        };
+        std::sort(result.begin(), result.end(), [&](const ContactSummary& a, const ContactSummary& b) {
+            std::wstring la = toLower(a.name);
+            std::wstring lb = toLower(b.name);
+            if (la != lb) return la < lb;
+            return a.phone < b.phone;
+        });
         return result;
     }
 

@@ -24,6 +24,7 @@ namespace KDEConnect {
         // Local storage access
         std::vector<Conversation> LoadAllConversations();
         Conversation LoadConversation(int64_t threadId);
+        std::vector<ContactSummary> GetSyncedContacts() const;
         void SaveMessageToDisk(const Message& msg);
         bool DeleteConversation(int64_t threadId);
 

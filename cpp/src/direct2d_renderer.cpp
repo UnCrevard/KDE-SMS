@@ -357,8 +357,8 @@ namespace KDEConnect {
                     snippetLayout->Release();
                 }
 
-                // Subtle delete button on hovered or selected conversation row
-                if (static_cast<int>(i) == hoveredIndex || conv.threadId == selectedThreadId) {
+                // Subtle delete button on hovered or selected real conversation row
+                if (conv.threadId > 0 && (static_cast<int>(i) == hoveredIndex || conv.threadId == selectedThreadId)) {
                     D2D1_ROUNDED_RECT delBtn = D2D1::RoundedRect(
                         D2D1::RectF(width - 30.0f, currentY + 35.0f, width - 8.0f, currentY + 57.0f),
                         5.0f, 5.0f
@@ -412,7 +412,7 @@ namespace KDEConnect {
         if (!conversation.address.empty() && conversation.contactName != conversation.address) {
             title += L"  (" + conversation.address + L")";
         }
-        D2D1_RECT_F titleRect = D2D1::RectF(startX + 20.0f, 15.0f, startX + width - 170.0f, 40.0f);
+        D2D1_RECT_F titleRect = D2D1::RectF(startX + 20.0f, 15.0f, startX + width - 190.0f, 40.0f);
         m_renderTarget->DrawText(title.c_str(), static_cast<UINT32>(title.length()), m_fontHeading, titleRect, m_brushTextPrimary);
 
         // Background of message panel
