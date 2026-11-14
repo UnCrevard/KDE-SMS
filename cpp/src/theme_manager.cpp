@@ -84,6 +84,37 @@ namespace KDEConnect {
         WritePrivateProfileStringW(section, key, value ? value : L"", iniPath.c_str());
     }
 
+    void DeleteIniKey(const wchar_t* section, const wchar_t* key) {
+        if (!section || !key) return;
+        std::wstring iniPath = GetSettingsIniPath();
+        WritePrivateProfileStringW(section, key, nullptr, iniPath.c_str());
+    }
+
+    std::vector<std::pair<std::wstring, std::wstring>> ReadIniSectionPairs(const wchar_t* section) {
+        std::vector<std::pair<std::wstring, std::wstring>> pairs;
+        if (!section) return pairs;
+        std::wstring iniPath = GetSettingsIniPath();
+        std::vector<wchar_t> buffer(16384, L'\0');
+        DWORD copied = GetPrivateProfileSectionW(
+            section,
+            buffer.data(),
+            static_cast<DWORD>(buffer.size()),
+            iniPath.c_str()
+        );
+        if (copied == 0) return pairs;
+
+        const wchar_t* ptr = buffer.data();
+        while (*ptr != L'\0') {
+            std::wstring entry(ptr);
+            size_t eq = entry.find(L'=');
+            if (eq != std::wstring::npos && eq > 0) {
+                pairs.emplace_back(entry.substr(0, eq), entry.substr(eq + 1));
+            }
+            ptr += entry.size() + 1;
+        }
+        return pairs;
+    }
+
     int ReadIniInt(const wchar_t* section, const wchar_t* key, int defaultValue) {
         std::wstring iniPath = GetSettingsIniPath();
         return static_cast<int>(GetPrivateProfileIntW(section, key, defaultValue, iniPath.c_str()));

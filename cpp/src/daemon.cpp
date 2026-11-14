@@ -598,6 +598,8 @@ namespace KDEConnect {
         if (m_running) return true;
 
         m_running = true;
+        m_startupEpochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
         {
             std::lock_guard<std::mutex> lock(m_storageMutex);
             m_watchDir = GetMessagesDirectory();
@@ -736,15 +738,91 @@ namespace KDEConnect {
         }
     }
 
+    void SmsDaemon::MaybeNotifyIncomingMessage(const Message& msg, const std::wstring& resolvedName) {
+        if (msg.isOutgoing) return;
+        if (!ToastNotifier::Instance().HasTrayWindow()) return;
+
+        int64_t nowSteadyMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::wstring sig = NormalizePhoneSuffix(msg.address) + L"|" + msg.body;
+        if (sig == L"|") {
+            sig = std::to_wstring(msg.id);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_notifyMutex);
+            for (auto it = m_recentNotifiedSignatures.begin(); it != m_recentNotifiedSignatures.end();) {
+                if (nowSteadyMs - it->second > 60000) {
+                    it = m_recentNotifiedSignatures.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (msg.id != 0 && m_notifiedMsgIds.find(msg.id) != m_notifiedMsgIds.end()) {
+                return;
+            }
+            if (m_recentNotifiedSignatures.find(sig) != m_recentNotifiedSignatures.end()) {
+                return;
+            }
+            m_recentNotifiedSignatures[sig] = nowSteadyMs;
+            if (msg.id != 0) {
+                m_notifiedMsgIds.insert(msg.id);
+            }
+        }
+
+        std::wstring title = resolvedName.empty() ? msg.address : resolvedName;
+        if (title.empty()) title = L"Nouveau SMS";
+        std::wstring body = msg.body;
+        if (body.empty()) {
+            body = msg.attachments.empty() ? L"Nouveau message recu" : L"[Piece jointe MMS]";
+        }
+        ToastNotifier::Instance().ShowSmsNotification(title, body, msg.threadId);
+    }
+
     void SmsDaemon::ProcessFolderChangeNotification() {
+        std::vector<std::pair<Message, std::wstring>> pendingToNotify;
+        int64_t nowEpochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
         {
             std::lock_guard<std::mutex> lock(m_storageMutex);
+            std::set<std::pair<int64_t, int64_t>> knownMsgIds;
+            if (m_isClientMode) {
+                for (const auto& kv : m_conversations) {
+                    for (const auto& m : kv.second.messages) {
+                        knownMsgIds.emplace(kv.first, m.id);
+                    }
+                }
+            }
+
             LoadContactsCacheLocked();
             LoadDeletedThreadsLocked();
             LoadAllConversationsFromDiskLocked();
             ApplyContactsToConversationsLocked();
+
+            if (m_isClientMode) {
+                for (const auto& kv : m_conversations) {
+                    for (const auto& m : kv.second.messages) {
+                        if (m.isOutgoing) continue;
+                        if (knownMsgIds.find(std::make_pair(kv.first, m.id)) != knownMsgIds.end()) continue;
+                        bool recent = (m.timestamp >= m_startupEpochMs - 60000) &&
+                                      (std::llabs(nowEpochMs - m.timestamp) <= 600000);
+                        if (recent) {
+                            pendingToNotify.emplace_back(m, kv.second.contactName);
+                        }
+                    }
+                }
+            }
         }
+
         NotifyConversationsUpdated();
+
+        size_t notifiedCount = 0;
+        for (const auto& item : pendingToNotify) {
+            if (notifiedCount >= 3) break;
+            MaybeNotifyIncomingMessage(item.first, item.second);
+            ++notifiedCount;
+        }
     }
 
     bool SmsDaemon::SendIpcCommand(const std::string& command, std::string* outResponse) {
@@ -1030,6 +1108,10 @@ namespace KDEConnect {
                     msg.body = L"[Piece jointe MMS]";
                 }
 
+                if (msg.timestamp > 0 && msg.timestamp < 100000000000LL) {
+                    msg.timestamp *= 1000;
+                }
+
                 if (msg.threadId > 0 && (!msg.body.empty() || !msg.address.empty() || !msg.attachments.empty())) {
                     threadsInPacket.insert(msg.threadId);
                     parsedMessages.push_back(std::move(msg));
@@ -1040,8 +1122,40 @@ namespace KDEConnect {
                        << threadsInPacket.size() << L" conversation(s)." << std::endl;
 
             if (!parsedMessages.empty()) {
-                SaveMessagesBatchToDisk(parsedMessages);
+                std::vector<Message> newlyInserted;
+                SaveMessagesBatchToDisk(parsedMessages, &newlyInserted);
                 NotifyConversationsUpdated();
+
+                if (!newlyInserted.empty()) {
+                    int64_t nowEpochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    std::vector<std::pair<Message, std::wstring>> toNotify;
+                    {
+                        std::lock_guard<std::mutex> lock(m_storageMutex);
+                        for (const auto& nm : newlyInserted) {
+                            if (nm.isOutgoing) continue;
+                            bool isRecent = (nm.timestamp >= m_startupEpochMs - 60000) &&
+                                            (std::llabs(nowEpochMs - nm.timestamp) <= 600000);
+                            bool isFreshUnread = (!nm.isRead && std::llabs(nowEpochMs - nm.timestamp) <= 600000);
+                            if (!isRecent && !isFreshUnread) continue;
+
+                            std::wstring displayName;
+                            auto it = m_conversations.find(nm.threadId);
+                            if (it != m_conversations.end() && !it->second.contactName.empty()) {
+                                displayName = it->second.contactName;
+                            } else {
+                                displayName = ResolveContactNameForAddressLocked(nm.address);
+                            }
+                            toNotify.emplace_back(nm, displayName);
+                        }
+                    }
+                    size_t notifiedCount = 0;
+                    for (const auto& item : toNotify) {
+                        if (notifiedCount >= 3) break;
+                        MaybeNotifyIncomingMessage(item.first, item.second);
+                        ++notifiedCount;
+                    }
+                }
 
                 // When request_conversations returns multiple threads (1 latest message each),
                 // automatically fetch full message history for the most recent threads!
@@ -1201,12 +1315,8 @@ namespace KDEConnect {
                 SaveMessageToDisk(msg);
                 NotifyConversationsUpdated();
 
-                // Fire native Windows Toast Notification
-                ToastNotifier::Instance().ShowSmsNotification(
-                    wName.empty() ? msg.address : wName,
-                    msg.body,
-                    msg.threadId
-                );
+                // Fire native Windows Toast / Tray Notification (deduplicated with sms.messages)
+                MaybeNotifyIncomingMessage(msg, wName.empty() ? msg.address : wName);
 
                 // Refresh synced conversations from phone as well
                 m_protocol.RequestAllConversations(device);
@@ -1454,7 +1564,7 @@ namespace KDEConnect {
         MoveFileExW(tmpPath.c_str(), filePath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
     }
 
-    void SmsDaemon::SaveMessagesBatchToDisk(const std::vector<Message>& messages) {
+    void SmsDaemon::SaveMessagesBatchToDisk(const std::vector<Message>& messages, std::vector<Message>* outNewlyInserted) {
         if (messages.empty()) return;
 
         std::lock_guard<std::mutex> lock(m_storageMutex);
@@ -1515,6 +1625,9 @@ namespace KDEConnect {
             }
             if (!updated) {
                 conv.messages.push_back(msg);
+                if (outNewlyInserted) {
+                    outNewlyInserted->push_back(msg);
+                }
             }
             dirtyThreads.insert(msg.threadId);
         }

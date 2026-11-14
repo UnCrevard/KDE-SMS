@@ -15,6 +15,7 @@ namespace KDEConnect {
         void Shutdown();
 
         HICON GetSmsIcon() const { return m_smsIcon; }
+        bool HasTrayWindow() const { return m_hwnd != nullptr && IsWindow(m_hwnd) != FALSE; }
 
         // Show a rich Windows Notification for incoming SMS
         bool ShowSmsNotification(
@@ -31,6 +32,7 @@ namespace KDEConnect {
         bool ShowWinRTToast(const std::wstring& sender, const std::wstring& body, int64_t threadId);
         bool ShowFallbackTrayBalloon(const std::wstring& sender, const std::wstring& body);
 
+        mutable std::mutex m_mutex;
         HWND m_hwnd = nullptr;
         HICON m_smsIcon = nullptr;
         NOTIFYICONDATAW m_nid{};

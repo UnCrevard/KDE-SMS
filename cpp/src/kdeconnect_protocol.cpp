@@ -304,24 +304,54 @@ namespace KDEConnect {
     }
 
     void ProtocolHandler::LoadPairedDevices() {
-        std::wstring path = GetAppDataDirectory() + L"\\paired_devices.txt";
-        std::filesystem::path fsPath(path);
-        std::ifstream file(fsPath);
-        if (!file.is_open()) return;
-        std::lock_guard<std::mutex> lock(m_devicesMutex);
-        std::string line;
-        while (std::getline(file, line)) {
-            while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ')) {
-                line.pop_back();
+        std::set<std::wstring> migratedIds;
+        {
+            std::lock_guard<std::mutex> lock(m_devicesMutex);
+            auto pairs = ReadIniSectionPairs(L"PairedDevices");
+            for (const auto& kv : pairs) {
+                if (kv.first == L"DeviceIds") {
+                    std::wstringstream ss(kv.second);
+                    std::wstring item;
+                    while (std::getline(ss, item, L',')) {
+                        while (!item.empty() && item.front() == L' ') item.erase(item.begin());
+                        while (!item.empty() && item.back() == L' ') item.pop_back();
+                        if (!item.empty()) m_pairedDeviceIds.insert(item);
+                    }
+                } else if (!kv.first.empty() && kv.second != L"0") {
+                    m_pairedDeviceIds.insert(kv.first);
+                }
             }
-            if (!line.empty()) {
-                m_pairedDeviceIds.insert(Utf8ToWide(line));
+
+            // One-time migration from legacy paired_devices.txt if present
+            std::wstring legacyPath = GetAppDataDirectory() + L"\\paired_devices.txt";
+            std::filesystem::path fsLegacy(legacyPath);
+            std::ifstream legacyFile(fsLegacy);
+            if (legacyFile.is_open()) {
+                std::string line;
+                while (std::getline(legacyFile, line)) {
+                    while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ')) {
+                        line.pop_back();
+                    }
+                    if (!line.empty()) {
+                        std::wstring devId = Utf8ToWide(line);
+                        if (m_pairedDeviceIds.insert(devId).second) {
+                            migratedIds.insert(devId);
+                        }
+                    }
+                }
+                legacyFile.close();
+                DeleteFileW(legacyPath.c_str());
             }
+        }
+
+        for (const auto& id : migratedIds) {
+            WriteIniString(L"PairedDevices", id.c_str(), L"1");
         }
     }
 
     void ProtocolHandler::MarkDevicePaired(const std::wstring& deviceId, bool paired) {
         if (deviceId.empty()) return;
+        std::wstring label = L"1";
         {
             std::lock_guard<std::mutex> lock(m_devicesMutex);
             if (paired) {
@@ -330,17 +360,18 @@ namespace KDEConnect {
                 m_pairedDeviceIds.erase(deviceId);
             }
             for (auto& d : m_knownDevices) {
-                if (d.deviceId == deviceId) d.isPaired = paired;
+                if (d.deviceId == deviceId) {
+                    d.isPaired = paired;
+                    if (!d.deviceName.empty()) {
+                        label = d.deviceName;
+                    }
+                }
             }
         }
-        std::wstring path = GetAppDataDirectory() + L"\\paired_devices.txt";
-        std::filesystem::path fsPath(path);
-        std::ofstream file(fsPath, std::ios::out | std::ios::trunc);
-        if (file.is_open()) {
-            std::lock_guard<std::mutex> lock(m_devicesMutex);
-            for (const auto& id : m_pairedDeviceIds) {
-                file << WideToUtf8(id) << "\n";
-            }
+        if (paired) {
+            WriteIniString(L"PairedDevices", deviceId.c_str(), label.c_str());
+        } else {
+            DeleteIniKey(L"PairedDevices", deviceId.c_str());
         }
     }
 

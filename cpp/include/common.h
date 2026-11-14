@@ -131,6 +131,8 @@ namespace KDEConnect {
     std::wstring GetSettingsIniPath();
     std::wstring ReadIniString(const wchar_t* section, const wchar_t* key, const wchar_t* defaultValue = L"");
     void WriteIniString(const wchar_t* section, const wchar_t* key, const wchar_t* value);
+    void DeleteIniKey(const wchar_t* section, const wchar_t* key);
+    std::vector<std::pair<std::wstring, std::wstring>> ReadIniSectionPairs(const wchar_t* section);
     int ReadIniInt(const wchar_t* section, const wchar_t* key, int defaultValue);
     void WriteIniInt(const wchar_t* section, const wchar_t* key, int value);
 

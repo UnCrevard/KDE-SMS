@@ -68,7 +68,8 @@ namespace KDEConnect {
         void NamedPipeIpcThread();
         void ProcessFolderChangeNotification();
         void HandleIncomingKdePacket(const DeviceInfo& device, const KDEPacket& packet);
-        void SaveMessagesBatchToDisk(const std::vector<Message>& messages);
+        void SaveMessagesBatchToDisk(const std::vector<Message>& messages, std::vector<Message>* outNewlyInserted = nullptr);
+        void MaybeNotifyIncomingMessage(const Message& msg, const std::wstring& resolvedName);
         void WriteConversationJsonLocked(const Conversation& conv);
         void LoadAllConversationsFromDiskLocked();
         void LoadDeletedThreadsLocked();
@@ -85,6 +86,7 @@ namespace KDEConnect {
         std::atomic<bool> m_running{false};
         std::atomic<bool> m_isClientMode{false};
         std::atomic<int64_t> m_ignoreWatcherUntilMs{0};
+        int64_t m_startupEpochMs = 0;
         std::wstring m_watchDir;
         HANDLE m_dirHandle = INVALID_HANDLE_VALUE;
 
@@ -99,6 +101,10 @@ namespace KDEConnect {
         std::map<std::string, int64_t> m_contactUidTimestamps;
         std::map<std::wstring, std::wstring> m_phoneToContactName;
         std::map<std::string, CachedContact> m_contactsCache;
+
+        std::mutex m_notifyMutex;
+        std::map<std::wstring, int64_t> m_recentNotifiedSignatures;
+        std::set<int64_t> m_notifiedMsgIds;
 
         std::mutex m_callbackMutex;
         ConversationsUpdatedCallback m_onConversationsUpdated;

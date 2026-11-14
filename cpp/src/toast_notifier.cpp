@@ -15,6 +15,7 @@ using namespace Microsoft::WRL::Wrappers;
 #endif
 
 #include <cmath>
+#include <cwchar>
 #include <vector>
 
 namespace KDEConnect {
@@ -131,6 +132,15 @@ namespace KDEConnect {
             return hIcon;
         }
 
+        void CopyBoundedWide(wchar_t* dest, size_t destCapacity, const std::wstring& src) {
+            if (!dest || destCapacity == 0) return;
+            size_t count = std::min(src.size(), destCapacity - 1);
+            if (count > 0) {
+                wmemcpy(dest, src.data(), count);
+            }
+            dest[count] = L'\0';
+        }
+
     } // namespace
 
     ToastNotifier& ToastNotifier::Instance() {
@@ -139,23 +149,29 @@ namespace KDEConnect {
     }
 
     void ToastNotifier::Initialize(HWND appHwnd) {
-        m_hwnd = appHwnd;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_hwnd = appHwnd;
 
 #if HAS_WINRT_NOTIFIER
-        HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
-        m_winRtAvailable = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+            if (!m_winRtAvailable) {
+                HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
+                m_winRtAvailable = SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE;
+            }
 #else
-        m_winRtAvailable = false;
+            m_winRtAvailable = false;
 #endif
 
-        if (!m_smsIcon) {
-            m_smsIcon = CreateSmsTrayIcon();
+            if (!m_smsIcon) {
+                m_smsIcon = CreateSmsTrayIcon();
+            }
         }
 
         EnsureTrayIcon();
     }
 
     void ToastNotifier::EnsureTrayIcon() {
+        std::lock_guard<std::mutex> lock(m_mutex);
         if (!m_hwnd || !IsWindow(m_hwnd)) return;
 
         ZeroMemory(&m_nid, sizeof(m_nid));
@@ -165,7 +181,7 @@ namespace KDEConnect {
         m_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         m_nid.uCallbackMessage = WM_TRAY_ICON;
         m_nid.hIcon = m_smsIcon ? m_smsIcon : LoadIcon(nullptr, IDI_APPLICATION);
-        wcscpy_s(m_nid.szTip, L"KDE Connect SMS");
+        CopyBoundedWide(m_nid.szTip, sizeof(m_nid.szTip) / sizeof(wchar_t), L"KDE Connect SMS");
 
         if (Shell_NotifyIconW(NIM_ADD, &m_nid) == TRUE) {
             m_nidAdded = true;
@@ -173,6 +189,7 @@ namespace KDEConnect {
     }
 
     void ToastNotifier::Shutdown() {
+        std::lock_guard<std::mutex> lock(m_mutex);
         if (m_nidAdded) {
             Shell_NotifyIconW(NIM_DELETE, &m_nid);
             m_nidAdded = false;
@@ -237,16 +254,44 @@ namespace KDEConnect {
     }
 
     bool ToastNotifier::ShowFallbackTrayBalloon(const std::wstring& sender, const std::wstring& body) {
-        if (!m_nidAdded && m_hwnd) {
-            Initialize(m_hwnd);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (!m_hwnd || !IsWindow(m_hwnd)) {
+            return false;
         }
 
-        m_nid.uFlags = NIF_INFO;
-        m_nid.dwInfoFlags = NIIF_INFO | NIIF_LARGE_ICON;
-        wcscpy_s(m_nid.szInfoTitle, sender.c_str());
-        wcscpy_s(m_nid.szInfo, body.c_str());
+        if (!m_nidAdded) {
+            ZeroMemory(&m_nid, sizeof(m_nid));
+            m_nid.cbSize = sizeof(NOTIFYICONDATAW);
+            m_nid.hWnd = m_hwnd;
+            m_nid.uID = 1001;
+            m_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+            m_nid.uCallbackMessage = WM_TRAY_ICON;
+            m_nid.hIcon = m_smsIcon ? m_smsIcon : LoadIcon(nullptr, IDI_APPLICATION);
+            CopyBoundedWide(m_nid.szTip, sizeof(m_nid.szTip) / sizeof(wchar_t), L"KDE Connect SMS");
+            if (Shell_NotifyIconW(NIM_ADD, &m_nid) == TRUE) {
+                m_nidAdded = true;
+            }
+        }
 
-        return Shell_NotifyIconW(NIM_MODIFY, &m_nid) == TRUE;
+        std::wstring safeTitle = sender.empty() ? L"KDE Connect SMS" : sender;
+        std::wstring safeBody = body.empty() ? L"Nouveau message recu" : body;
+
+        NOTIFYICONDATAW balloonNid{};
+        balloonNid.cbSize = sizeof(NOTIFYICONDATAW);
+        balloonNid.hWnd = m_hwnd;
+        balloonNid.uID = 1001;
+        balloonNid.uFlags = NIF_INFO;
+        balloonNid.uTimeout = 10000;
+        if (m_smsIcon) {
+            balloonNid.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
+            balloonNid.hBalloonIcon = m_smsIcon;
+        } else {
+            balloonNid.dwInfoFlags = NIIF_INFO;
+        }
+        CopyBoundedWide(balloonNid.szInfoTitle, sizeof(balloonNid.szInfoTitle) / sizeof(wchar_t), safeTitle);
+        CopyBoundedWide(balloonNid.szInfo, sizeof(balloonNid.szInfo) / sizeof(wchar_t), safeBody);
+
+        return Shell_NotifyIconW(NIM_MODIFY, &balloonNid) == TRUE;
     }
 
 } // namespace KDEConnect
