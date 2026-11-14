@@ -24,6 +24,7 @@ namespace KDEConnect {
         // Local storage access
         std::vector<Conversation> LoadAllConversations();
         Conversation LoadConversation(int64_t threadId);
+        int64_t ResolveMergedThreadId(int64_t threadId) const;
         std::vector<ContactSummary> GetSyncedContacts() const;
         void SaveMessageToDisk(const Message& msg);
         bool DeleteConversation(int64_t threadId);
@@ -83,6 +84,7 @@ namespace KDEConnect {
         std::wstring ResolveContactNameForAddressLocked(const std::wstring& rawAddress) const;
         std::wstring ResolveSingleAvatarLocked(const std::wstring& rawAddress) const;
         std::wstring ResolveAvatarForAddressLocked(const std::wstring& rawAddress) const;
+        int64_t FindConversationByPhoneLocked(const std::wstring& rawAddress) const;
         bool ApplyContactsToConversationsLocked();
         bool SendIpcCommand(const std::string& command, std::string* outResponse = nullptr);
         void NotifyConversationsUpdated();
@@ -101,6 +103,7 @@ namespace KDEConnect {
         mutable std::mutex m_storageMutex;
         std::map<int64_t, Conversation> m_conversations;
         std::map<int64_t, int64_t> m_deletedThreads;
+        std::map<int64_t, int64_t> m_threadRedirects;
         std::set<int64_t> m_requestedThreads;
         std::map<std::string, int64_t> m_contactUidTimestamps;
         std::map<std::wstring, std::wstring> m_phoneToContactName;

@@ -312,6 +312,26 @@ namespace KDEConnect {
             return digits;
         }
 
+        bool IsMultiRecipientAddress(const std::wstring& addr) {
+            return addr.find_first_of(L",;") != std::wstring::npos;
+        }
+
+        std::wstring CanonicalSinglePhoneKey(const std::wstring& rawPhone) {
+            if (rawPhone.empty() || IsMultiRecipientAddress(rawPhone)) return L"";
+            std::wstring digits = NormalizePhoneDigits(rawPhone);
+            if (digits.empty()) return L"";
+            if (digits.size() >= 8) {
+                return L"suf:" + (digits.size() > 9 ? digits.substr(digits.size() - 9) : digits);
+            }
+            return L"exact:" + digits;
+        }
+
+        int64_t MakeFallbackThreadId(const std::wstring& phone) {
+            std::wstring key = CanonicalSinglePhoneKey(phone);
+            size_t h = std::hash<std::wstring>{}(key.empty() ? phone : key);
+            return 1000000000LL + static_cast<int64_t>(h % 900000000LL);
+        }
+
         std::wstring GuessMimeTypeWide(const std::wstring& filePath) {
             std::wstring ext = std::filesystem::path(filePath).extension().wstring();
             for (auto& ch : ext) ch = static_cast<wchar_t>(::towlower(ch));
@@ -1446,7 +1466,6 @@ namespace KDEConnect {
             if (!phone.empty() && !body.empty()) {
                 std::wstring wPhone = Utf8ToWide(phone);
                 std::wstring wName = Utf8ToWide(contactName);
-                std::wstring wSuffix = NormalizePhoneSuffix(wPhone);
 
                 int64_t matchedThreadId = -1;
                 {
@@ -1454,16 +1473,16 @@ namespace KDEConnect {
                     if (wName.empty()) {
                         wName = ResolveContactNameForAddressLocked(wPhone);
                     }
-                    for (auto& kv : m_conversations) {
-                        if (!wSuffix.empty() && NormalizePhoneSuffix(kv.second.address) == wSuffix) {
-                            matchedThreadId = kv.first;
-                            if (!wName.empty()) kv.second.contactName = wName;
-                            break;
+                    matchedThreadId = FindConversationByPhoneLocked(wPhone);
+                    if (matchedThreadId > 0) {
+                        auto it = m_conversations.find(matchedThreadId);
+                        if (it != m_conversations.end() && !wName.empty()) {
+                            it->second.contactName = wName;
                         }
                     }
                 }
-                if (matchedThreadId < 0) {
-                    matchedThreadId = static_cast<int64_t>(std::hash<std::string>{}(phone) % 100000) + 1;
+                if (matchedThreadId <= 0) {
+                    matchedThreadId = MakeFallbackThreadId(wPhone);
                 }
 
                 Message msg;
@@ -1479,7 +1498,7 @@ namespace KDEConnect {
                 SaveMessageToDisk(msg);
                 NotifyConversationsUpdated();
 
-                // Fire native Windows Toast / Tray Notification (deduplicated with sms.messages)
+                // Fire non-intrusive bubble notification (deduplicated with sms.messages)
                 MaybeNotifyIncomingMessage(msg, wName.empty() ? msg.address : wName);
 
                 // Refresh synced conversations from phone as well
@@ -1573,6 +1592,37 @@ namespace KDEConnect {
             start = sep + 1;
         }
         return L"";
+    }
+
+    int64_t SmsDaemon::FindConversationByPhoneLocked(const std::wstring& rawAddress) const {
+        if (rawAddress.empty()) return -1;
+        std::wstring targetKey = CanonicalSinglePhoneKey(rawAddress);
+        for (const auto& kv : m_conversations) {
+            if (!targetKey.empty()) {
+                if (CanonicalSinglePhoneKey(kv.second.address) == targetKey) {
+                    return kv.first;
+                }
+                for (const auto& m : kv.second.messages) {
+                    if (CanonicalSinglePhoneKey(m.address) == targetKey) {
+                        return kv.first;
+                    }
+                }
+            } else if (kv.second.address == rawAddress) {
+                return kv.first;
+            }
+        }
+        return -1;
+    }
+
+    int64_t SmsDaemon::ResolveMergedThreadId(int64_t threadId) const {
+        std::lock_guard<std::mutex> lock(m_storageMutex);
+        int64_t cur = threadId;
+        for (int hops = 0; hops < 8; ++hops) {
+            auto it = m_threadRedirects.find(cur);
+            if (it == m_threadRedirects.end() || it->second == cur) break;
+            cur = it->second;
+        }
+        return cur;
     }
 
     void SmsDaemon::LoadContactsCacheLocked() {
@@ -1811,7 +1861,8 @@ namespace KDEConnect {
         std::set<int64_t> dirtyThreads;
         bool deletedChanged = false;
 
-        for (const auto& msg : messages) {
+        for (const auto& rawMsg : messages) {
+            Message msg = rawMsg;
             auto delIt = m_deletedThreads.find(msg.threadId);
             if (delIt != m_deletedThreads.end()) {
                 if (msg.timestamp <= delIt->second) {
@@ -1820,6 +1871,36 @@ namespace KDEConnect {
                 // New message arrived after deletion -> unhide thread cleanly
                 m_deletedThreads.erase(delIt);
                 deletedChanged = true;
+            }
+
+            // Prevent duplicate conversations for the same single phone number
+            if (m_conversations.find(msg.threadId) == m_conversations.end() && !msg.address.empty()) {
+                int64_t dupTid = FindConversationByPhoneLocked(msg.address);
+                if (dupTid > 0 && dupTid != msg.threadId) {
+                    if (msg.threadId >= 1000000000LL && dupTid < 1000000000LL) {
+                        // Prefer keeping the real Android threadId over a generated fallback
+                        msg.threadId = dupTid;
+                    } else {
+                        // Absorb older/duplicate thread (e.g. optimistic outgoing thread) into Android's thread
+                        Conversation oldConv = std::move(m_conversations[dupTid]);
+                        m_conversations.erase(dupTid);
+                        dirtyThreads.erase(dupTid);
+                        m_threadRedirects[dupTid] = msg.threadId;
+
+                        std::wstring oldFilePath = m_watchDir + L"\\thread_" + std::to_wstring(dupTid) + L".json";
+                        DeleteFileW(oldFilePath.c_str());
+
+                        auto& destConv = m_conversations[msg.threadId];
+                        destConv.threadId = msg.threadId;
+                        if (destConv.address.empty()) destConv.address = oldConv.address;
+                        if (destConv.contactName.empty()) destConv.contactName = oldConv.contactName;
+                        if (destConv.avatarPath.empty()) destConv.avatarPath = oldConv.avatarPath;
+                        for (auto& oldM : oldConv.messages) {
+                            oldM.threadId = msg.threadId;
+                            destConv.messages.push_back(std::move(oldM));
+                        }
+                    }
+                }
             }
 
             auto& conv = m_conversations[msg.threadId];
@@ -2012,6 +2093,67 @@ namespace KDEConnect {
             return;
         }
 
+        // Deduplicate any pre-existing duplicate thread files on disk for the same single phone number
+        std::map<std::wstring, int64_t> canonicalByPhone;
+        std::vector<int64_t> dupIds;
+        for (auto& kv : loadedFromDisk) {
+            std::wstring pKey = CanonicalSinglePhoneKey(kv.second.address);
+            if (pKey.empty()) continue;
+            auto it = canonicalByPhone.find(pKey);
+            if (it == canonicalByPhone.end()) {
+                canonicalByPhone[pKey] = kv.first;
+                continue;
+            }
+
+            int64_t keepId = it->second;
+            int64_t dropId = kv.first;
+            // Prefer keeping non-synthetic Android threadId (< 1000000000LL)
+            if (keepId >= 1000000000LL && dropId < 1000000000LL) {
+                std::swap(keepId, dropId);
+                canonicalByPhone[pKey] = keepId;
+            }
+
+            Conversation& keepConv = loadedFromDisk[keepId];
+            Conversation& dropConv = loadedFromDisk[dropId];
+            if (keepConv.contactName.empty() || keepConv.contactName == keepConv.address) {
+                if (!dropConv.contactName.empty()) keepConv.contactName = dropConv.contactName;
+            }
+            if (keepConv.avatarPath.empty()) keepConv.avatarPath = dropConv.avatarPath;
+
+            for (auto& dm : dropConv.messages) {
+                bool dupMsg = false;
+                for (const auto& km : keepConv.messages) {
+                    if ((dm.id != 0 && km.id == dm.id) ||
+                        (km.isOutgoing == dm.isOutgoing && km.body == dm.body && std::llabs(km.timestamp - dm.timestamp) < 60000)) {
+                        dupMsg = true;
+                        break;
+                    }
+                }
+                if (!dupMsg) {
+                    dm.threadId = keepId;
+                    keepConv.messages.push_back(std::move(dm));
+                }
+            }
+            std::sort(keepConv.messages.begin(), keepConv.messages.end(), [](const Message& a, const Message& b) {
+                if (a.timestamp != b.timestamp) return a.timestamp < b.timestamp;
+                return a.id < b.id;
+            });
+            if (!keepConv.messages.empty()) {
+                keepConv.lastTimestamp = keepConv.messages.back().timestamp;
+                keepConv.snippet = keepConv.messages.back().body.empty() && !keepConv.messages.back().attachments.empty()
+                    ? L"[Image]"
+                    : keepConv.messages.back().body;
+            }
+            WriteConversationJsonLocked(keepConv);
+            m_threadRedirects[dropId] = keepId;
+            dupIds.push_back(dropId);
+        }
+        for (int64_t did : dupIds) {
+            loadedFromDisk.erase(did);
+            std::wstring oldFile = m_watchDir + L"\\thread_" + std::to_wstring(did) + L".json";
+            DeleteFileW(oldFile.c_str());
+        }
+
         m_conversations = std::move(loadedFromDisk);
     }
 
@@ -2096,19 +2238,23 @@ namespace KDEConnect {
         if (phoneNumber.empty() || (text.empty() && attachmentPath.empty())) return false;
 
         int64_t threadId = preferredThreadId;
-        if (threadId <= 0) {
-            std::wstring suffix = NormalizePhoneSuffix(phoneNumber);
+        {
             std::lock_guard<std::mutex> lock(m_storageMutex);
-            for (const auto& kv : m_conversations) {
-                if ((!suffix.empty() && NormalizePhoneSuffix(kv.second.address) == suffix) ||
-                    kv.second.address == phoneNumber) {
-                    threadId = kv.first;
-                    break;
+            if (threadId > 0) {
+                int64_t cur = threadId;
+                for (int hops = 0; hops < 8; ++hops) {
+                    auto it = m_threadRedirects.find(cur);
+                    if (it == m_threadRedirects.end() || it->second == cur) break;
+                    cur = it->second;
                 }
+                threadId = cur;
+            }
+            if (threadId <= 0) {
+                threadId = FindConversationByPhoneLocked(phoneNumber);
             }
         }
         if (threadId <= 0) {
-            threadId = static_cast<int64_t>(std::hash<std::string>{}(WideToUtf8(phoneNumber)) % 100000) + 1;
+            threadId = MakeFallbackThreadId(phoneNumber);
         }
 
         std::vector<Attachment> atts;

@@ -4,6 +4,7 @@
 #include "toast_notifier.h"
 #include "daemon.h"
 #include <filesystem>
+#include <map>
 #include <set>
 
 using namespace KDEConnect;
@@ -146,12 +147,20 @@ static std::wstring ExtractDigitsLocal(const std::wstring& s) {
     return digits;
 }
 
-static std::wstring NormalizePhoneSuffixLocal(const std::wstring& phone) {
+static bool IsMultiRecipientAddressLocal(const std::wstring& address) {
+    return address.find(L',') != std::wstring::npos || address.find(L';') != std::wstring::npos;
+}
+
+static std::wstring CanonicalSinglePhoneKeyLocal(const std::wstring& phone) {
+    if (IsMultiRecipientAddressLocal(phone)) return L"";
     std::wstring digits = ExtractDigitsLocal(phone);
-    if (digits.size() > 9) {
-        return digits.substr(digits.size() - 9);
+    if (digits.size() >= 8) {
+        return (digits.size() > 9) ? digits.substr(digits.size() - 9) : digits;
     }
-    return digits;
+    if (!digits.empty()) {
+        return L"exact:" + digits;
+    }
+    return L"";
 }
 
 static bool ContactsSnapshotEqual(const std::vector<ContactSummary>& a, const std::vector<ContactSummary>& b) {
@@ -214,7 +223,19 @@ static void ApplySearchFilter() {
 
     std::wstring q = ToLowerCopy(g_searchFilter);
     std::wstring qDigits = ExtractDigitsLocal(g_searchFilter);
-    std::set<std::wstring> coveredPhones;
+
+    // Map all existing single-recipient conversations by canonical phone key
+    // so searching a contact never opens or creates a duplicate synthetic conversation.
+    std::map<std::wstring, size_t> convIndexByPhone;
+    for (size_t i = 0; i < g_allConversations.size(); ++i) {
+        std::wstring key = CanonicalSinglePhoneKeyLocal(g_allConversations[i].address);
+        if (!key.empty() && convIndexByPhone.find(key) == convIndexByPhone.end()) {
+            convIndexByPhone[key] = i;
+        }
+    }
+
+    std::set<int64_t> visibleThreadIds;
+    std::set<std::wstring> coveredContactPhones;
 
     for (const auto& conv : g_allConversations) {
         bool matched = (ToLowerCopy(conv.contactName).find(q) != std::wstring::npos ||
@@ -237,12 +258,11 @@ static void ApplySearchFilter() {
 
         if (matched) {
             g_visibleConversations.push_back(conv);
-            std::wstring suf = NormalizePhoneSuffixLocal(conv.address);
-            if (!suf.empty()) coveredPhones.insert(suf);
+            visibleThreadIds.insert(conv.threadId);
         }
     }
 
-    // Append matching phonebook contacts not already covered by a conversation thread
+    // Append matching phonebook contacts not already linked to any existing conversation thread
     for (size_t i = 0; i < g_allContacts.size(); ++i) {
         const auto& c = g_allContacts[i];
         bool matched = (ToLowerCopy(c.name).find(q) != std::wstring::npos ||
@@ -254,11 +274,22 @@ static void ApplySearchFilter() {
         }
         if (!matched) continue;
 
-        std::wstring suf = NormalizePhoneSuffixLocal(c.phone);
-        if (!suf.empty() && coveredPhones.find(suf) != coveredPhones.end()) {
-            continue;
+        std::wstring key = CanonicalSinglePhoneKeyLocal(c.phone);
+        if (!key.empty()) {
+            auto existingIt = convIndexByPhone.find(key);
+            if (existingIt != convIndexByPhone.end()) {
+                const Conversation& existingConv = g_allConversations[existingIt->second];
+                if (visibleThreadIds.find(existingConv.threadId) == visibleThreadIds.end()) {
+                    g_visibleConversations.push_back(existingConv);
+                    visibleThreadIds.insert(existingConv.threadId);
+                }
+                continue;
+            }
+            if (coveredContactPhones.find(key) != coveredContactPhones.end()) {
+                continue;
+            }
+            coveredContactPhones.insert(key);
         }
-        if (!suf.empty()) coveredPhones.insert(suf);
 
         Conversation contactEntry;
         contactEntry.threadId = -100000 - static_cast<int64_t>(i);
@@ -273,12 +304,26 @@ static void ApplySearchFilter() {
 
 static void ReloadConversations(HWND hwnd, bool autoScrollIfNewOrActive, bool forceRepaint = false) {
     size_t prevSelectedCount = 0;
+    std::wstring activeSyntheticPhoneKey;
     if (Conversation* prev = FindActiveConversation()) {
         prevSelectedCount = prev->messages.size();
+        if (prev->threadId <= -100000) {
+            activeSyntheticPhoneKey = CanonicalSinglePhoneKeyLocal(prev->address);
+        }
     }
 
     std::vector<Conversation> fresh = SmsDaemon::Instance().LoadAllConversations();
     std::vector<ContactSummary> freshContacts = SmsDaemon::Instance().GetSyncedContacts();
+
+    int64_t resolvedSelectedId = g_selectedThreadId;
+    if (resolvedSelectedId > 0) {
+        resolvedSelectedId = SmsDaemon::Instance().ResolveMergedThreadId(resolvedSelectedId);
+    }
+    if (resolvedSelectedId != g_selectedThreadId) {
+        g_selectedThreadId = resolvedSelectedId;
+        forceRepaint = true;
+    }
+
     bool listChanged = !ConversationsSnapshotEqual(g_allConversations, fresh) ||
                        !ContactsSnapshotEqual(g_allContacts, freshContacts);
     if (!listChanged && !forceRepaint) {
@@ -287,6 +332,17 @@ static void ReloadConversations(HWND hwnd, bool autoScrollIfNewOrActive, bool fo
 
     g_allConversations = std::move(fresh);
     g_allContacts = std::move(freshContacts);
+
+    // If the user had a synthetic contact selected and a real conversation now exists for that number, switch to it
+    if (g_selectedThreadId <= -100000 && !activeSyntheticPhoneKey.empty()) {
+        for (const auto& c : g_allConversations) {
+            if (CanonicalSinglePhoneKeyLocal(c.address) == activeSyntheticPhoneKey) {
+                g_selectedThreadId = c.threadId;
+                break;
+            }
+        }
+    }
+
     ApplySearchFilter();
     ClampSidebarScroll(hwnd);
 
@@ -837,7 +893,18 @@ void OnSendMessage(HWND hwnd) {
 
     bool wasSyntheticContact = (active->threadId <= -100000);
     std::wstring targetAddress = active->address;
-    int64_t preferredThreadId = wasSyntheticContact ? -1 : active->threadId;
+    std::wstring targetKey = CanonicalSinglePhoneKeyLocal(targetAddress);
+    int64_t preferredThreadId = -1;
+    if (!wasSyntheticContact) {
+        preferredThreadId = SmsDaemon::Instance().ResolveMergedThreadId(active->threadId);
+    } else if (!targetKey.empty()) {
+        for (const auto& c : g_allConversations) {
+            if (CanonicalSinglePhoneKeyLocal(c.address) == targetKey) {
+                preferredThreadId = c.threadId;
+                break;
+            }
+        }
+    }
 
     // Send via daemon (host TLS or IPC to background daemon)
     bool sentOk = SmsDaemon::Instance().SendOutgoingSms(targetAddress, text, preferredThreadId, g_pendingAttachmentPath);
@@ -855,12 +922,11 @@ void OnSendMessage(HWND hwnd) {
     SetWindowTextW(g_hwndComposerEdit, L"");
     ClearPendingAttachment(nullptr);
 
-    // Reload conversation and keep focus on newly created or updated thread
+    // Reload conversation and keep focus on newly created or existing thread
     ReloadConversations(hwnd, true, true);
     if (wasSyntheticContact) {
-        std::wstring suffix = NormalizePhoneSuffixLocal(targetAddress);
         for (const auto& c : g_allConversations) {
-            if ((!suffix.empty() && NormalizePhoneSuffixLocal(c.address) == suffix) || c.address == targetAddress) {
+            if ((!targetKey.empty() && CanonicalSinglePhoneKeyLocal(c.address) == targetKey) || c.address == targetAddress) {
                 g_selectedThreadId = c.threadId;
                 ScrollThreadToBottom(hwnd);
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -1178,7 +1244,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (hitDeleteBtn) {
                         PerformDeleteConversation(hwnd, clickedIdx, true);
                     } else {
-                        g_selectedThreadId = clickedId;
+                        int64_t nextTid = clickedId;
+                        if (nextTid <= -100000) {
+                            std::wstring key = CanonicalSinglePhoneKeyLocal(g_visibleConversations[clickedIdx].address);
+                            if (!key.empty()) {
+                                for (const auto& c : g_allConversations) {
+                                    if (CanonicalSinglePhoneKeyLocal(c.address) == key) {
+                                        nextTid = c.threadId;
+                                        break;
+                                    }
+                                }
+                            }
+                        } else if (nextTid > 0) {
+                            nextTid = SmsDaemon::Instance().ResolveMergedThreadId(nextTid);
+                        }
+                        g_selectedThreadId = nextTid;
                         ScrollThreadToBottom(hwnd);
                         if (g_selectedThreadId > 0) {
                             SmsDaemon::Instance().RequestThreadSync(g_selectedThreadId);
@@ -1321,9 +1401,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        case WM_SHOW_SMS_BUBBLE: {
+            ToastNotifier::Instance().ProcessPendingBubbles();
+            return 0;
+        }
+
+        case WM_OPEN_SMS_THREAD: {
+            RestoreFromTray(hwnd);
+            int64_t targetTid = static_cast<int64_t>(lParam);
+            if (targetTid > 0) {
+                targetTid = SmsDaemon::Instance().ResolveMergedThreadId(targetTid);
+                g_selectedThreadId = targetTid;
+                ReloadConversations(hwnd, true, true);
+                ScrollThreadToBottom(hwnd);
+                SmsDaemon::Instance().RequestThreadSync(targetTid);
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        }
+
         case WM_TRAY_ICON: {
             UINT eventMsg = LOWORD(static_cast<DWORD>(lParam));
-            if (eventMsg == WM_LBUTTONUP || eventMsg == WM_LBUTTONDBLCLK || eventMsg == NIN_BALLOONUSERCLICK) {
+            if (eventMsg == WM_LBUTTONUP || eventMsg == WM_LBUTTONDBLCLK) {
                 RestoreFromTray(hwnd);
             } else if (eventMsg == WM_RBUTTONUP || eventMsg == WM_CONTEXTMENU) {
                 POINT pt{};
