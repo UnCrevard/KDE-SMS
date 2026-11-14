@@ -977,40 +977,18 @@ namespace KDEConnect {
             m_protocol.RequestAllConversations(dev);
         });
 
-        // Start protocol handler on UDP 1716 and TCP 1716.
-        // Only enter IPC Client Mode if KDEConnectDaemon's Named Pipe is actually present.
+        // Start protocol handler directly on UDP 1716 and TCP 1716 using the configured BindIp
+        m_isClientMode = false;
         bool protocolStarted = m_protocol.Start(bindIp);
-        if (!protocolStarted && IsDaemonIpcAvailable()) {
-            m_isClientMode = true;
-            {
-                std::lock_guard<std::mutex> lock(m_netStatusMutex);
-                m_lastBindError.clear();
-            }
-            std::wcout << L"[IPC Client] Port 1716 occupe par KDEConnectDaemon. Mode client IPC active." << std::endl;
+        if (!protocolStarted) {
+            std::lock_guard<std::mutex> lock(m_netStatusMutex);
+            m_lastBindError = m_protocol.GetLastBindError();
         } else {
-            m_isClientMode = false;
-            if (!protocolStarted) {
-                std::lock_guard<std::mutex> lock(m_netStatusMutex);
-                m_lastBindError = m_protocol.GetLastBindError();
-            } else {
-                std::lock_guard<std::mutex> lock(m_netStatusMutex);
-                m_lastBindError.clear();
-            }
-            m_ipcThread = std::thread(&SmsDaemon::NamedPipeIpcThread, this);
+            std::lock_guard<std::mutex> lock(m_netStatusMutex);
+            m_lastBindError.clear();
         }
 
         m_watcherThread = std::thread(&SmsDaemon::DirectoryWatcherThread, this);
-
-        // If in client mode, query daemon status and kick off a SYNC command
-        if (m_isClientMode) {
-            std::thread([this]() {
-                if (m_running) {
-                    RefreshClientStatusFromDaemon();
-                    SendIpcCommand("SYNC\n");
-                    NotifyConversationsUpdated();
-                }
-            }).detach();
-        }
 
         return true;
     }

@@ -65,6 +65,7 @@ static UINT g_msgTaskbarCreated = 0;
 #define WM_APP_REFRESH_CONVS  (WM_APP + 1)
 #define WM_APP_RESTORE_WINDOW (WM_APP + 2)
 #define WM_APP_RELOAD_INI     (WM_APP + 3)
+#define WM_APP_BIND_ALERT     (WM_APP + 4)
 
 // Settings modal control IDs
 #define IDC_SET_CONV_EDIT        3001
@@ -761,8 +762,6 @@ void ShowSettingsDialog(HWND parent) {
     std::wstring bindStatusLine;
     if (!activeBindErr.empty()) {
         bindStatusLine = L"Etat actuel : " + activeBindErr;
-    } else if (SmsDaemon::Instance().IsClientMode()) {
-        bindStatusLine = L"Etat actuel : Via KDEConnectDaemon IPC (" + (activeEndpoint.empty() ? L"en cours" : activeEndpoint) + L")";
     } else {
         bindStatusLine = L"Ecoute active : " + (activeEndpoint.empty() ? L"inactive" : activeEndpoint);
     }
@@ -1042,9 +1041,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
             });
 
-            // Start background sync daemon (or attach as IPC client if KDEConnectDaemon already runs)
+            // Start direct standalone KDE Connect protocol on configured BindIp
             SmsDaemon::Instance().Start(g_bindIp);
             UpdateMainWindowTitle(hwnd);
+            if (!SmsDaemon::Instance().GetProtocol().IsListening()) {
+                PostMessageW(hwnd, WM_APP_BIND_ALERT, 0, 0);
+            }
 
             // Create UI font
             g_hFont = CreateFontW(
@@ -1492,9 +1494,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        case WM_APP_BIND_ALERT: {
+            std::wstring err = SmsDaemon::Instance().GetLastBindError();
+            if (!err.empty()) {
+                std::wstring msg = L"Impossible d'ouvrir l'ecoute KDE Connect sur l'adresse configuree (" +
+                                   (g_bindIp.empty() ? L"0.0.0.0" : g_bindIp) + L":1716) :\n\n" + err +
+                                   L"\n\nOuvrez \"Reglages\" pour choisir une interface reseau valide ou fermez l'application qui utilise deja le port 1716.";
+                MessageBoxW(hwnd, msg.c_str(), L"Erreur de liaison reseau", MB_OK | MB_ICONWARNING);
+            }
+            return 0;
+        }
+
         case WM_APP_RELOAD_INI: {
             RestoreFromTray(hwnd);
             g_bindIp = TrimWideLocal(ReadIniString(L"Network", L"BindIp", L""));
+            if (g_bindIp.empty()) {
+                g_bindIp = TrimWideLocal(ReadIniString(L"Network", L"BindUP", L""));
+            }
             if (g_bindIp == L"0.0.0.0") g_bindIp.clear();
             bool reloadOk = SmsDaemon::Instance().ApplySettingsReload(g_bindIp, GetConfiguredDeviceName());
             UpdateMainWindowTitle(hwnd);
@@ -1631,6 +1647,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE /*hPrevInstance*/, PWSTR /*pC
         WriteIniString(L"Network", L"BindIp", g_bindIp.c_str());
     } else {
         g_bindIp = TrimWideLocal(ReadIniString(L"Network", L"BindIp", L""));
+        if (g_bindIp.empty()) {
+            g_bindIp = TrimWideLocal(ReadIniString(L"Network", L"BindUP", L""));
+        }
         if (g_bindIp == L"0.0.0.0") g_bindIp.clear();
     }
 
