@@ -1078,6 +1078,216 @@ static std::wstring GetWindowTextSafe(HWND hCtrl) {
     return text;
 }
 
+struct DarkComboState {
+    WNDPROC origProc = nullptr;
+    bool hovered = false;
+    bool tracking = false;
+};
+
+struct DarkComboListState {
+    WNDPROC origProc = nullptr;
+};
+
+static const wchar_t* kPropComboState = L"KDEComboState";
+static const wchar_t* kPropComboListState = L"KDEComboListState";
+
+static LRESULT CALLBACK DarkComboBoxProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    DarkComboState* cs = reinterpret_cast<DarkComboState*>(GetPropW(hwnd, kPropComboState));
+    WNDPROC origProc = cs ? cs->origProc : nullptr;
+
+    switch (msg) {
+        case WM_MOUSEMOVE: {
+            if (cs) {
+                if (!cs->tracking) {
+                    TRACKMOUSEEVENT tme{ sizeof(TRACKMOUSEEVENT), TME_LEAVE, hwnd, 0 };
+                    TrackMouseEvent(&tme);
+                    cs->tracking = true;
+                }
+                if (!cs->hovered) {
+                    cs->hovered = true;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+            }
+            break;
+        }
+
+        case WM_MOUSELEAVE: {
+            if (cs) {
+                cs->tracking = false;
+                if (cs->hovered) {
+                    cs->hovered = false;
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+            }
+            break;
+        }
+
+        case WM_SETFOCUS:
+        case WM_KILLFOCUS:
+        case WM_ENABLE: {
+            InvalidateRect(hwnd, nullptr, FALSE);
+            break;
+        }
+
+        case WM_ERASEBKGND:
+            return 1;
+
+        case WM_PAINT: {
+            PAINTSTRUCT ps{};
+            HDC hdc = BeginPaint(hwnd, &ps);
+            RECT rc{};
+            GetClientRect(hwnd, &rc);
+            int w = rc.right - rc.left;
+            int h = rc.bottom - rc.top;
+
+            if (w > 0 && h > 0) {
+                HDC memDc = CreateCompatibleDC(hdc);
+                HBITMAP memBmp = CreateCompatibleBitmap(hdc, w, h);
+                HGDIOBJ oldBmp = SelectObject(memDc, memBmp);
+
+                const auto& colors = ThemeManager::Instance().GetColors();
+                bool isDark = ThemeManager::Instance().IsDarkActive();
+                bool isFocused = (GetFocus() == hwnd);
+                bool isDropped = (SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) != 0);
+                bool isEnabled = (IsWindowEnabled(hwnd) != FALSE);
+                bool isHovered = (cs && cs->hovered);
+
+                HBRUSH outerBr = CreateSolidBrush(colors.win32BgColor);
+                FillRect(memDc, &rc, outerBr);
+                DeleteObject(outerBr);
+
+                COLORREF fillBg = isDark
+                    ? ((isHovered || isDropped) ? RGB(38, 51, 73) : RGB(30, 41, 59))
+                    : ((isHovered || isDropped) ? RGB(248, 250, 252) : RGB(255, 255, 255));
+                COLORREF borderCol = (isFocused || isDropped)
+                    ? RGB(59, 130, 246)
+                    : (isDark
+                        ? (isHovered ? RGB(100, 116, 139) : RGB(61, 75, 98))
+                        : (isHovered ? RGB(148, 163, 184) : RGB(203, 213, 225)));
+                COLORREF textCol = isEnabled
+                    ? colors.win32TextColor
+                    : (isDark ? RGB(100, 116, 139) : RGB(148, 163, 184));
+
+                HBRUSH boxBr = CreateSolidBrush(fillBg);
+                HPEN boxPen = CreatePen(PS_SOLID, 1, borderCol);
+                HGDIOBJ oldBr = SelectObject(memDc, boxBr);
+                HGDIOBJ oldPen = SelectObject(memDc, boxPen);
+                RoundRect(memDc, 0, 0, w, h, 8, 8);
+                SelectObject(memDc, oldPen);
+                SelectObject(memDc, oldBr);
+                DeleteObject(boxPen);
+                DeleteObject(boxBr);
+
+                int sel = static_cast<int>(SendMessageW(hwnd, CB_GETCURSEL, 0, 0));
+                if (sel != CB_ERR) {
+                    int len = static_cast<int>(SendMessageW(hwnd, CB_GETLBTEXTLEN, static_cast<WPARAM>(sel), 0));
+                    if (len > 0) {
+                        std::wstring selText(static_cast<size_t>(len) + 1, L'\0');
+                        SendMessageW(hwnd, CB_GETLBTEXT, static_cast<WPARAM>(sel), reinterpret_cast<LPARAM>(&selText[0]));
+                        selText.resize(static_cast<size_t>(len));
+
+                        HFONT hFont = reinterpret_cast<HFONT>(SendMessageW(hwnd, WM_GETFONT, 0, 0));
+                        HGDIOBJ oldFont = hFont ? SelectObject(memDc, hFont) : nullptr;
+                        SetBkMode(memDc, TRANSPARENT);
+                        SetTextColor(memDc, textCol);
+                        RECT textRc{ 10, 0, std::max(14, w - 28), h };
+                        DrawTextW(memDc, selText.c_str(), static_cast<int>(selText.size()), &textRc,
+                                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+                        if (oldFont) SelectObject(memDc, oldFont);
+                    }
+                }
+
+                int cx = w - 15;
+                int cy = h / 2;
+                COLORREF chevCol = isDark ? RGB(203, 213, 225) : RGB(71, 85, 105);
+                HPEN chevPen = CreatePen(PS_SOLID, 2, chevCol);
+                HGDIOBJ oldChevPen = SelectObject(memDc, chevPen);
+                MoveToEx(memDc, cx - 4, cy - 2, nullptr);
+                LineTo(memDc, cx, cy + 2);
+                LineTo(memDc, cx + 5, cy - 3);
+                SelectObject(memDc, oldChevPen);
+                DeleteObject(chevPen);
+
+                BitBlt(hdc, 0, 0, w, h, memDc, 0, 0, SRCCOPY);
+                SelectObject(memDc, oldBmp);
+                DeleteObject(memBmp);
+                DeleteDC(memDc);
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
+
+        case WM_NCDESTROY: {
+            RemovePropW(hwnd, kPropComboState);
+            if (origProc) {
+                SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(origProc));
+            }
+            delete cs;
+            return origProc ? CallWindowProcW(origProc, hwnd, msg, wParam, lParam) : DefWindowProcW(hwnd, msg, wParam, lParam);
+        }
+    }
+    return origProc ? CallWindowProcW(origProc, hwnd, msg, wParam, lParam) : DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static LRESULT CALLBACK DarkComboListProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    DarkComboListState* ls = reinterpret_cast<DarkComboListState*>(GetPropW(hwnd, kPropComboListState));
+    WNDPROC origProc = ls ? ls->origProc : nullptr;
+
+    if (msg == WM_NCPAINT) {
+        LRESULT res = origProc ? CallWindowProcW(origProc, hwnd, msg, wParam, lParam) : DefWindowProcW(hwnd, msg, wParam, lParam);
+        if (HDC hdcWin = GetWindowDC(hwnd)) {
+            RECT wrc{};
+            if (GetWindowRect(hwnd, &wrc)) {
+                RECT frameRc{ 0, 0, wrc.right - wrc.left, wrc.bottom - wrc.top };
+                bool isDark = ThemeManager::Instance().IsDarkActive();
+                HBRUSH br = CreateSolidBrush(isDark ? RGB(71, 85, 105) : RGB(203, 213, 225));
+                FrameRect(hdcWin, &frameRc, br);
+                DeleteObject(br);
+            }
+            ReleaseDC(hwnd, hdcWin);
+        }
+        return res;
+    }
+
+    if (msg == WM_NCDESTROY) {
+        RemovePropW(hwnd, kPropComboListState);
+        if (origProc) {
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(origProc));
+        }
+        delete ls;
+        return origProc ? CallWindowProcW(origProc, hwnd, msg, wParam, lParam) : DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+
+    return origProc ? CallWindowProcW(origProc, hwnd, msg, wParam, lParam) : DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+static void AttachModernComboBox(HWND hCombo) {
+    if (!hCombo || !IsWindow(hCombo)) return;
+    SendMessageW(hCombo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), 22);
+    SendMessageW(hCombo, CB_SETITEMHEIGHT, 0, 26);
+
+    if (!GetPropW(hCombo, kPropComboState)) {
+        DarkComboState* cs = new DarkComboState{};
+        cs->origProc = reinterpret_cast<WNDPROC>(
+            SetWindowLongPtrW(hCombo, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(DarkComboBoxProc))
+        );
+        SetPropW(hCombo, kPropComboState, cs);
+    }
+
+    COMBOBOXINFO cbi{};
+    cbi.cbSize = sizeof(cbi);
+    if (GetComboBoxInfo(hCombo, &cbi) && cbi.hwndList && IsWindow(cbi.hwndList)) {
+        ThemeManager::Instance().ApplyToControl(cbi.hwndList);
+        if (!GetPropW(cbi.hwndList, kPropComboListState)) {
+            DarkComboListState* ls = new DarkComboListState{};
+            ls->origProc = reinterpret_cast<WNDPROC>(
+                SetWindowLongPtrW(cbi.hwndList, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(DarkComboListProc))
+            );
+            SetPropW(cbi.hwndList, kPropComboListState, ls);
+        }
+    }
+}
+
 static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     SettingsModalState* st = reinterpret_cast<SettingsModalState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
 
@@ -1110,11 +1320,17 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
             } else if (id == IDC_SET_SKIPDEL_LBL && code == STN_CLICKED) {
                 toggleCheckbox(st->skipDeleteChk);
                 return 0;
-            } else if (id == IDC_SET_BIND_COMBO && code == CBN_SELCHANGE) {
-                int sel = static_cast<int>(SendMessageW(st->bindCombo, CB_GETCURSEL, 0, 0));
-                if (sel >= 0 && sel < static_cast<int>(st->bindIpValues.size())) {
-                    st->selectedBindIdx = sel;
-                    st->resBindIp = st->bindIpValues[static_cast<size_t>(sel)];
+            } else if ((id == IDC_SET_BIND_COMBO || id == IDC_SET_THEME_COMBO || id == IDC_SET_LANG_COMBO || id == IDC_SET_SYNC_COMBO) &&
+                       (code == CBN_SELCHANGE || code == CBN_DROPDOWN || code == CBN_CLOSEUP)) {
+                if (id == IDC_SET_BIND_COMBO && code == CBN_SELCHANGE) {
+                    int sel = static_cast<int>(SendMessageW(st->bindCombo, CB_GETCURSEL, 0, 0));
+                    if (sel >= 0 && sel < static_cast<int>(st->bindIpValues.size())) {
+                        st->selectedBindIdx = sel;
+                        st->resBindIp = st->bindIpValues[static_cast<size_t>(sel)];
+                    }
+                }
+                if (HWND hCombo = reinterpret_cast<HWND>(lParam)) {
+                    InvalidateRect(hCombo, nullptr, FALSE);
                 }
                 return 0;
             } else if (id == IDC_SET_CONV_BROWSE) {
@@ -1203,6 +1419,59 @@ static LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
                 SetBkColor(hdc, colors.win32BgColor);
                 SetBkMode(hdc, OPAQUE);
                 return reinterpret_cast<LRESULT>(st->bgBrush);
+            }
+            break;
+        }
+
+        case WM_MEASUREITEM: {
+            MEASUREITEMSTRUCT* mis = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+            if (mis && mis->CtlType == ODT_COMBOBOX) {
+                mis->itemHeight = 26;
+                return TRUE;
+            }
+            break;
+        }
+
+        case WM_DRAWITEM: {
+            DRAWITEMSTRUCT* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lParam);
+            if (dis && dis->CtlType == ODT_COMBOBOX && dis->hwndItem) {
+                const auto& colors = ThemeManager::Instance().GetColors();
+                bool isDark = ThemeManager::Instance().IsDarkActive();
+                bool isSelected = ((dis->itemState & ODS_SELECTED) != 0) && ((dis->itemState & ODS_COMBOBOXEDIT) == 0);
+
+                COLORREF bg = isSelected
+                    ? RGB(37, 99, 235)
+                    : (isDark ? RGB(30, 41, 59) : RGB(255, 255, 255));
+                COLORREF fg = isSelected ? RGB(255, 255, 255) : colors.win32TextColor;
+
+                HBRUSH hBr = CreateSolidBrush(bg);
+                FillRect(dis->hDC, &dis->rcItem, hBr);
+                DeleteObject(hBr);
+
+                if (dis->itemID != static_cast<UINT>(-1)) {
+                    int len = static_cast<int>(SendMessageW(dis->hwndItem, CB_GETLBTEXTLEN, dis->itemID, 0));
+                    if (len > 0) {
+                        std::wstring txt(static_cast<size_t>(len) + 1, L'\0');
+                        SendMessageW(dis->hwndItem, CB_GETLBTEXT, dis->itemID, reinterpret_cast<LPARAM>(&txt[0]));
+                        txt.resize(static_cast<size_t>(len));
+
+                        HFONT hCtrlFont = reinterpret_cast<HFONT>(SendMessageW(dis->hwndItem, WM_GETFONT, 0, 0));
+                        HGDIOBJ oldFont = hCtrlFont ? SelectObject(dis->hDC, hCtrlFont) : nullptr;
+                        int oldBk = SetBkMode(dis->hDC, TRANSPARENT);
+                        COLORREF oldFg = SetTextColor(dis->hDC, fg);
+
+                        RECT textRc = dis->rcItem;
+                        textRc.left += 10;
+                        textRc.right -= 8;
+                        DrawTextW(dis->hDC, txt.c_str(), static_cast<int>(txt.size()), &textRc,
+                                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+
+                        SetTextColor(dis->hDC, oldFg);
+                        SetBkMode(dis->hDC, oldBk);
+                        if (oldFont) SelectObject(dis->hDC, oldFont);
+                    }
+                }
+                return TRUE;
             }
             break;
         }
@@ -1307,6 +1576,7 @@ void ShowSettingsDialog(HWND parent) {
         return;
     }
     state.hwnd = hDlg;
+    ThemeManager::Instance().ApplyToWindow(hDlg);
 
     auto addCtrl = [&](const wchar_t* cls, const std::wstring& text, DWORD ctrlStyle, DWORD exStyle, int x, int y, int w, int h, int id) -> HWND {
         HWND hChild = CreateWindowExW(
@@ -1332,7 +1602,7 @@ void ShowSettingsDialog(HWND parent) {
     // Group 2: Network interface & device name
     addCtrl(L"BUTTON", Tr("grp_network"), BS_GROUPBOX, 0, 18, 156, 504, 150, 0);
     addCtrl(L"STATIC", Tr("lbl_bind_ip"), 0, 0, 32, 178, 476, 18, 0);
-    state.bindCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 32, 198, 476, 180, IDC_SET_BIND_COMBO);
+    state.bindCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP, 0, 32, 198, 476, 180, IDC_SET_BIND_COMBO);
 
     state.bindIpValues.push_back(L"");
     SendMessageW(state.bindCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(Tr("bind_all_interfaces").c_str()));
@@ -1382,14 +1652,14 @@ void ShowSettingsDialog(HWND parent) {
     addCtrl(L"BUTTON", Tr("grp_app_prefs"), BS_GROUPBOX, 0, 18, 316, 504, 222, 0);
 
     addCtrl(L"STATIC", Tr("lbl_theme"), 0, 0, 32, 340, 170, 20, 0);
-    state.themeCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 210, 337, 298, 140, IDC_SET_THEME_COMBO);
+    state.themeCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP, 0, 210, 337, 298, 140, IDC_SET_THEME_COMBO);
     SendMessageW(state.themeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(Tr("theme_system").c_str()));
     SendMessageW(state.themeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(Tr("theme_light").c_str()));
     SendMessageW(state.themeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(Tr("theme_dark").c_str()));
     SendMessageW(state.themeCombo, CB_SETCURSEL, static_cast<WPARAM>(ThemeManager::Instance().GetMode()), 0);
 
     addCtrl(L"STATIC", Tr("lbl_language"), 0, 0, 32, 370, 170, 20, 0);
-    state.langCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 210, 367, 298, 180, IDC_SET_LANG_COMBO);
+    state.langCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP, 0, 210, 367, 298, 180, IDC_SET_LANG_COMBO);
     for (int i = 0; i <= static_cast<int>(AppLanguage::Portuguese); ++i) {
         std::wstring langLabel = I18n::GetLanguageDisplayName(static_cast<AppLanguage>(i));
         SendMessageW(state.langCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(langLabel.c_str()));
@@ -1397,7 +1667,7 @@ void ShowSettingsDialog(HWND parent) {
     SendMessageW(state.langCombo, CB_SETCURSEL, static_cast<WPARAM>(I18n::Instance().GetConfiguredLanguage()), 0);
 
     addCtrl(L"STATIC", Tr("lbl_sync"), 0, 0, 32, 400, 170, 20, 0);
-    state.syncCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 0, 210, 397, 298, 160, IDC_SET_SYNC_COMBO);
+    state.syncCombo = addCtrl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP, 0, 210, 397, 298, 160, IDC_SET_SYNC_COMBO);
     const std::pair<int, const char*> syncOptions[] = {
         { 3, "sync_3s" },
         { 5, "sync_5s" },
@@ -1448,6 +1718,10 @@ void ShowSettingsDialog(HWND parent) {
     addCtrl(L"BUTTON", Tr("btn_cancel"), BS_PUSHBUTTON | WS_TABSTOP, 0, 422, 550, 100, 30, IDC_SET_CANCEL_BTN);
 
     ThemeManager::Instance().ApplyToWindow(hDlg);
+    AttachModernComboBox(state.bindCombo);
+    AttachModernComboBox(state.themeCombo);
+    AttachModernComboBox(state.langCombo);
+    AttachModernComboBox(state.syncCombo);
 
     if (parent) EnableWindow(parent, FALSE);
     ShowWindow(hDlg, SW_SHOW);
