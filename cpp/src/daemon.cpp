@@ -2445,8 +2445,18 @@ namespace KDEConnect {
 
     void SmsDaemon::LoadDeletedThreadsLocked() {
         m_deletedThreads.clear();
-        std::wstring path = GetAppDataDirectory() + L"\\deleted_threads.txt";
-        std::filesystem::path fsPath(path);
+        std::wstring newPath = m_watchDir + L"\\deleted_threads.txt";
+        std::wstring legacyPath = GetAppDataDirectory() + L"\\deleted_threads.txt";
+        bool loadedFromLegacy = false;
+        std::wstring pathToRead = newPath;
+        if (GetFileAttributesW(newPath.c_str()) == INVALID_FILE_ATTRIBUTES &&
+            _wcsicmp(newPath.c_str(), legacyPath.c_str()) != 0 &&
+            GetFileAttributesW(legacyPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            pathToRead = legacyPath;
+            loadedFromLegacy = true;
+        }
+
+        std::filesystem::path fsPath(pathToRead);
         std::ifstream file(fsPath);
         if (!file.is_open()) return;
         std::string line;
@@ -2459,10 +2469,17 @@ namespace KDEConnect {
                 if (tid > 0) m_deletedThreads[tid] = ts;
             }
         }
+        file.close();
+
+        if (loadedFromLegacy) {
+            SaveDeletedThreadsLocked();
+            DeleteFileW(legacyPath.c_str());
+        }
     }
 
     void SmsDaemon::SaveDeletedThreadsLocked() {
-        std::wstring path = GetAppDataDirectory() + L"\\deleted_threads.txt";
+        SHCreateDirectoryExW(nullptr, m_watchDir.c_str(), nullptr);
+        std::wstring path = m_watchDir + L"\\deleted_threads.txt";
         std::filesystem::path fsPath(path);
         std::ofstream file(fsPath, std::ios::out | std::ios::trunc);
         if (file.is_open()) {
