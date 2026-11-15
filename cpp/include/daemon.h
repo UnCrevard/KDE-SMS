@@ -66,6 +66,16 @@ namespace KDEConnect {
             std::wstring avatarPath;
         };
 
+        struct PendingAttachmentRequest {
+            int64_t threadId = 0;
+            int64_t messageId = 0;
+            size_t attachmentIndex = 0;
+            int64_t partId = -1;
+            std::string uniqueId;
+            std::wstring mimeType;
+            int64_t requestedAtMs = 0;
+        };
+
         SmsDaemon();
         ~SmsDaemon();
 
@@ -75,6 +85,8 @@ namespace KDEConnect {
         void HandleIncomingKdePacket(const DeviceInfo& device, const KDEPacket& packet);
         void SaveMessagesBatchToDisk(const std::vector<Message>& messages, std::vector<Message>* outNewlyInserted = nullptr);
         void MaybeNotifyIncomingMessage(const Message& msg, const std::wstring& resolvedName);
+        std::wstring BuildConversationFilePathLocked(const Conversation& conv) const;
+        void RemoveConversationFileLocked(int64_t threadId);
         void WriteConversationJsonLocked(const Conversation& conv);
         void LoadAllConversationsFromDiskLocked();
         void LoadDeletedThreadsLocked();
@@ -109,9 +121,12 @@ namespace KDEConnect {
         std::wstring m_clientBoundEndpoint;
         mutable std::mutex m_storageMutex;
         std::map<int64_t, Conversation> m_conversations;
+        std::map<int64_t, std::wstring> m_threadFilePaths;
         std::map<int64_t, int64_t> m_deletedThreads;
         std::map<int64_t, int64_t> m_threadRedirects;
         std::set<int64_t> m_requestedThreads;
+        std::map<std::string, PendingAttachmentRequest> m_pendingAttachments;
+        std::set<std::string> m_completedAttachmentKeys;
         std::map<std::string, int64_t> m_contactUidTimestamps;
         std::map<std::wstring, std::wstring> m_phoneToContactName;
         std::map<std::wstring, std::wstring> m_phoneToAvatarPath;

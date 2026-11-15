@@ -15,6 +15,8 @@ namespace KDEConnect {
         const ThemeColors& GetColors() const;
 
         void ApplyToWindow(HWND hwnd);
+        void ApplyToControl(HWND hCtrl);
+        void ApplyThemeToChildren(HWND parentHwnd);
         void HandleSettingChange(HWND hwnd, LPARAM lParam);
 
         // Callbacks for UI updates when theme changes

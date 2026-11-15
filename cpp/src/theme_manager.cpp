@@ -1,4 +1,5 @@
 #include "theme_manager.h"
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 
@@ -474,13 +475,148 @@ namespace KDEConnect {
         }
     }
 
+    namespace {
+
+        enum class PreferredAppModeWin {
+            Default = 0,
+            AllowDark = 1,
+            ForceDark = 2,
+            ForceLight = 3,
+            Max = 4
+        };
+
+        using FnSetWindowTheme = HRESULT(WINAPI*)(HWND, LPCWSTR, LPCWSTR);
+        using FnAllowDarkModeForWindow = bool(WINAPI*)(HWND, bool);
+        using FnSetPreferredAppMode = PreferredAppModeWin(WINAPI*)(PreferredAppModeWin);
+        using FnFlushMenuThemes = void(WINAPI*)();
+        using FnRefreshImmersiveColorPolicyState = void(WINAPI*)();
+
+        struct UxThemeApi {
+            HMODULE hMod = nullptr;
+            FnSetWindowTheme setWindowTheme = nullptr;
+            FnAllowDarkModeForWindow allowDarkModeForWindow = nullptr;
+            FnSetPreferredAppMode setPreferredAppMode = nullptr;
+            FnFlushMenuThemes flushMenuThemes = nullptr;
+            FnRefreshImmersiveColorPolicyState refreshImmersiveColorPolicyState = nullptr;
+        };
+
+        template<typename Fn>
+        Fn LoadProcSafe(HMODULE mod, const char* nameOrOrd) {
+            if (!mod) return nullptr;
+            FARPROC p = GetProcAddress(mod, nameOrOrd);
+            if (!p) return nullptr;
+            Fn fn = nullptr;
+            static_assert(sizeof(fn) == sizeof(p), "Function pointer size mismatch");
+            memcpy(&fn, &p, sizeof(fn));
+            return fn;
+        }
+
+        const UxThemeApi& GetUxThemeApi() {
+            static UxThemeApi api;
+            static std::once_flag once;
+            std::call_once(once, []() {
+                api.hMod = LoadLibraryW(L"uxtheme.dll");
+                if (!api.hMod) return;
+                api.setWindowTheme = LoadProcSafe<FnSetWindowTheme>(api.hMod, "SetWindowTheme");
+                api.refreshImmersiveColorPolicyState = LoadProcSafe<FnRefreshImmersiveColorPolicyState>(api.hMod, MAKEINTRESOURCEA(104));
+                api.allowDarkModeForWindow = LoadProcSafe<FnAllowDarkModeForWindow>(api.hMod, MAKEINTRESOURCEA(133));
+                api.setPreferredAppMode = LoadProcSafe<FnSetPreferredAppMode>(api.hMod, MAKEINTRESOURCEA(135));
+                api.flushMenuThemes = LoadProcSafe<FnFlushMenuThemes>(api.hMod, MAKEINTRESOURCEA(136));
+                if (api.setPreferredAppMode) {
+                    api.setPreferredAppMode(PreferredAppModeWin::AllowDark);
+                }
+                if (api.refreshImmersiveColorPolicyState) {
+                    api.refreshImmersiveColorPolicyState();
+                }
+            });
+            return api;
+        }
+
+    } // namespace
+
+    void ThemeManager::ApplyToControl(HWND hCtrl) {
+        if (!hCtrl || !IsWindow(hCtrl)) return;
+
+        const UxThemeApi& api = GetUxThemeApi();
+        if (api.allowDarkModeForWindow) {
+            api.allowDarkModeForWindow(hCtrl, m_isDarkActive);
+        }
+
+        wchar_t cls[64]{};
+        GetClassNameW(hCtrl, cls, 64);
+
+        if (api.setWindowTheme) {
+            if (_wcsicmp(cls, L"ComboBox") == 0) {
+                api.setWindowTheme(hCtrl, m_isDarkActive ? L"DarkMode_CFD" : L"Explorer", nullptr);
+                COMBOBOXINFO cbi{};
+                cbi.cbSize = sizeof(cbi);
+                if (GetComboBoxInfo(hCtrl, &cbi)) {
+                    if (cbi.hwndList) {
+                        if (api.allowDarkModeForWindow) {
+                            api.allowDarkModeForWindow(cbi.hwndList, m_isDarkActive);
+                        }
+                        api.setWindowTheme(cbi.hwndList, m_isDarkActive ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+                    }
+                    if (cbi.hwndItem) {
+                        if (api.allowDarkModeForWindow) {
+                            api.allowDarkModeForWindow(cbi.hwndItem, m_isDarkActive);
+                        }
+                        api.setWindowTheme(cbi.hwndItem, m_isDarkActive ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+                    }
+                }
+            } else if (_wcsicmp(cls, L"Edit") == 0) {
+                api.setWindowTheme(hCtrl, m_isDarkActive ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+            } else if (_wcsicmp(cls, L"Button") == 0) {
+                LONG_PTR style = GetWindowLongPtrW(hCtrl, GWL_STYLE);
+                DWORD btnType = static_cast<DWORD>(style & BS_TYPEMASK);
+                if (btnType == BS_GROUPBOX) {
+                    api.setWindowTheme(hCtrl, m_isDarkActive ? L"" : L"Explorer", m_isDarkActive ? L"" : nullptr);
+                } else {
+                    api.setWindowTheme(hCtrl, m_isDarkActive ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+                }
+            } else {
+                api.setWindowTheme(hCtrl, m_isDarkActive ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+            }
+        }
+
+        SendMessageW(hCtrl, WM_THEMECHANGED, 0, 0);
+        InvalidateRect(hCtrl, nullptr, TRUE);
+    }
+
+    void ThemeManager::ApplyThemeToChildren(HWND parentHwnd) {
+        if (!parentHwnd || !IsWindow(parentHwnd)) return;
+        EnumChildWindows(parentHwnd, [](HWND hChild, LPARAM lParam) -> BOOL {
+            auto* mgr = reinterpret_cast<ThemeManager*>(lParam);
+            if (mgr) mgr->ApplyToControl(hChild);
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(this));
+        RedrawWindow(parentHwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    }
+
     void ThemeManager::ApplyToWindow(HWND hwnd) {
         if (!hwnd || !IsWindow(hwnd)) return;
+
+        const UxThemeApi& api = GetUxThemeApi();
+        if (api.setPreferredAppMode) {
+            api.setPreferredAppMode(m_isDarkActive ? PreferredAppModeWin::ForceDark : PreferredAppModeWin::ForceLight);
+        }
+        if (api.allowDarkModeForWindow) {
+            api.allowDarkModeForWindow(hwnd, m_isDarkActive);
+        }
+        if (api.flushMenuThemes) {
+            api.flushMenuThemes();
+        }
 
         // DWMWA_USE_IMMERSIVE_DARK_MODE: 20 (Windows 10 20H1+ and Windows 11), 19 on older Win10
         BOOL useDarkMode = m_isDarkActive ? TRUE : FALSE;
         DwmSetWindowAttribute(hwnd, 20, &useDarkMode, sizeof(useDarkMode));
         DwmSetWindowAttribute(hwnd, 19, &useDarkMode, sizeof(useDarkMode));
+
+        // DWMWA_WINDOW_CORNER_PREFERENCE (33): DWMWCP_ROUND (2) for modern Windows 11 rounded corners
+        DWORD cornerPref = 2;
+        DwmSetWindowAttribute(hwnd, 33, &cornerPref, sizeof(cornerPref));
+
+        ApplyThemeToChildren(hwnd);
 
         // Redraw frame to force DWM titlebar repaint
         SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);

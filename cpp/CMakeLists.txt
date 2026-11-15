@@ -19,6 +19,7 @@ include_directories(include)
 # Source files for the core library
 set(CORE_SOURCES
     src/theme_manager.cpp
+    src/i18n.cpp
     src/kdeconnect_protocol.cpp
     src/toast_notifier.cpp
     src/daemon.cpp

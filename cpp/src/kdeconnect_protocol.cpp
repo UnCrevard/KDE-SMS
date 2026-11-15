@@ -174,7 +174,14 @@ namespace KDEConnect {
         if (ext == L".gif") return "image/gif";
         if (ext == L".webp") return "image/webp";
         if (ext == L".bmp") return "image/bmp";
-        if (ext == L".heic") return "image/heic";
+        if (ext == L".heic" || ext == L".heif") return "image/heic";
+        if (ext == L".avif") return "image/avif";
+        if (ext == L".mp4" || ext == L".m4v") return "video/mp4";
+        if (ext == L".3gp" || ext == L".3gpp") return "video/3gpp";
+        if (ext == L".mov") return "video/quicktime";
+        if (ext == L".webm") return "video/webm";
+        if (ext == L".mkv") return "video/x-matroska";
+        if (ext == L".avi") return "video/x-msvideo";
         return "application/octet-stream";
     }
 
@@ -220,6 +227,18 @@ namespace KDEConnect {
                 if (valEnd == std::string::npos) break;
                 if (key == "body") {
                     outPacket.bodyJson = raw.substr(pos, valEnd - pos + 1);
+                } else if (key == "payloadTransferInfo") {
+                    std::string pti = raw.substr(pos, valEnd - pos + 1);
+                    size_t pPort = pti.find("\"port\"");
+                    if (pPort != std::string::npos) {
+                        size_t colon = pti.find(':', pPort + 6);
+                        if (colon != std::string::npos) {
+                            int parsedPort = std::atoi(pti.c_str() + colon + 1);
+                            if (parsedPort > 0 && parsedPort <= 65535) {
+                                outPacket.payloadPort = static_cast<uint16_t>(parsedPort);
+                            }
+                        }
+                    }
                 }
                 pos = valEnd + 1;
             } else {
@@ -228,6 +247,9 @@ namespace KDEConnect {
                 if (key == "id") {
                     std::string idStr = raw.substr(pos, valEnd - pos);
                     outPacket.id = std::strtoll(idStr.c_str(), nullptr, 10);
+                } else if (key == "payloadSize") {
+                    std::string szStr = raw.substr(pos, valEnd - pos);
+                    outPacket.payloadSize = std::strtoll(szStr.c_str(), nullptr, 10);
                 }
                 pos = valEnd;
             }
@@ -1945,6 +1967,99 @@ namespace KDEConnect {
         ss << "]}";
         pkt.bodyJson = ss.str();
         return SendPacket(device, pkt);
+    }
+
+    bool ProtocolHandler::RequestAttachment(const DeviceInfo& device, int64_t partId, const std::string& uniqueIdentifier) {
+        if (uniqueIdentifier.empty()) return false;
+        KDEPacket pkt;
+        pkt.id = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        pkt.type = "kdeconnect.sms.request_attachment";
+        std::ostringstream ss;
+        ss << "{\"part_id\":" << partId
+           << ",\"unique_identifier\":\"" << EscapeJsonString(uniqueIdentifier) << "\"}";
+        pkt.bodyJson = ss.str();
+        return SendPacket(device, pkt);
+    }
+
+    bool ProtocolHandler::DownloadPayloadToMemory(
+        const std::wstring& ipAddress,
+        uint16_t port,
+        int64_t expectedSize,
+        std::vector<uint8_t>& outBytes
+    ) {
+        outBytes.clear();
+        if (ipAddress.empty() || port == 0 || !m_running) return false;
+        constexpr size_t kMaxPayloadBytes = 50u * 1024u * 1024u;
+        if (expectedSize > static_cast<int64_t>(kMaxPayloadBytes)) {
+            return false;
+        }
+
+        SOCKET sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) return false;
+
+        std::wstring effectiveBind = GetEffectiveBindIp();
+        if (!effectiveBind.empty()) {
+            in_addr localBindIn{};
+            std::string bindUtf8 = WideToUtf8(effectiveBind);
+            if (inet_pton(AF_INET, bindUtf8.c_str(), &localBindIn) == 1) {
+                sockaddr_in localAddr{};
+                localAddr.sin_family = AF_INET;
+                localAddr.sin_port = 0;
+                localAddr.sin_addr = localBindIn;
+                if (bind(sock, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr)) == SOCKET_ERROR) {
+                    closesocket(sock);
+                    return false;
+                }
+            }
+        }
+
+        DWORD timeoutMs = 20000;
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+        setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
+
+        sockaddr_in destAddr{};
+        destAddr.sin_family = AF_INET;
+        destAddr.sin_port = htons(port);
+        std::string ipUtf8 = WideToUtf8(ipAddress);
+        if (inet_pton(AF_INET, ipUtf8.c_str(), &destAddr.sin_addr) != 1) {
+            closesocket(sock);
+            return false;
+        }
+
+        if (connect(sock, reinterpret_cast<sockaddr*>(&destAddr), sizeof(destAddr)) == SOCKET_ERROR) {
+            closesocket(sock);
+            return false;
+        }
+
+        auto session = std::make_shared<TlsSession>();
+        if (!PerformTlsHandshakeClient(sock, *session)) {
+            CleanupTlsSession(*session);
+            return false;
+        }
+
+        if (expectedSize > 0) {
+            outBytes.reserve(static_cast<size_t>(expectedSize));
+        }
+
+        std::string chunk;
+        while (m_running && TlsRecvChunk(*session, chunk)) {
+            if (outBytes.size() + chunk.size() > kMaxPayloadBytes) {
+                size_t keep = kMaxPayloadBytes - outBytes.size();
+                outBytes.insert(outBytes.end(),
+                                reinterpret_cast<const uint8_t*>(chunk.data()),
+                                reinterpret_cast<const uint8_t*>(chunk.data()) + keep);
+                break;
+            }
+            outBytes.insert(outBytes.end(),
+                            reinterpret_cast<const uint8_t*>(chunk.data()),
+                            reinterpret_cast<const uint8_t*>(chunk.data()) + chunk.size());
+            if (expectedSize > 0 && static_cast<int64_t>(outBytes.size()) >= expectedSize) {
+                break;
+            }
+        }
+
+        CleanupTlsSession(*session);
+        return !outBytes.empty();
     }
 
     bool ProtocolHandler::SendSms(

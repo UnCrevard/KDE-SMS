@@ -13,16 +13,12 @@ ifeq ($(OS),Windows_NT)
   # Native Windows commands without '-p' flag
   # Under cmd.exe: 'mkdir dir' works; 'mkdir -p dir' creates a folder named '-p'
   MKDIR_OBJ = if not exist "obj" mkdir "obj"
-  MKDIR_BIN = if not exist "build" mkdir "build"
   RM_OBJ    = if exist "obj" rmdir /S /Q "obj"
-  RM_BIN    = if exist "build" rmdir /S /Q "build"
   RM_EXTRA  = if exist "-p" rmdir /S /Q "-p"
 else
   # Fallback for Linux / Unix environments
   MKDIR_OBJ = mkdir -p obj
-  MKDIR_BIN = mkdir -p build
   RM_OBJ    = rm -rf obj
-  RM_BIN    = rm -rf build
   RM_EXTRA  = rm -rf "-p"
 endif
 
@@ -44,6 +40,7 @@ TARGET_DAEMON = KDEConnectDaemon.exe
 
 # Sources
 CORE_SRCS = $(SRC_DIR)/theme_manager.cpp \
+            $(SRC_DIR)/i18n.cpp \
             $(SRC_DIR)/kdeconnect_protocol.cpp \
             $(SRC_DIR)/toast_notifier.cpp \
             $(SRC_DIR)/daemon.cpp
@@ -74,7 +71,6 @@ all: dirs $(TARGET_UI) $(TARGET_DAEMON)
 # Directory creation without -p flag (guaranteed no '-p' folder under Windows cmd.exe)
 dirs:
 	@$(MKDIR_OBJ)
-	@$(MKDIR_BIN)
 
 # Windows Resource script compilation with windres
 $(RES_OBJ): $(RES_DIR)/app.rc $(RES_DIR)/app.manifest | dirs
@@ -98,11 +94,10 @@ $(TARGET_DAEMON): $(DAEMON_OBJS) $(CORE_OBJS) $(RES_OBJ) | dirs
 	@echo [LINK] $@
 	$(CXX) -o $@ $(DAEMON_OBJS) $(CORE_OBJS) $(RES_OBJ) $(LDFLAGS_DAEMON)
 
-# Clean: removes obj, bin, and any previously created '-p' folder
+# Clean: removes obj and any previously created '-p' folder
 clean:
-	@echo [CLEAN] Cleaning object and binary directories...
+	@echo [CLEAN] Cleaning object directories...
 	@$(RM_OBJ)
-	@$(RM_BIN)
 	@$(RM_EXTRA)
 	@echo [CLEAN] Done.
 

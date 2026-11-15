@@ -1,4 +1,5 @@
 #include "daemon.h"
+#include "i18n.h"
 #include <fstream>
 #include <iostream>
 #include <filesystem>
@@ -418,7 +419,19 @@ namespace KDEConnect {
             if (ext == L".gif") return L"image/gif";
             if (ext == L".webp") return L"image/webp";
             if (ext == L".bmp") return L"image/bmp";
-            if (ext == L".heic") return L"image/heic";
+            if (ext == L".heic" || ext == L".heif") return L"image/heic";
+            if (ext == L".avif") return L"image/avif";
+            if (ext == L".mp4" || ext == L".m4v") return L"video/mp4";
+            if (ext == L".3gp" || ext == L".3gpp") return L"video/3gpp";
+            if (ext == L".3g2" || ext == L".3gpp2") return L"video/3gpp2";
+            if (ext == L".mov") return L"video/quicktime";
+            if (ext == L".webm") return L"video/webm";
+            if (ext == L".mkv") return L"video/x-matroska";
+            if (ext == L".avi") return L"video/x-msvideo";
+            if (ext == L".ogg" || ext == L".oga" || ext == L".ogv") return L"audio/ogg";
+            if (ext == L".mp3") return L"audio/mpeg";
+            if (ext == L".amr") return L"audio/amr";
+            if (ext == L".m4a" || ext == L".aac") return L"audio/mp4";
             return L"application/octet-stream";
         }
 
@@ -426,10 +439,206 @@ namespace KDEConnect {
             std::wstring m = mime;
             for (auto& ch : m) ch = static_cast<wchar_t>(::towlower(ch));
             if (m.find(L"png") != std::wstring::npos) return L".png";
+            if (m.find(L"jpeg") != std::wstring::npos || m.find(L"jpg") != std::wstring::npos) return L".jpg";
             if (m.find(L"gif") != std::wstring::npos) return L".gif";
             if (m.find(L"webp") != std::wstring::npos) return L".webp";
             if (m.find(L"bmp") != std::wstring::npos) return L".bmp";
-            return L".jpg";
+            if (m.find(L"heic") != std::wstring::npos || m.find(L"heif") != std::wstring::npos) return L".heic";
+            if (m.find(L"avif") != std::wstring::npos) return L".avif";
+            if (m.find(L"svg") != std::wstring::npos) return L".svg";
+            if (m.find(L"3gpp2") != std::wstring::npos) return L".3g2";
+            if (m.find(L"3gpp") != std::wstring::npos || m.find(L"3gp") != std::wstring::npos) return L".3gp";
+            if (m.find(L"quicktime") != std::wstring::npos) return L".mov";
+            if (m.find(L"webm") != std::wstring::npos) return L".webm";
+            if (m.find(L"matroska") != std::wstring::npos || m.find(L"mkv") != std::wstring::npos) return L".mkv";
+            if (m.find(L"msvideo") != std::wstring::npos || m.find(L"avi") != std::wstring::npos) return L".avi";
+            if (m.find(L"mp4") != std::wstring::npos) return (m.rfind(L"audio/", 0) == 0) ? L".m4a" : L".mp4";
+            if (m.find(L"aac") != std::wstring::npos) return L".m4a";
+            if (m.find(L"amr") != std::wstring::npos) return L".amr";
+            if (m.find(L"ogg") != std::wstring::npos) return (m.rfind(L"video/", 0) == 0) ? L".ogv" : L".ogg";
+            if (m.find(L"mpeg") != std::wstring::npos || m.find(L"mp3") != std::wstring::npos) return L".mp3";
+            if (m.find(L"vcard") != std::wstring::npos) return L".vcf";
+            if (m.find(L"pdf") != std::wstring::npos) return L".pdf";
+            if (m.rfind(L"image/", 0) == 0) return L".jpg";
+            if (m.rfind(L"video/", 0) == 0) return L".mp4";
+            if (m.rfind(L"audio/", 0) == 0) return L".m4a";
+            return L"";
+        }
+
+        std::wstring DetectMediaExtension(
+            const std::vector<uint8_t>& bytes,
+            std::wstring& inOutMimeType,
+            const std::wstring& origFileName = L""
+        ) {
+            if (bytes.size() >= 8 && bytes[0] == 0x89 && bytes[1] == 0x50 && bytes[2] == 0x4E && bytes[3] == 0x47 &&
+                bytes[4] == 0x0D && bytes[5] == 0x0A && bytes[6] == 0x1A && bytes[7] == 0x0A) {
+                if (inOutMimeType.empty() || inOutMimeType == L"application/octet-stream" || inOutMimeType.rfind(L"image/", 0) == 0) {
+                    inOutMimeType = L"image/png";
+                }
+                return L".png";
+            }
+            if (bytes.size() >= 3 && bytes[0] == 0xFF && bytes[1] == 0xD8 && bytes[2] == 0xFF) {
+                if (inOutMimeType.empty() || inOutMimeType == L"application/octet-stream" || inOutMimeType.rfind(L"image/", 0) == 0) {
+                    inOutMimeType = L"image/jpeg";
+                }
+                return L".jpg";
+            }
+            if (bytes.size() >= 6 && bytes[0] == 'G' && bytes[1] == 'I' && bytes[2] == 'F' && bytes[3] == '8') {
+                if (inOutMimeType.empty() || inOutMimeType == L"application/octet-stream" || inOutMimeType.rfind(L"image/", 0) == 0) {
+                    inOutMimeType = L"image/gif";
+                }
+                return L".gif";
+            }
+            if (bytes.size() >= 12 && bytes[0] == 'R' && bytes[1] == 'I' && bytes[2] == 'F' && bytes[3] == 'F') {
+                if (bytes[8] == 'W' && bytes[9] == 'E' && bytes[10] == 'B' && bytes[11] == 'P') {
+                    if (inOutMimeType.empty() || inOutMimeType == L"application/octet-stream" || inOutMimeType.rfind(L"image/", 0) == 0) {
+                        inOutMimeType = L"image/webp";
+                    }
+                    return L".webp";
+                }
+                if (bytes[8] == 'A' && bytes[9] == 'V' && bytes[10] == 'I' && bytes[11] == ' ') {
+                    if (inOutMimeType.empty() || inOutMimeType == L"application/octet-stream") {
+                        inOutMimeType = L"video/x-msvideo";
+                    }
+                    return L".avi";
+                }
+            }
+            if (bytes.size() >= 2 && bytes[0] == 'B' && bytes[1] == 'M') {
+                if (inOutMimeType.empty() || inOutMimeType == L"application/octet-stream" || inOutMimeType.rfind(L"image/", 0) == 0) {
+                    inOutMimeType = L"image/bmp";
+                }
+                return L".bmp";
+            }
+            if (bytes.size() >= 12 && bytes[4] == 'f' && bytes[5] == 't' && bytes[6] == 'y' && bytes[7] == 'p') {
+                std::string brand(reinterpret_cast<const char*>(&bytes[8]), 4);
+                if (brand == "heic" || brand == "heix" || brand == "hevc" || brand == "hevx" || brand == "mif1" || brand == "msf1") {
+                    if (inOutMimeType.empty() || inOutMimeType == L"application/octet-stream") inOutMimeType = L"image/heic";
+                    return L".heic";
+                }
+                if (brand == "avif" || brand == "avis") {
+                    if (inOutMimeType.empty() || inOutMimeType == L"application/octet-stream") inOutMimeType = L"image/avif";
+                    return L".avif";
+                }
+                if (brand == "qt  ") {
+                    if (inOutMimeType.empty() || inOutMimeType == L"application/octet-stream") inOutMimeType = L"video/quicktime";
+                    return L".mov";
+                }
+                if (brand.rfind("3g2", 0) == 0) {
+                    if (inOutMimeType.empty() || inOutMimeType == L"application/octet-stream") inOutMimeType = L"video/3gpp2";
+                    return L".3g2";
+                }
+                if (brand.rfind("3gp", 0) == 0) {
+                    if (inOutMimeType.empty() || inOutMimeType == L"application/octet-stream") inOutMimeType = L"video/3gpp";
+                    return L".3gp";
+                }
+                if (brand == "M4A ") {
+                    if (inOutMimeType.empty() || inOutMimeType == L"application/octet-stream") inOutMimeType = L"audio/mp4";
+                    return L".m4a";
+                }
+                if (inOutMimeType.empty() || inOutMimeType == L"application/octet-stream") inOutMimeType = L"video/mp4";
+                return L".mp4";
+            }
+            if (bytes.size() >= 4 && bytes[0] == 0x1A && bytes[1] == 0x45 && bytes[2] == 0xDF && bytes[3] == 0xA3) {
+                std::wstring lowMime = ToLowerWideCopy(inOutMimeType);
+                if (lowMime.find(L"webm") != std::wstring::npos) {
+                    return L".webm";
+                }
+                if (inOutMimeType.empty() || inOutMimeType == L"application/octet-stream") inOutMimeType = L"video/x-matroska";
+                return L".mkv";
+            }
+            if (bytes.size() >= 4 && bytes[0] == 'O' && bytes[1] == 'g' && bytes[2] == 'g' && bytes[3] == 'S') {
+                return (ToLowerWideCopy(inOutMimeType).rfind(L"video/", 0) == 0) ? L".ogv" : L".ogg";
+            }
+            if (bytes.size() >= 5 && bytes[0] == '#' && bytes[1] == '!' && bytes[2] == 'A' && bytes[3] == 'M' && bytes[4] == 'R') {
+                return L".amr";
+            }
+            if ((bytes.size() >= 3 && bytes[0] == 'I' && bytes[1] == 'D' && bytes[2] == '3') ||
+                (bytes.size() >= 2 && bytes[0] == 0xFF && (bytes[1] & 0xE0) == 0xE0)) {
+                return L".mp3";
+            }
+
+            std::wstring byMime = ExtensionFromMimeWide(inOutMimeType);
+            if (!byMime.empty()) return byMime;
+
+            if (!origFileName.empty()) {
+                std::wstring origExt = std::filesystem::path(origFileName).extension().wstring();
+                for (auto& ch : origExt) ch = static_cast<wchar_t>(::towlower(ch));
+                if (!origExt.empty() && origExt.size() <= 8) return origExt;
+            }
+            return L".bin";
+        }
+
+        bool IsVideoAttachment(const Attachment& att) {
+            std::wstring lowMime = ToLowerWideCopy(att.mimeType);
+            if (lowMime.rfind(L"video/", 0) == 0) return true;
+            std::wstring ext = ToLowerWideCopy(std::filesystem::path(
+                att.localFilePath.empty() ? att.fileName : att.localFilePath).extension().wstring());
+            return (ext == L".mp4" || ext == L".3gp" || ext == L".3g2" || ext == L".mov" ||
+                    ext == L".webm" || ext == L".mkv" || ext == L".avi" || ext == L".m4v");
+        }
+
+        std::wstring BuildMessageSnippet(const Message& msg) {
+            if (!msg.body.empty()) return msg.body;
+            if (!msg.attachments.empty()) {
+                return IsVideoAttachment(msg.attachments[0]) ? Tr("att_video") : Tr("att_image");
+            }
+            return L"";
+        }
+
+        std::wstring SanitizePhoneForFilename(const std::wstring& rawAddress, int64_t threadId) {
+            std::wstring trimmed = TrimWideCopy(rawAddress);
+            if (trimmed.size() > 4 && ToLowerWideCopy(trimmed.substr(0, 4)) == L"tel:") {
+                trimmed = TrimWideCopy(trimmed.substr(4));
+            }
+            if (trimmed.empty()) {
+                return L"thread_" + std::to_wstring(threadId);
+            }
+
+            bool hasAlpha = false;
+            for (wchar_t ch : trimmed) {
+                if ((ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z')) {
+                    hasAlpha = true;
+                    break;
+                }
+            }
+
+            std::wstring out;
+            out.reserve(trimmed.size());
+            for (wchar_t ch : trimmed) {
+                if ((ch >= L'0' && ch <= L'9') || ch == L'+' ||
+                    (ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z') ||
+                    ch == L'-' || ch == L'_') {
+                    out.push_back(ch);
+                } else if (ch == L',' || ch == L';') {
+                    if (!out.empty() && out.back() != L'_') out.push_back(L'_');
+                } else if (ch == L' ' || ch == L'\t') {
+                    if (hasAlpha && !out.empty() && out.back() != L'_') {
+                        out.push_back(L'_');
+                    }
+                }
+            }
+
+            while (!out.empty() && (out.front() == L'_' || out.front() == L'.')) out.erase(out.begin());
+            while (!out.empty() && (out.back() == L'_' || out.back() == L'.')) out.pop_back();
+
+            if (out.size() > 80) {
+                out.resize(80);
+                while (!out.empty() && (out.back() == L'_' || out.back() == L'.')) out.pop_back();
+            }
+
+            if (out.empty()) {
+                return L"thread_" + std::to_wstring(threadId);
+            }
+
+            std::wstring upper;
+            upper.reserve(out.size());
+            for (wchar_t ch : out) upper.push_back(static_cast<wchar_t>(::towupper(ch)));
+            if (upper == L"CON" || upper == L"PRN" || upper == L"AUX" || upper == L"NUL" ||
+                (upper.size() == 4 && (upper.rfind(L"COM", 0) == 0 || upper.rfind(L"LPT", 0) == 0) &&
+                 upper[3] >= L'1' && upper[3] <= L'9')) {
+                out = L"num_" + out;
+            }
+            return out;
         }
 
         std::vector<uint8_t> Base64DecodeBytes(const std::string& b64) {
@@ -555,9 +764,10 @@ namespace KDEConnect {
             return L".jpg";
         }
 
-        std::wstring SaveContactAvatarToDisk(const std::string& uid, const std::vector<uint8_t>& bytes, const std::wstring& ext) {
+        std::wstring SaveContactAvatarToDisk(const std::string& uid, const std::vector<uint8_t>& bytes, const std::wstring& ext, const std::wstring& baseDir) {
             if (bytes.size() < 32) return L"";
-            std::wstring avatarDir = GetAppDataDirectory() + L"\\ContactAvatars";
+            std::wstring rootDir = baseDir.empty() ? GetMessagesDirectory() : baseDir;
+            std::wstring avatarDir = rootDir + L"\\ContactAvatars";
             SHCreateDirectoryExW(nullptr, avatarDir.c_str(), nullptr);
 
             std::wstring safeUid;
@@ -1098,10 +1308,10 @@ namespace KDEConnect {
         }
 
         std::wstring title = resolvedName.empty() ? msg.address : resolvedName;
-        if (title.empty()) title = L"Nouveau SMS";
+        if (title.empty()) title = Tr("new_sms_title");
         std::wstring body = msg.body;
         if (body.empty()) {
-            body = msg.attachments.empty() ? L"Nouveau message recu" : L"[Piece jointe MMS]";
+            body = msg.attachments.empty() ? Tr("new_sms_body") : Tr("att_mms");
         }
         ToastNotifier::Instance().ShowSmsNotification(title, body, msg.threadId);
     }
@@ -1337,28 +1547,29 @@ namespace KDEConnect {
             std::wstring bound = GetBoundEndpointSummary();
             std::wstring err = GetLastBindError();
             if (!err.empty()) {
-                return L"Service Daemon (IPC) - " + err;
+                return TrFmt("conn_ipc_err", err);
             }
             if (!bound.empty()) {
-                return L"Connecte au service Daemon (IPC actif - " + bound + L")";
+                return TrFmt("conn_ipc_active_bound", bound);
             }
-            return L"Connecte au service Daemon (IPC actif)";
+            return Tr("conn_ipc_active");
         }
 
         if (!m_protocol.IsListening()) {
             std::wstring err = GetLastBindError();
-            return err.empty() ? L"Ecoute reseau inactive (verifiez l'IP dans Reglages)" : err;
+            return err.empty() ? Tr("conn_inactive") : err;
         }
 
         std::wstring bound = m_protocol.GetBoundEndpointSummary();
         std::wstring bindSuffix = bound.empty() ? L"" : (L" [" + bound + L"]");
         auto devs = m_protocol.GetConnectedDevices();
         if (devs.empty()) {
-            return L"En attente de connexion du telephone sur " + (bound.empty() ? L"0.0.0.0:1716" : bound) + L"...";
+            return TrFmt("conn_waiting", bound.empty() ? L"0.0.0.0:1716" : bound);
         }
         const auto& d = devs.front();
         std::wstring name = d.deviceName.empty() ? d.ipAddress : d.deviceName;
-        return L"Connecte a " + name + (d.isPaired ? L" (Appaire)" : L" (En attente d'appairage)") + bindSuffix;
+        std::wstring pairStatus = d.isPaired ? Tr("conn_paired") : Tr("conn_pending_pair");
+        return TrFmt("conn_connected", name, pairStatus) + bindSuffix;
     }
 
     void SmsDaemon::HandleIncomingKdePacket(const DeviceInfo& device, const KDEPacket& packet) {
@@ -1434,25 +1645,51 @@ namespace KDEConnect {
                     msg.id = msg.timestamp ^ (msg.threadId << 16);
                 }
 
+                std::vector<PendingAttachmentRequest> attachmentRequestsForMsg;
                 if (hasAttachments && !rawAttachmentsJson.empty()) {
                     std::wstring recvDir = GetReceivedFilesDirectory();
                     int attIndex = 0;
                     ForEachJsonArrayObject(rawAttachmentsJson, [&](const std::string& attObj) {
-                        std::wstring mimeType = L"image/jpeg";
+                        std::wstring mimeType;
+                        std::wstring origFileName;
                         std::string encodedThumb;
+                        int64_t partId = -1;
+                        std::string uniqueId;
                         ForEachJsonObjectField(attObj, [&](const std::string& aKey, const std::string& aVal, bool) {
-                            if (aKey == "mime_type" || aKey == "mimeType") {
+                            if (aKey == "mime_type" || aKey == "mimeType" || aKey == "content_type") {
                                 mimeType = Utf8ToWide(UnescapeJsonString(aVal));
+                            } else if (aKey == "filename" || aKey == "fileName" || aKey == "name") {
+                                origFileName = Utf8ToWide(UnescapeJsonString(aVal));
                             } else if (aKey == "encoded_thumbnail" && !aVal.empty()) {
                                 encodedThumb = UnescapeJsonString(aVal);
+                            } else if (aKey == "part_id" || aKey == "partId") {
+                                partId = std::strtoll(aVal.c_str(), nullptr, 10);
+                            } else if (aKey == "unique_identifier" || aKey == "uniqueIdentifier") {
+                                uniqueId = UnescapeJsonString(aVal);
                             }
                         });
+
+                        if (mimeType.empty() && !origFileName.empty()) {
+                            mimeType = GuessMimeTypeWide(origFileName);
+                        }
+                        if (mimeType.empty()) {
+                            mimeType = L"application/octet-stream";
+                        }
+
+                        std::wstring lowerMime = ToLowerWideCopy(mimeType);
+                        bool isVideo = (lowerMime.rfind(L"video/", 0) == 0);
+                        bool hasFullSaved = false;
 
                         if (!encodedThumb.empty()) {
                             std::vector<uint8_t> bytes = Base64DecodeBytes(encodedThumb);
                             if (!bytes.empty()) {
-                                std::wstring ext = ExtensionFromMimeWide(mimeType);
-                                std::wstring fileName = L"mms_" + std::to_wstring(msg.id) + L"_" + std::to_wstring(attIndex) + ext;
+                                std::wstring thumbMime = isVideo ? L"image/png" : mimeType;
+                                std::wstring ext = DetectMediaExtension(bytes, thumbMime, origFileName);
+                                if (!isVideo && mimeType == L"application/octet-stream") {
+                                    mimeType = thumbMime;
+                                }
+                                std::wstring fileName = L"mms_" + std::to_wstring(msg.id) + L"_" + std::to_wstring(attIndex) +
+                                                         (isVideo ? (L"_thumb" + ext) : ext);
                                 std::wstring destPath = recvDir + L"\\" + fileName;
                                 std::filesystem::path fsDest(destPath);
                                 if (!std::filesystem::exists(fsDest)) {
@@ -1468,13 +1705,40 @@ namespace KDEConnect {
                                 att.fileSize = bytes.size();
                                 msg.attachments.push_back(std::move(att));
                             }
+                        } else {
+                            // Placeholder attachment entry until full payload arrives via kdeconnect.sms.attachment_file
+                            std::wstring ext = ExtensionFromMimeWide(mimeType);
+                            std::wstring fileName = L"mms_" + std::to_wstring(msg.id) + L"_" + std::to_wstring(attIndex) +
+                                                     (ext.empty() ? L".bin" : ext);
+                            std::wstring destPath = recvDir + L"\\" + fileName;
+                            std::error_code ec;
+                            if (std::filesystem::exists(std::filesystem::path(destPath), ec) &&
+                                std::filesystem::file_size(std::filesystem::path(destPath), ec) > 0) {
+                                hasFullSaved = true;
+                            }
+                            Attachment att;
+                            att.fileName = fileName;
+                            att.mimeType = mimeType;
+                            att.localFilePath = hasFullSaved ? destPath : L"";
+                            msg.attachments.push_back(std::move(att));
+                        }
+
+                        if (!uniqueId.empty() && !hasFullSaved && (isVideo || encodedThumb.empty())) {
+                            PendingAttachmentRequest req;
+                            req.threadId = msg.threadId;
+                            req.messageId = msg.id;
+                            req.attachmentIndex = msg.attachments.empty() ? 0 : (msg.attachments.size() - 1);
+                            req.partId = partId;
+                            req.uniqueId = uniqueId;
+                            req.mimeType = mimeType;
+                            attachmentRequestsForMsg.push_back(std::move(req));
                         }
                         ++attIndex;
                     });
                 }
 
                 if (msg.body.empty() && hasAttachments && msg.attachments.empty()) {
-                    msg.body = L"[Piece jointe MMS]";
+                    msg.body = Tr("att_mms");
                 }
 
                 if (msg.timestamp > 0 && msg.timestamp < 100000000000LL) {
@@ -1484,6 +1748,34 @@ namespace KDEConnect {
                 if (msg.threadId > 0 && (!msg.body.empty() || !msg.address.empty() || !msg.attachments.empty())) {
                     threadsInPacket.insert(msg.threadId);
                     parsedMessages.push_back(std::move(msg));
+                    if (!attachmentRequestsForMsg.empty()) {
+                        std::vector<PendingAttachmentRequest> toSend;
+                        int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+                        {
+                            std::lock_guard<std::mutex> lock(m_storageMutex);
+                            for (auto& req : attachmentRequestsForMsg) {
+                                std::string doneKey = std::to_string(req.messageId) + "|" + req.uniqueId;
+                                if (m_completedAttachmentKeys.find(doneKey) != m_completedAttachmentKeys.end()) {
+                                    continue;
+                                }
+                                if (m_pendingAttachments.find(req.uniqueId) == m_pendingAttachments.end()) {
+                                    req.requestedAtMs = nowMs;
+                                    m_pendingAttachments[req.uniqueId] = req;
+                                    toSend.push_back(req);
+                                }
+                            }
+                        }
+                        if (!toSend.empty()) {
+                            std::thread([this, device, toSend = std::move(toSend)]() {
+                                for (const auto& req : toSend) {
+                                    if (!m_running) break;
+                                    m_protocol.RequestAttachment(device, req.partId, req.uniqueId);
+                                    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+                                }
+                            }).detach();
+                        }
+                    }
                 }
             });
 
@@ -1611,6 +1903,136 @@ namespace KDEConnect {
                     }
                 }).detach();
             }
+        } else if (packet.type == "kdeconnect.sms.attachment_file") {
+            std::string bodyFileName;
+            ForEachJsonObjectField(packet.bodyJson, [&](const std::string& key, const std::string& val, bool) {
+                if (key == "filename" || key == "fileName" || key == "unique_identifier") {
+                    bodyFileName = UnescapeJsonString(val);
+                }
+            });
+
+            if (packet.payloadPort == 0 || device.ipAddress.empty()) {
+                return;
+            }
+
+            PendingAttachmentRequest matchedReq;
+            bool hasMatched = false;
+            {
+                std::lock_guard<std::mutex> lock(m_storageMutex);
+                if (!bodyFileName.empty()) {
+                    auto it = m_pendingAttachments.find(bodyFileName);
+                    if (it != m_pendingAttachments.end()) {
+                        matchedReq = it->second;
+                        m_pendingAttachments.erase(it);
+                        hasMatched = true;
+                    } else {
+                        for (auto pit = m_pendingAttachments.begin(); pit != m_pendingAttachments.end(); ++pit) {
+                            if (bodyFileName.find(pit->first) != std::string::npos ||
+                                pit->first.find(bodyFileName) != std::string::npos) {
+                                matchedReq = pit->second;
+                                m_pendingAttachments.erase(pit);
+                                hasMatched = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!hasMatched && !m_pendingAttachments.empty()) {
+                    auto bestIt = m_pendingAttachments.begin();
+                    for (auto pit = m_pendingAttachments.begin(); pit != m_pendingAttachments.end(); ++pit) {
+                        if (pit->second.requestedAtMs < bestIt->second.requestedAtMs) {
+                            bestIt = pit;
+                        }
+                    }
+                    matchedReq = bestIt->second;
+                    m_pendingAttachments.erase(bestIt);
+                    hasMatched = true;
+                }
+            }
+
+            uint16_t payloadPort = packet.payloadPort;
+            int64_t payloadSize = packet.payloadSize;
+            std::wstring devIp = device.ipAddress;
+            std::wstring wOrigName = Utf8ToWide(bodyFileName);
+
+            std::thread([this, devIp, payloadPort, payloadSize, wOrigName, matchedReq, hasMatched]() {
+                std::vector<uint8_t> rawBytes;
+                if (!m_protocol.DownloadPayloadToMemory(devIp, payloadPort, payloadSize, rawBytes) || rawBytes.empty()) {
+                    return;
+                }
+
+                std::wstring detectedMime = hasMatched ? matchedReq.mimeType : GuessMimeTypeWide(wOrigName);
+                std::wstring ext = DetectMediaExtension(rawBytes, detectedMime, wOrigName);
+                std::wstring recvDir = GetReceivedFilesDirectory();
+                std::wstring fileName;
+                if (hasMatched) {
+                    fileName = L"mms_" + std::to_wstring(matchedReq.messageId) + L"_" +
+                               std::to_wstring(matchedReq.attachmentIndex) + ext;
+                } else {
+                    int64_t tsNow = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch()).count();
+                    fileName = L"mms_" + std::to_wstring(tsNow) + ext;
+                }
+
+                std::wstring destPath = recvDir + L"\\" + fileName;
+                {
+                    std::ofstream outFile(std::filesystem::path(destPath), std::ios::out | std::ios::binary | std::ios::trunc);
+                    if (!outFile.is_open()) return;
+                    outFile.write(reinterpret_cast<const char*>(rawBytes.data()), static_cast<std::streamsize>(rawBytes.size()));
+                }
+
+                if (!hasMatched) return;
+
+                bool updated = false;
+                {
+                    std::lock_guard<std::mutex> lock(m_storageMutex);
+                    m_completedAttachmentKeys.insert(std::to_string(matchedReq.messageId) + "|" + matchedReq.uniqueId);
+                    int64_t resolvedTid = matchedReq.threadId;
+                    for (int hops = 0; hops < 8; ++hops) {
+                        auto rIt = m_threadRedirects.find(resolvedTid);
+                        if (rIt == m_threadRedirects.end() || rIt->second == resolvedTid) break;
+                        resolvedTid = rIt->second;
+                    }
+                    auto convIt = m_conversations.find(resolvedTid);
+                    if (convIt != m_conversations.end()) {
+                        for (auto& m : convIt->second.messages) {
+                            if (m.id == matchedReq.messageId) {
+                                if (matchedReq.attachmentIndex < m.attachments.size()) {
+                                    auto& att = m.attachments[matchedReq.attachmentIndex];
+                                    att.fileName = fileName;
+                                    att.mimeType = detectedMime;
+                                    att.localFilePath = destPath;
+                                    att.fileSize = rawBytes.size();
+                                } else {
+                                    Attachment att;
+                                    att.fileName = fileName;
+                                    att.mimeType = detectedMime;
+                                    att.localFilePath = destPath;
+                                    att.fileSize = rawBytes.size();
+                                    m.attachments.push_back(std::move(att));
+                                }
+                                if (m.body == Tr("att_mms")) {
+                                    m.body.clear();
+                                }
+                                updated = true;
+                                break;
+                            }
+                        }
+                        if (updated) {
+                            if (!convIt->second.messages.empty()) {
+                                convIt->second.snippet = BuildMessageSnippet(convIt->second.messages.back());
+                            }
+                            int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+                            m_ignoreWatcherUntilMs = nowMs + 350;
+                            WriteConversationJsonLocked(convIt->second);
+                        }
+                    }
+                }
+                if (updated) {
+                    NotifyConversationsUpdated();
+                }
+            }).detach();
         } else if (packet.type == "kdeconnect.contacts.response_vcards") {
             size_t addedCount = 0;
             size_t avatarCount = 0;
@@ -1631,7 +2053,7 @@ namespace KDEConnect {
                     ParseVCardFields(rawVCard, contact.name, contact.phones, &photoBytes, &photoExt);
                     if (!contact.name.empty() && !contact.phones.empty()) {
                         if (!photoBytes.empty()) {
-                            contact.avatarPath = SaveContactAvatarToDisk(contact.uid, photoBytes, photoExt);
+                            contact.avatarPath = SaveContactAvatarToDisk(contact.uid, photoBytes, photoExt, m_watchDir);
                             if (!contact.avatarPath.empty()) avatarCount++;
                         }
                         m_contactsCache[contact.uid] = contact;
@@ -1881,10 +2303,24 @@ namespace KDEConnect {
         m_phoneToContactName.clear();
         m_phoneToAvatarPath.clear();
 
-        std::wstring path = GetAppDataDirectory() + L"\\contacts_cache.txt";
-        std::filesystem::path fsPath(path);
+        std::wstring newCachePath = m_watchDir + L"\\contacts_cache.txt";
+        std::wstring legacyCachePath = GetAppDataDirectory() + L"\\contacts_cache.txt";
+        bool loadedFromLegacy = false;
+        std::wstring pathToRead = newCachePath;
+        if (GetFileAttributesW(newCachePath.c_str()) == INVALID_FILE_ATTRIBUTES &&
+            _wcsicmp(newCachePath.c_str(), legacyCachePath.c_str()) != 0 &&
+            GetFileAttributesW(legacyCachePath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            pathToRead = legacyCachePath;
+            loadedFromLegacy = true;
+        }
+
+        std::filesystem::path fsPath(pathToRead);
         std::ifstream file(fsPath);
         if (!file.is_open()) return;
+
+        std::wstring targetAvatarDir = m_watchDir + L"\\ContactAvatars";
+        std::wstring legacyAvatarDir = GetAppDataDirectory() + L"\\ContactAvatars";
+        bool migratedAvatars = false;
 
         std::string line;
         while (std::getline(file, line)) {
@@ -1914,6 +2350,17 @@ namespace KDEConnect {
             if (hasAvatarCol) {
                 std::wstring av = Utf8ToWide(HexDecode(line.substr(p4 + 1)));
                 if (!av.empty() && GetFileAttributesW(av.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                    // Migrate avatar into <ConversationsDir>\ContactAvatars if it still resides in legacy AppData\ContactAvatars
+                    std::wstring avParent = std::filesystem::path(av).parent_path().wstring();
+                    if (_wcsicmp(avParent.c_str(), targetAvatarDir.c_str()) != 0 &&
+                        _wcsicmp(avParent.c_str(), legacyAvatarDir.c_str()) == 0) {
+                        SHCreateDirectoryExW(nullptr, targetAvatarDir.c_str(), nullptr);
+                        std::wstring newAvPath = targetAvatarDir + L"\\" + std::filesystem::path(av).filename().wstring();
+                        if (MoveFileExW(av.c_str(), newAvPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED)) {
+                            av = newAvPath;
+                            migratedAvatars = true;
+                        }
+                    }
                     c.avatarPath = std::move(av);
                 }
             }
@@ -1925,10 +2372,19 @@ namespace KDEConnect {
                 IndexContactLocked(c);
             }
         }
+        file.close();
+
+        if (loadedFromLegacy || migratedAvatars) {
+            SaveContactsCacheLocked();
+            if (loadedFromLegacy) {
+                DeleteFileW(legacyCachePath.c_str());
+            }
+        }
     }
 
     void SmsDaemon::SaveContactsCacheLocked() {
-        std::wstring path = GetAppDataDirectory() + L"\\contacts_cache.txt";
+        SHCreateDirectoryExW(nullptr, m_watchDir.c_str(), nullptr);
+        std::wstring path = m_watchDir + L"\\contacts_cache.txt";
         std::filesystem::path fsPath(path);
         std::ofstream file(fsPath, std::ios::out | std::ios::trunc);
         if (!file.is_open()) return;
@@ -2016,6 +2472,44 @@ namespace KDEConnect {
         }
     }
 
+    std::wstring SmsDaemon::BuildConversationFilePathLocked(const Conversation& conv) const {
+        std::wstring baseAddr = conv.address;
+        if (baseAddr.empty()) {
+            for (const auto& m : conv.messages) {
+                if (!m.address.empty()) {
+                    baseAddr = m.address;
+                    break;
+                }
+            }
+        }
+        std::wstring stem = SanitizePhoneForFilename(baseAddr, conv.threadId);
+        std::wstring candidate = m_watchDir + L"\\" + stem + L".json";
+
+        bool collision = false;
+        for (const auto& kv : m_threadFilePaths) {
+            if (kv.first != conv.threadId && _wcsicmp(kv.second.c_str(), candidate.c_str()) == 0) {
+                collision = true;
+                break;
+            }
+        }
+        if (collision) {
+            candidate = m_watchDir + L"\\" + stem + L"_" + std::to_wstring(conv.threadId) + L".json";
+        }
+        return candidate;
+    }
+
+    void SmsDaemon::RemoveConversationFileLocked(int64_t threadId) {
+        auto it = m_threadFilePaths.find(threadId);
+        if (it != m_threadFilePaths.end()) {
+            if (!it->second.empty()) {
+                DeleteFileW(it->second.c_str());
+            }
+            m_threadFilePaths.erase(it);
+        }
+        std::wstring legacyFile = m_watchDir + L"\\thread_" + std::to_wstring(threadId) + L".json";
+        DeleteFileW(legacyFile.c_str());
+    }
+
     bool SmsDaemon::DeleteConversation(int64_t threadId) {
         if (threadId <= 0) return false;
 
@@ -2035,8 +2529,7 @@ namespace KDEConnect {
                 std::chrono::steady_clock::now().time_since_epoch()).count();
             m_ignoreWatcherUntilMs = nowMs + 350;
 
-            std::wstring filePath = m_watchDir + L"\\thread_" + std::to_wstring(threadId) + L".json";
-            DeleteFileW(filePath.c_str());
+            RemoveConversationFileLocked(threadId);
         }
 
         NotifyConversationsUpdated();
@@ -2054,7 +2547,8 @@ namespace KDEConnect {
     }
 
     void SmsDaemon::WriteConversationJsonLocked(const Conversation& conv) {
-        std::wstring filePath = m_watchDir + L"\\thread_" + std::to_wstring(conv.threadId) + L".json";
+        SHCreateDirectoryExW(nullptr, m_watchDir.c_str(), nullptr);
+        std::wstring filePath = BuildConversationFilePathLocked(conv);
         std::wstring tmpPath = filePath + L".tmp";
 
         {
@@ -2102,6 +2596,18 @@ namespace KDEConnect {
         }
 
         MoveFileExW(tmpPath.c_str(), filePath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+
+        auto prevIt = m_threadFilePaths.find(conv.threadId);
+        if (prevIt != m_threadFilePaths.end() && !prevIt->second.empty() &&
+            _wcsicmp(prevIt->second.c_str(), filePath.c_str()) != 0) {
+            DeleteFileW(prevIt->second.c_str());
+        }
+        std::wstring legacyPath = m_watchDir + L"\\thread_" + std::to_wstring(conv.threadId) + L".json";
+        if (_wcsicmp(legacyPath.c_str(), filePath.c_str()) != 0 &&
+            GetFileAttributesW(legacyPath.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            DeleteFileW(legacyPath.c_str());
+        }
+        m_threadFilePaths[conv.threadId] = filePath;
     }
 
     void SmsDaemon::SaveMessagesBatchToDisk(const std::vector<Message>& messages, std::vector<Message>* outNewlyInserted) {
@@ -2145,8 +2651,7 @@ namespace KDEConnect {
                             m_conversations.erase(msg.threadId);
                             dirtyThreads.erase(msg.threadId);
                             m_threadRedirects[msg.threadId] = dupTid;
-                            std::wstring oldFilePath = m_watchDir + L"\\thread_" + std::to_wstring(msg.threadId) + L".json";
-                            DeleteFileW(oldFilePath.c_str());
+                            RemoveConversationFileLocked(msg.threadId);
 
                             auto& destConv = m_conversations[dupTid];
                             for (auto& oldM : oldConv.messages) {
@@ -2171,8 +2676,7 @@ namespace KDEConnect {
                         dirtyThreads.erase(dupTid);
                         m_threadRedirects[dupTid] = msg.threadId;
 
-                        std::wstring oldFilePath = m_watchDir + L"\\thread_" + std::to_wstring(dupTid) + L".json";
-                        DeleteFileW(oldFilePath.c_str());
+                        RemoveConversationFileLocked(dupTid);
 
                         auto& destConv = m_conversations[msg.threadId];
                         destConv.threadId = msg.threadId;
@@ -2200,8 +2704,7 @@ namespace KDEConnect {
                         dirtyThreads.erase(dupTid);
                         m_threadRedirects[dupTid] = msg.threadId;
 
-                        std::wstring oldFilePath = m_watchDir + L"\\thread_" + std::to_wstring(dupTid) + L".json";
-                        DeleteFileW(oldFilePath.c_str());
+                        RemoveConversationFileLocked(dupTid);
 
                         auto& destConv = m_conversations[msg.threadId];
                         destConv.threadId = msg.threadId;
@@ -2235,7 +2738,7 @@ namespace KDEConnect {
             if (!resolvedName.empty()) {
                 conv.contactName = resolvedName;
             } else if (conv.contactName.empty()) {
-                conv.contactName = conv.address.empty() ? (L"Fil #" + std::to_wstring(msg.threadId)) : conv.address;
+                conv.contactName = conv.address.empty() ? TrFmt("thread_fallback", std::to_wstring(msg.threadId)) : conv.address;
             }
             std::wstring resolvedAvatar = ResolveAvatarForAddressLocked(conv.address);
             if (!resolvedAvatar.empty()) {
@@ -2307,9 +2810,7 @@ namespace KDEConnect {
             }
             if (!conv.messages.empty()) {
                 conv.lastTimestamp = conv.messages.back().timestamp;
-                conv.snippet = conv.messages.back().body.empty() && !conv.messages.back().attachments.empty()
-                    ? L"[Image]"
-                    : conv.messages.back().body;
+                conv.snippet = BuildMessageSnippet(conv.messages.back());
             }
 
             WriteConversationJsonLocked(conv);
@@ -2318,6 +2819,7 @@ namespace KDEConnect {
 
     void SmsDaemon::LoadAllConversationsFromDiskLocked() {
         std::map<int64_t, Conversation> loadedFromDisk;
+        std::map<int64_t, std::wstring> loadedPaths;
 
         try {
             std::filesystem::path dirPath(m_watchDir);
@@ -2326,33 +2828,36 @@ namespace KDEConnect {
             for (const auto& entry : std::filesystem::directory_iterator(dirPath)) {
                 if (!entry.is_regular_file()) continue;
                 std::wstring filename = entry.path().filename().wstring();
-                if (filename.rfind(L"thread_", 0) != 0 || !filename.ends_with(L".json")) continue;
+                std::wstring lowName = ToLowerWideCopy(filename);
+                if (!lowName.ends_with(L".json")) continue;
 
                 std::ifstream file(entry.path(), std::ios::in | std::ios::binary);
                 if (!file.is_open()) continue;
 
                 std::string jsonContent((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+                file.close();
                 if (jsonContent.empty()) continue;
 
                 Conversation conv;
                 std::string messagesArr;
+                bool hasMessagesKey = false;
 
                 ForEachJsonObjectField(jsonContent, [&](const std::string& key, const std::string& val, bool) {
                     if (key == "threadId") conv.threadId = std::strtoll(val.c_str(), nullptr, 10);
                     else if (key == "address") conv.address = Utf8ToWide(UnescapeJsonString(val));
                     else if (key == "contactName") conv.contactName = Utf8ToWide(UnescapeJsonString(val));
                     else if (key == "avatarPath") conv.avatarPath = Utf8ToWide(UnescapeJsonString(val));
-                    else if (key == "messages") messagesArr = val;
+                    else if (key == "messages") { messagesArr = val; hasMessagesKey = true; }
                 });
 
-                if (conv.threadId <= 0) continue;
+                if (conv.threadId <= 0 || !hasMessagesKey) continue;
                 if (m_deletedThreads.find(conv.threadId) != m_deletedThreads.end()) continue;
 
                 std::wstring resolved = ResolveContactNameForAddressLocked(conv.address);
                 if (!resolved.empty()) {
                     conv.contactName = resolved;
                 } else if (conv.contactName.empty()) {
-                    conv.contactName = conv.address.empty() ? (L"Fil #" + std::to_wstring(conv.threadId)) : conv.address;
+                    conv.contactName = conv.address.empty() ? TrFmt("thread_fallback", std::to_wstring(conv.threadId)) : conv.address;
                 }
                 std::wstring resolvedAvatar = ResolveAvatarForAddressLocked(conv.address);
                 if (!resolvedAvatar.empty()) {
@@ -2439,20 +2944,33 @@ namespace KDEConnect {
 
                 if (!conv.messages.empty()) {
                     conv.lastTimestamp = conv.messages.back().timestamp;
-                    conv.snippet = conv.messages.back().body.empty() && !conv.messages.back().attachments.empty()
-                        ? L"[Image]"
-                        : conv.messages.back().body;
+                    conv.snippet = BuildMessageSnippet(conv.messages.back());
                 }
                 for (const auto& m : conv.messages) {
                     if (!m.isOutgoing && !m.isRead) conv.unreadCount++;
                 }
 
-                loadedFromDisk[conv.threadId] = std::move(conv);
+                std::wstring currentEntryPath = entry.path().wstring();
+                auto existingSameId = loadedFromDisk.find(conv.threadId);
+                if (existingSameId != loadedFromDisk.end()) {
+                    if (conv.messages.size() > existingSameId->second.messages.size()) {
+                        DeleteFileW(loadedPaths[conv.threadId].c_str());
+                        loadedFromDisk[conv.threadId] = std::move(conv);
+                        loadedPaths[conv.threadId] = currentEntryPath;
+                    } else {
+                        DeleteFileW(currentEntryPath.c_str());
+                    }
+                } else {
+                    loadedPaths[conv.threadId] = currentEntryPath;
+                    loadedFromDisk[conv.threadId] = std::move(conv);
+                }
             }
         } catch (...) {
             // Keep existing in-memory cache if filesystem scan races
             return;
         }
+
+        m_threadFilePaths = loadedPaths;
 
         // Deduplicate any pre-existing duplicate thread files on disk for the same single phone number / sender
         std::map<std::wstring, int64_t> canonicalByPhone;
@@ -2515,9 +3033,7 @@ namespace KDEConnect {
             });
             if (!keepConv.messages.empty()) {
                 keepConv.lastTimestamp = keepConv.messages.back().timestamp;
-                keepConv.snippet = keepConv.messages.back().body.empty() && !keepConv.messages.back().attachments.empty()
-                    ? L"[Image]"
-                    : keepConv.messages.back().body;
+                keepConv.snippet = BuildMessageSnippet(keepConv.messages.back());
             }
             WriteConversationJsonLocked(keepConv);
             m_threadRedirects[dropId] = keepId;
@@ -2525,8 +3041,19 @@ namespace KDEConnect {
         }
         for (int64_t did : dupIds) {
             loadedFromDisk.erase(did);
-            std::wstring oldFile = m_watchDir + L"\\thread_" + std::to_wstring(did) + L".json";
-            DeleteFileW(oldFile.c_str());
+            RemoveConversationFileLocked(did);
+        }
+
+        // Auto-migrate legacy thread_<id>.json filenames to <phone_number>.json filenames
+        for (auto& kv : loadedFromDisk) {
+            std::wstring desiredPath = BuildConversationFilePathLocked(kv.second);
+            auto pit = m_threadFilePaths.find(kv.first);
+            if (pit == m_threadFilePaths.end() || _wcsicmp(pit->second.c_str(), desiredPath.c_str()) != 0) {
+                int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                m_ignoreWatcherUntilMs = nowMs + 350;
+                WriteConversationJsonLocked(kv.second);
+            }
         }
 
         m_conversations = std::move(loadedFromDisk);

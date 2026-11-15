@@ -1,6 +1,7 @@
 #include "common.h"
 #include "daemon.h"
 #include "toast_notifier.h"
+#include "i18n.h"
 #include <iostream>
 #include <vector>
 #include <string>
@@ -26,6 +27,7 @@ int wmain(int argc, wchar_t* argv[]) {
     std::wcout << L"==================================================" << std::endl;
 
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    I18n::Instance().Initialize();
     ToastNotifier::Instance().Initialize(nullptr);
 
     // Initialize Winsock to enumerate network adapters

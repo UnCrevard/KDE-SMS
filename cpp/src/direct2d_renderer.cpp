@@ -1,6 +1,24 @@
 #include "direct2d_renderer.h"
+#include "i18n.h"
+#include <filesystem>
+#include <cwctype>
 
 namespace KDEConnect {
+
+    namespace {
+        bool IsVideoAttachmentHelper(const Attachment& att) {
+            std::wstring m = att.mimeType;
+            std::transform(m.begin(), m.end(), m.begin(), ::towlower);
+            if (m.rfind(L"video/", 0) == 0) return true;
+            std::wstring p = att.localFilePath.empty() ? att.fileName : att.localFilePath;
+            std::transform(p.begin(), p.end(), p.begin(), ::towlower);
+            for (const wchar_t* ext : { L".mp4", L".m4v", L".3gp", L".3g2", L".mov", L".webm", L".mkv", L".avi" }) {
+                size_t elen = wcslen(ext);
+                if (p.size() >= elen && p.compare(p.size() - elen, elen, ext) == 0) return true;
+            }
+            return false;
+        }
+    }
 
     template<class T> void SafeRelease(T** ppT) {
         if (*ppT) {
@@ -408,7 +426,7 @@ namespace KDEConnect {
                         m_renderTarget->FillRoundedRectangle(delBtn, m_brushDivider);
                     }
                     D2D1_RECT_F xRect = D2D1::RectF(width - 25.0f, currentY + 36.0f, width - 8.0f, currentY + 57.0f);
-                    m_renderTarget->DrawText(L"×", 1, m_fontBodyBold, xRect,
+                    m_renderTarget->DrawText(L"\u00D7", 1, m_fontBodyBold, xRect,
                         static_cast<int>(i) == hoveredIndex ? m_brushTextPrimary : m_brushTextMuted);
                 }
 
@@ -488,20 +506,37 @@ namespace KDEConnect {
             float bubbleContentWidth = std::max(textMetrics.widthIncludingTrailingWhitespace + 32.0f, 95.0f);
             float bubbleContentHeight = std::max(textMetrics.height + 30.0f, 46.0f);
 
-            // Handle image attachment height
+            // Handle image or video/media attachment height
             ID2D1Bitmap* attachmentBitmap = nullptr;
+            bool hasMediaCard = false;
+            std::wstring mediaCardLabel;
             float imageDrawWidth = 0.0f;
             float imageDrawHeight = 0.0f;
+            float mediaCardHeight = 0.0f;
             if (!msg.attachments.empty()) {
                 attachmentBitmap = LoadImageFromFile(msg.attachments[0].localFilePath);
                 if (attachmentBitmap) {
                     D2D1_SIZE_F imgSize = attachmentBitmap->GetSize();
                     imageDrawWidth = std::min(imgSize.width, maxBubbleWidth - 20.0f);
-                    float ratio = imageDrawWidth / imgSize.width;
+                    float ratio = imageDrawWidth / std::max(1.0f, imgSize.width);
                     imageDrawHeight = std::min(imgSize.height * ratio, 280.0f);
 
                     bubbleContentWidth = std::max(bubbleContentWidth, imageDrawWidth + 20.0f);
                     bubbleContentHeight += imageDrawHeight + 10.0f;
+                } else if (!msg.attachments[0].localFilePath.empty()) {
+                    hasMediaCard = true;
+                    std::wstring dispName = msg.attachments[0].fileName;
+                    if (dispName.empty()) {
+                        dispName = std::filesystem::path(msg.attachments[0].localFilePath).filename().wstring();
+                    }
+                    if (dispName.empty()) {
+                        dispName = IsVideoAttachmentHelper(msg.attachments[0]) ? Tr("att_video") : Tr("att_mms");
+                    }
+                    std::wstring prefixIcon = IsVideoAttachmentHelper(msg.attachments[0]) ? L"\U0001F3AC  " : L"\U0001F4CE  ";
+                    mediaCardLabel = prefixIcon + dispName;
+                    mediaCardHeight = 42.0f;
+                    bubbleContentWidth = std::max(bubbleContentWidth, std::min(maxBubbleWidth, 240.0f));
+                    bubbleContentHeight += mediaCardHeight + 10.0f;
                 }
             }
 
@@ -526,12 +561,37 @@ namespace KDEConnect {
                 }
 
                 float contentY = bubbleTop + 10.0f;
+                D2D1_RECT_F attDest = D2D1::RectF(0.0f, 0.0f, 0.0f, 0.0f);
 
                 // Render Image Attachment if present
                 if (attachmentBitmap) {
-                    D2D1_RECT_F imgDest = D2D1::RectF(bubbleLeft + 10.0f, contentY, bubbleLeft + 10.0f + imageDrawWidth, contentY + imageDrawHeight);
-                    m_renderTarget->DrawBitmap(attachmentBitmap, imgDest);
+                    attDest = D2D1::RectF(bubbleLeft + 10.0f, contentY, bubbleLeft + 10.0f + imageDrawWidth, contentY + imageDrawHeight);
+                    m_renderTarget->DrawBitmap(attachmentBitmap, attDest);
                     contentY += imageDrawHeight + 8.0f;
+                } else if (hasMediaCard) {
+                    attDest = D2D1::RectF(bubbleLeft + 10.0f, contentY, bubbleRight - 10.0f, contentY + mediaCardHeight);
+                    D2D1_ROUNDED_RECT cardRounded = D2D1::RoundedRect(attDest, 8.0f, 8.0f);
+                    m_renderTarget->FillRoundedRectangle(cardRounded, isOut ? m_brushAccent : m_brushDivider);
+                    m_renderTarget->DrawRoundedRectangle(cardRounded, m_brushBubbleInboundBorder, 1.0f);
+
+                    IDWriteTextLayout* cardLayout = nullptr;
+                    float labelW = std::max(40.0f, (attDest.right - attDest.left) - 18.0f);
+                    if (SUCCEEDED(m_dwriteFactory->CreateTextLayout(mediaCardLabel.c_str(), static_cast<UINT32>(mediaCardLabel.length()), m_fontCaption, labelW, 20.0f, &cardLayout)) && cardLayout) {
+                        DWRITE_TRIMMING trimming = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+                        IDWriteInlineObject* ellipsis = nullptr;
+                        m_dwriteFactory->CreateEllipsisTrimmingSign(m_fontCaption, &ellipsis);
+                        cardLayout->SetTrimming(&trimming, ellipsis);
+                        SafeRelease(&ellipsis);
+
+                        m_renderTarget->DrawTextLayout(
+                            D2D1::Point2F(attDest.left + 9.0f, attDest.top + 12.0f),
+                            cardLayout,
+                            isOut ? m_brushBubbleOutboundText : m_brushTextPrimary,
+                            D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT
+                        );
+                        cardLayout->Release();
+                    }
+                    contentY += mediaCardHeight + 8.0f;
                 }
 
                 // Render SMS Text Layout with COLOR EMOJIS!
@@ -560,8 +620,9 @@ namespace KDEConnect {
                 BubbleLayout layout{};
                 layout.messageId = msg.id;
                 layout.bubbleRect = roundedBubble.rect;
+                layout.imageRect = attDest;
                 layout.isOutgoing = isOut;
-                layout.hasAttachment = (attachmentBitmap != nullptr);
+                layout.hasAttachment = (!msg.attachments.empty() && !msg.attachments[0].localFilePath.empty());
                 if (!msg.attachments.empty()) layout.attachmentPath = msg.attachments[0].localFilePath;
                 outBubbleLayouts.push_back(layout);
             }
@@ -587,7 +648,7 @@ namespace KDEConnect {
         m_renderTarget->FillRectangle(barRect, m_brushSidebarSelected);
         m_renderTarget->DrawLine(D2D1::Point2F(startX, topY), D2D1::Point2F(startX + width, topY), m_brushDivider, 1.0f);
 
-        std::wstring label = L"📎 Image prete a envoyer : " + attachmentName;
+        std::wstring label = TrFmt("pending_attachment_label", attachmentName);
         D2D1_RECT_F textRect = D2D1::RectF(startX + 16.0f, topY + 5.0f, startX + width - 44.0f, composerTopY - 4.0f);
         m_renderTarget->DrawText(
             label.c_str(),
@@ -599,7 +660,7 @@ namespace KDEConnect {
         );
 
         D2D1_RECT_F clearRect = D2D1::RectF(startX + width - 34.0f, topY + 4.0f, startX + width - 10.0f, composerTopY - 4.0f);
-        m_renderTarget->DrawText(L"×", 1, m_fontHeading, clearRect, m_brushTextSecondary);
+        m_renderTarget->DrawText(L"\u00D7", 1, m_fontHeading, clearRect, m_brushTextSecondary);
     }
 
     void Direct2DRenderer::RenderEmptyState(float startX, float width, float height, const std::wstring& message) {
@@ -635,8 +696,8 @@ namespace KDEConnect {
                     float imgW = std::min(imgSize.width, maxBubbleWidth - 20.0f);
                     float imgH = std::min(imgSize.height * (imgW / std::max(1.0f, imgSize.width)), 280.0f);
                     bubbleH += imgH + 10.0f;
-                } else {
-                    bubbleH += 180.0f;
+                } else if (!msg.attachments[0].localFilePath.empty()) {
+                    bubbleH += 52.0f;
                 }
             }
 

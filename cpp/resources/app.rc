@@ -1,9 +1,13 @@
 #include <windows.h>
 
+#ifndef RT_MANIFEST
+#define RT_MANIFEST 24
+#endif
+
 #define IDI_APP_ICON      101
 #define IDR_MANIFEST      1
 
-// Manifest resource
+// Manifest resource (Type 24 = RT_MANIFEST for Common Controls v6 visual styles)
 IDR_MANIFEST RT_MANIFEST "app.manifest"
 
 // Version info

@@ -19,6 +19,8 @@ namespace KDEConnect {
         int64_t id = 0;
         std::string type;
         std::string bodyJson;
+        int64_t payloadSize = 0;
+        uint16_t payloadPort = 0;
 
         std::string Serialize() const;
         static bool Deserialize(const std::string& raw, KDEPacket& outPacket);
@@ -54,6 +56,8 @@ namespace KDEConnect {
 
         bool RequestAllContacts(const DeviceInfo& device = DeviceInfo{});
         bool RequestContactsVcards(const DeviceInfo& device, const std::vector<std::string>& uids);
+        bool RequestAttachment(const DeviceInfo& device, int64_t partId, const std::string& uniqueIdentifier);
+        bool DownloadPayloadToMemory(const std::wstring& ipAddress, uint16_t port, int64_t expectedSize, std::vector<uint8_t>& outBytes);
 
         void SetOnPacketReceived(PacketCallback cb) { m_onPacketReceived = cb; }
         void SetOnDeviceDiscovered(DeviceDiscoveredCallback cb) { m_onDeviceDiscovered = cb; }

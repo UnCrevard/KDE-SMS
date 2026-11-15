@@ -1,5 +1,6 @@
 #include "toast_notifier.h"
 #include "theme_manager.h"
+#include "i18n.h"
 
 #include <cmath>
 #include <cwchar>
@@ -307,8 +308,8 @@ namespace KDEConnect {
                         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
                         DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
 
-                    std::wstring senderText = (st && !st->sender.empty()) ? st->sender : L"Nouveau SMS";
-                    std::wstring bodyText = (st && !st->body.empty()) ? st->body : L"Nouveau message recu";
+                    std::wstring senderText = (st && !st->sender.empty()) ? st->sender : Tr("new_sms_title");
+                    std::wstring bodyText = (st && !st->body.empty()) ? st->body : Tr("new_sms_body");
 
                     HGDIOBJ oldFont = SelectObject(memDc, hTitleFont);
                     SetTextColor(memDc, titleCol);
@@ -496,7 +497,7 @@ namespace KDEConnect {
             targetHwnd = m_hwnd;
             PendingBubble b;
             b.sender = senderName.empty() ? L"KDE Connect SMS" : senderName;
-            b.body = messageBody.empty() ? L"Nouveau message recu" : messageBody;
+            b.body = messageBody.empty() ? Tr("new_sms_body") : messageBody;
             b.threadId = threadId;
             b.avatarPath = avatarPath;
             m_pendingBubbles.push_back(std::move(b));
