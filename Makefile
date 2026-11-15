@@ -29,7 +29,7 @@ RES_DIR = cpp/resources
 OBJ_DIR = obj
 
 # Compiler & Linker Flags
-CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -MMD -MP -DUNICODE -D_UNICODE -DNOMINMAX -DWIN32_LEAN_AND_MEAN -I$(INC_DIR)
+CXXFLAGS ?= -std=c++20 -O2 -Wall -Wextra -MMD -MP -DUNICODE -D_UNICODE -DNOMINMAX -DWIN32_LEAN_AND_MEAN -Wunknown-pragmas -I$(INC_DIR)
 LDFLAGS_COMMON = -s -lws2_32 -lcrypt32 -lsecur32 -lshlwapi -lole32 -lshell32 -luuid -lcomdlg32 -ladvapi32 -ldwmapi -lgdi32
 LDFLAGS_UI = -mwindows -municode -ld2d1 -ldwrite -lwindowscodecs -lcomctl32 $(LDFLAGS_COMMON)
 LDFLAGS_DAEMON = -municode $(LDFLAGS_COMMON)
