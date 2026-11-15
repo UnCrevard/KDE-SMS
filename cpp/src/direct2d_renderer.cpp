@@ -472,8 +472,29 @@ namespace KDEConnect {
         if (!conversation.address.empty() && conversation.contactName != conversation.address) {
             title += L"  (" + conversation.address + L")";
         }
-        D2D1_RECT_F titleRect = D2D1::RectF(startX + 64.0f, 15.0f, startX + width - 190.0f, 40.0f);
-        m_renderTarget->DrawText(title.c_str(), static_cast<UINT32>(title.length()), m_fontHeading, titleRect, m_brushTextPrimary);
+        float titleLeft = startX + 64.0f;
+        float titleRight = std::max(titleLeft + 20.0f, startX + width - 252.0f);
+        IDWriteTextLayout* titleLayout = nullptr;
+        if (SUCCEEDED(m_dwriteFactory->CreateTextLayout(
+                title.c_str(), static_cast<UINT32>(title.length()),
+                m_fontHeading, titleRight - titleLeft, 26.0f, &titleLayout)) && titleLayout) {
+            DWRITE_TRIMMING trimming = { DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0 };
+            IDWriteInlineObject* ellipsis = nullptr;
+            m_dwriteFactory->CreateEllipsisTrimmingSign(m_fontHeading, &ellipsis);
+            titleLayout->SetTrimming(&trimming, ellipsis);
+            SafeRelease(&ellipsis);
+
+            m_renderTarget->DrawTextLayout(
+                D2D1::Point2F(titleLeft, 15.0f),
+                titleLayout,
+                m_brushTextPrimary,
+                D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT
+            );
+            titleLayout->Release();
+        } else {
+            D2D1_RECT_F titleRect = D2D1::RectF(titleLeft, 15.0f, titleRight, 40.0f);
+            m_renderTarget->DrawText(title.c_str(), static_cast<UINT32>(title.length()), m_fontHeading, titleRect, m_brushTextPrimary);
+        }
 
         // Background of message panel
         D2D1_RECT_F threadRect = D2D1::RectF(startX, headerH, startX + width, messageAreaBottom);
@@ -677,6 +698,86 @@ namespace KDEConnect {
             textRect,
             m_brushTextMuted
         );
+    }
+
+    void Direct2DRenderer::RenderConnectionIndicator(float rightX, float headerH, bool isConnected) {
+        if (!m_renderTarget) return;
+
+        const bool isDark = ThemeManager::Instance().IsDarkActive();
+        const float badgeW = 34.0f;
+        const float badgeH = 32.0f;
+        const float left = rightX - badgeW;
+        const float top = (headerH - badgeH) * 0.5f;
+        const float right = rightX;
+        const float bottom = top + badgeH;
+
+        D2D1_COLOR_F statusColor = isConnected
+            ? D2D1::ColorF(0.133f, 0.773f, 0.369f, 1.0f)   // Vivid emerald green (#22C55E)
+            : D2D1::ColorF(0.937f, 0.267f, 0.267f, 1.0f);  // Vivid coral red (#EF4444)
+
+        D2D1_COLOR_F pillBgColor = isConnected
+            ? D2D1::ColorF(0.133f, 0.773f, 0.369f, isDark ? 0.16f : 0.12f)
+            : D2D1::ColorF(0.937f, 0.267f, 0.267f, isDark ? 0.16f : 0.11f);
+
+        D2D1_COLOR_F pillBorderColor = isConnected
+            ? D2D1::ColorF(0.133f, 0.773f, 0.369f, isDark ? 0.50f : 0.45f)
+            : D2D1::ColorF(0.937f, 0.267f, 0.267f, isDark ? 0.50f : 0.45f);
+
+        D2D1_COLOR_F haloColor = statusColor;
+        haloColor.a = isDark ? 0.28f : 0.22f;
+
+        ID2D1SolidColorBrush* bgBrush = nullptr;
+        ID2D1SolidColorBrush* borderBrush = nullptr;
+        ID2D1SolidColorBrush* statusBrush = nullptr;
+        ID2D1SolidColorBrush* haloBrush = nullptr;
+
+        m_renderTarget->CreateSolidColorBrush(pillBgColor, &bgBrush);
+        m_renderTarget->CreateSolidColorBrush(pillBorderColor, &borderBrush);
+        m_renderTarget->CreateSolidColorBrush(statusColor, &statusBrush);
+        m_renderTarget->CreateSolidColorBrush(haloColor, &haloBrush);
+
+        D2D1_ROUNDED_RECT badge = D2D1::RoundedRect(D2D1::RectF(left, top, right, bottom), 8.0f, 8.0f);
+        if (bgBrush) m_renderTarget->FillRoundedRectangle(badge, bgBrush);
+        if (borderBrush) m_renderTarget->DrawRoundedRectangle(badge, borderBrush, 1.0f);
+
+        // Smartphone silhouette slightly left of center inside badge
+        float phoneCx = left + 13.0f;
+        float phoneCy = top + 16.5f;
+        D2D1_ROUNDED_RECT phoneRect = D2D1::RoundedRect(
+            D2D1::RectF(phoneCx - 5.5f, phoneCy - 8.5f, phoneCx + 5.5f, phoneCy + 8.5f),
+            2.2f, 2.2f
+        );
+        if (m_brushTextPrimary) {
+            m_renderTarget->DrawRoundedRectangle(phoneRect, m_brushTextPrimary, 1.4f);
+        }
+        if (m_brushTextSecondary) {
+            m_renderTarget->DrawLine(
+                D2D1::Point2F(phoneCx - 2.0f, phoneCy - 5.8f),
+                D2D1::Point2F(phoneCx + 2.0f, phoneCy - 5.8f),
+                m_brushTextSecondary,
+                1.0f
+            );
+            m_renderTarget->DrawLine(
+                D2D1::Point2F(phoneCx - 2.0f, phoneCy + 5.8f),
+                D2D1::Point2F(phoneCx + 2.0f, phoneCy + 5.8f),
+                m_brushTextSecondary,
+                1.1f
+            );
+        }
+
+        // Green or Red LED dot on the right side of the badge
+        D2D1_POINT_2F dotCenter = D2D1::Point2F(left + 25.0f, top + 11.5f);
+        if (haloBrush) {
+            m_renderTarget->FillEllipse(D2D1::Ellipse(dotCenter, 5.8f, 5.8f), haloBrush);
+        }
+        if (statusBrush) {
+            m_renderTarget->FillEllipse(D2D1::Ellipse(dotCenter, 3.8f, 3.8f), statusBrush);
+        }
+
+        SafeRelease(&bgBrush);
+        SafeRelease(&borderBrush);
+        SafeRelease(&statusBrush);
+        SafeRelease(&haloBrush);
     }
 
     float Direct2DRenderer::CalculateTotalThreadHeight(const Conversation& conversation, float contentWidth) {

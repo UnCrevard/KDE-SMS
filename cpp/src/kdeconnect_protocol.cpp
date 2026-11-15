@@ -402,6 +402,20 @@ namespace KDEConnect {
         return m_pairedDeviceIds.find(deviceId) != m_pairedDeviceIds.end();
     }
 
+    void ProtocolHandler::SetOnConnectionChanged(ConnectionChangedCallback cb) {
+        std::lock_guard<std::mutex> lock(m_connCbMutex);
+        m_onConnectionChanged = std::move(cb);
+    }
+
+    void ProtocolHandler::NotifyConnectionChanged() {
+        ConnectionChangedCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(m_connCbMutex);
+            cb = m_onConnectionChanged;
+        }
+        if (cb) cb();
+    }
+
     std::vector<DeviceInfo> ProtocolHandler::GetConnectedDevices() const {
         std::vector<DeviceInfo> connected;
         std::lock_guard<std::mutex> connLock(m_connMutex);
@@ -1377,8 +1391,10 @@ namespace KDEConnect {
             m_tcpListenSocket = INVALID_SOCKET;
         }
 
+        bool hadSessions = false;
         {
             std::lock_guard<std::mutex> lock(m_connMutex);
+            hadSessions = !m_activeSessions.empty();
             for (auto& kv : m_activeSessions) {
                 if (kv.second) {
                     std::lock_guard<std::mutex> sLock(kv.second->sendMutex);
@@ -1393,6 +1409,9 @@ namespace KDEConnect {
             }
             m_activeSessions.clear();
             m_lastTcpAttempt.clear();
+        }
+        if (hadSessions) {
+            NotifyConnectionChanged();
         }
 
         if (m_broadcastThread.joinable()) m_broadcastThread.join();
@@ -1617,6 +1636,7 @@ namespace KDEConnect {
                 it->isPaired = dev.isPaired;
             }
         }
+        NotifyConnectionChanged();
 
         std::string bufferAccumulator;
         std::string chunk;
@@ -1655,6 +1675,7 @@ namespace KDEConnect {
                             }
                         }
                         std::wcout << L"[TLS Identite] Identite chiffree confirmee (Protocole v8 OK) !" << std::endl;
+                        NotifyConnectionChanged();
                         if (!readyNotified && m_onDeviceReady) {
                             readyNotified = true;
                             m_onDeviceReady(dev);
@@ -1710,14 +1731,19 @@ namespace KDEConnect {
             }
         }
 
+        bool removedSession = false;
         if (!dev.deviceId.empty()) {
             std::lock_guard<std::mutex> lock(m_connMutex);
             auto it = m_activeSessions.find(dev.deviceId);
             if (it != m_activeSessions.end() && it->second == session) {
                 m_activeSessions.erase(it);
+                removedSession = true;
             }
         }
         CleanupTlsSession(*session);
+        if (removedSession) {
+            NotifyConnectionChanged();
+        }
         std::wcout << L"[TLS Session] Connexion fermee avec " << dev.ipAddress << std::endl;
     }
 
@@ -1793,9 +1819,11 @@ namespace KDEConnect {
 
         std::wcout << L"[TLS Serveur] Tunnel chiffre etabli avec " << device.ipAddress << L" ! Envoi identite TLS..." << std::endl;
 
-        // Disable short receive timeout for long-lived idle TLS session
+        // Disable short receive timeout for long-lived idle TLS session & enable TCP keepalive
         DWORD noTimeout = 0;
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&noTimeout), sizeof(noTimeout));
+        BOOL keepAlive = TRUE;
+        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&keepAlive), sizeof(keepAlive));
 
         // Protocol v8: immediately send encrypted identity packet over TLS
         if (!TlsSendAll(*session, BuildIdentityPacket())) {
@@ -1870,6 +1898,8 @@ namespace KDEConnect {
 
         DWORD noTimeout = 0;
         setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&noTimeout), sizeof(noTimeout));
+        BOOL keepAlive = TRUE;
+        setsockopt(clientSocket, SOL_SOCKET, SO_KEEPALIVE, reinterpret_cast<const char*>(&keepAlive), sizeof(keepAlive));
 
         // Protocol v8: immediately send encrypted identity packet over TLS
         if (!TlsSendAll(*session, BuildIdentityPacket())) {

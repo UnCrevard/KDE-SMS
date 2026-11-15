@@ -45,8 +45,11 @@ static HWND g_hwndSyncButton = nullptr;
 static HWND g_hwndSettingsButton = nullptr;
 static HWND g_hwndAttachButton = nullptr;
 static HWND g_hwndEmojiButton = nullptr;
+static HWND g_hwndConnTooltip = nullptr;
 static HMODULE g_hMsftEdit = nullptr;
 static bool g_composerIsRichEdit = false;
+static bool g_lastPhoneConnected = false;
+static std::wstring g_lastPhoneName;
 static HFONT g_hFont = nullptr;
 static HBRUSH g_editBrush = nullptr;
 static COLORREF g_editBrushColor = RGB(0, 0, 0);
@@ -67,6 +70,7 @@ static UINT g_msgTaskbarCreated = 0;
 #define IDC_EMOJI_BUTTON     1009
 #define IDC_SYNC_TIMER       1
 #define IDC_DEBOUNCE_TIMER   2
+#define IDC_CONN_POLL_TIMER  3
 #define IDM_DELETE_CONV      2001
 #define IDM_TRAY_SHOW         2002
 #define IDM_TRAY_EXIT         2003
@@ -75,6 +79,7 @@ static UINT g_msgTaskbarCreated = 0;
 #define WM_APP_RESTORE_WINDOW (WM_APP + 2)
 #define WM_APP_RELOAD_INI     (WM_APP + 3)
 #define WM_APP_BIND_ALERT     (WM_APP + 4)
+#define WM_APP_CONN_CHANGED   (WM_APP + 5)
 
 // Settings modal control IDs
 #define IDC_SET_CONV_EDIT        3001
@@ -605,6 +610,58 @@ static void UpdateMainWindowTitle(HWND hwnd) {
     SetWindowTextW(hwnd, title.c_str());
 }
 
+static RECT GetConnectionIndicatorRect(HWND hwnd) {
+    RECT rc{};
+    if (hwnd && IsWindow(hwnd)) {
+        GetClientRect(hwnd, &rc);
+    }
+    int width = rc.right - rc.left;
+    return RECT{ width - 242, 11, width - 208, 43 };
+}
+
+static std::wstring BuildConnectionTooltipText() {
+    if (SmsDaemon::Instance().IsPhoneConnected()) {
+        std::wstring devName = SmsDaemon::Instance().GetConnectedDeviceName();
+        if (!devName.empty()) {
+            return TrFmt("phone_status_connected_named", devName);
+        }
+        return Tr("phone_status_connected");
+    }
+    return Tr("phone_status_disconnected");
+}
+
+static void UpdateConnectionTooltip(HWND hwnd) {
+    if (!g_hwndConnTooltip || !IsWindow(g_hwndConnTooltip) || !hwnd) return;
+    std::wstring tipText = BuildConnectionTooltipText();
+    RECT badgeRc = GetConnectionIndicatorRect(hwnd);
+    TOOLINFOW ti{};
+    ti.cbSize = sizeof(TOOLINFOW);
+    ti.uFlags = TTF_SUBCLASS;
+    ti.hwnd = hwnd;
+    ti.uId = 1;
+    ti.rect = badgeRc;
+    ti.lpszText = const_cast<LPWSTR>(tipText.c_str());
+    SendMessageW(g_hwndConnTooltip, TTM_NEWTOOLRECTW, 0, reinterpret_cast<LPARAM>(&ti));
+    SendMessageW(g_hwndConnTooltip, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&ti));
+}
+
+static void RefreshConnectionUi(HWND hwnd) {
+    if (!hwnd || !IsWindow(hwnd)) return;
+    g_lastPhoneConnected = SmsDaemon::Instance().IsPhoneConnected();
+    g_lastPhoneName = SmsDaemon::Instance().GetConnectedDeviceName();
+    UpdateMainWindowTitle(hwnd);
+    UpdateConnectionTooltip(hwnd);
+    if (g_allConversations.empty()) {
+        g_lastEmptyStatus = SmsDaemon::Instance().GetConnectionStatusText();
+        InvalidateRect(hwnd, nullptr, FALSE);
+    } else {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        RECT headerOnly{ static_cast<LONG>(g_sidebarWidth), 0, rc.right, 54 };
+        InvalidateRect(hwnd, &headerOnly, FALSE);
+    }
+}
+
 static void ApplyLanguageToMainUi(HWND hwnd) {
     if (!hwnd || !IsWindow(hwnd)) return;
     if (g_hwndSearchEdit) {
@@ -621,6 +678,7 @@ static void ApplyLanguageToMainUi(HWND hwnd) {
         InvalidateRect(g_emojiPopup.hwnd, nullptr, FALSE);
     }
     UpdateMainWindowTitle(hwnd);
+    UpdateConnectionTooltip(hwnd);
     g_lastEmptyStatus = SmsDaemon::Instance().GetConnectionStatusText();
     ApplySearchFilter();
     InvalidateRect(hwnd, nullptr, FALSE);
@@ -1852,6 +1910,7 @@ void LayoutChildControls(HWND hwnd) {
     if (g_emojiPopup.hwnd && IsWindow(g_emojiPopup.hwnd)) {
         PositionEmojiPicker(hwnd);
     }
+    UpdateConnectionTooltip(hwnd);
 }
 
 static void ClearPendingAttachment(HWND hwnd) {
@@ -1973,15 +2032,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hSmsIcon));
             }
 
-            // Register live conversation update hook before starting daemon
+            // Register live conversation & phone connection update hooks before starting daemon
             SmsDaemon::Instance().SetOnConversationsUpdated([]() {
                 if (g_hwndMain && IsWindow(g_hwndMain)) {
                     PostMessageW(g_hwndMain, WM_APP_REFRESH_CONVS, 0, 0);
                 }
             });
+            SmsDaemon::Instance().SetOnConnectionChanged([]() {
+                if (g_hwndMain && IsWindow(g_hwndMain)) {
+                    PostMessageW(g_hwndMain, WM_APP_CONN_CHANGED, 0, 0);
+                }
+            });
 
             // Start direct standalone KDE Connect protocol on configured BindIp
             SmsDaemon::Instance().Start(g_bindIp);
+            g_lastPhoneConnected = SmsDaemon::Instance().IsPhoneConnected();
+            g_lastPhoneName = SmsDaemon::Instance().GetConnectedDeviceName();
             UpdateMainWindowTitle(hwnd);
             if (!SmsDaemon::Instance().GetProtocol().IsListening()) {
                 PostMessageW(hwnd, WM_APP_BIND_ALERT, 0, 0);
@@ -2078,11 +2144,44 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             ThemeManager::Instance().ApplyThemeToChildren(hwnd);
             ApplyComposerTheme();
+
+            // Tooltip for the top-right green/red phone connection status icon
+            g_hwndConnTooltip = CreateWindowExW(
+                WS_EX_TOPMOST,
+                TOOLTIPS_CLASSW,
+                nullptr,
+                WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                hwnd,
+                nullptr,
+                GetModuleHandle(nullptr),
+                nullptr
+            );
+            if (g_hwndConnTooltip) {
+                ThemeManager::Instance().ApplyToControl(g_hwndConnTooltip);
+                std::wstring initTip = BuildConnectionTooltipText();
+                TOOLINFOW ti{};
+                ti.cbSize = sizeof(TOOLINFOW);
+                ti.uFlags = TTF_SUBCLASS;
+                ti.hwnd = hwnd;
+                ti.uId = 1;
+                ti.rect = GetConnectionIndicatorRect(hwnd);
+                ti.lpszText = const_cast<LPWSTR>(initTip.c_str());
+                SendMessageW(g_hwndConnTooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
+                SendMessageW(g_hwndConnTooltip, TTM_SETMAXTIPWIDTH, 0, 320);
+                ThemeManager::Instance().RegisterCallback("ConnTooltip", [](bool, const ThemeColors&) {
+                    if (g_hwndConnTooltip && IsWindow(g_hwndConnTooltip)) {
+                        ThemeManager::Instance().ApplyToControl(g_hwndConnTooltip);
+                    }
+                });
+            }
+
             LayoutChildControls(hwnd);
             ReloadConversations(hwnd, true, true);
 
-            // Configure periodic sync check from INI
+            // Configure periodic sync check from INI and lightweight connection poll timer
             ConfigureSyncTimer(hwnd);
+            SetTimer(hwnd, IDC_CONN_POLL_TIMER, 2000, nullptr);
             return 0;
         }
 
@@ -2097,20 +2196,43 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        case WM_APP_CONN_CHANGED: {
+            RefreshConnectionUi(hwnd);
+            return 0;
+        }
+
         case WM_TIMER: {
             if (wParam == IDC_DEBOUNCE_TIMER) {
                 KillTimer(hwnd, IDC_DEBOUNCE_TIMER);
-                UpdateMainWindowTitle(hwnd);
+                RefreshConnectionUi(hwnd);
                 ReloadConversations(hwnd, true);
             } else if (wParam == IDC_SYNC_TIMER) {
+                if (SmsDaemon::Instance().IsClientMode()) {
+                    SmsDaemon::Instance().RefreshClientStatus();
+                }
                 SmsDaemon::Instance().RequestConversationsSync();
-                UpdateMainWindowTitle(hwnd);
+                bool nowConn = SmsDaemon::Instance().IsPhoneConnected();
+                std::wstring nowDev = SmsDaemon::Instance().GetConnectedDeviceName();
+                if (nowConn != g_lastPhoneConnected || nowDev != g_lastPhoneName) {
+                    RefreshConnectionUi(hwnd);
+                } else {
+                    UpdateMainWindowTitle(hwnd);
+                }
                 if (g_allConversations.empty()) {
                     std::wstring status = SmsDaemon::Instance().GetConnectionStatusText();
                     if (status != g_lastEmptyStatus) {
                         g_lastEmptyStatus = status;
                         InvalidateRect(hwnd, nullptr, FALSE);
                     }
+                }
+            } else if (wParam == IDC_CONN_POLL_TIMER) {
+                if (SmsDaemon::Instance().IsClientMode()) {
+                    SmsDaemon::Instance().RefreshClientStatus();
+                }
+                bool nowConn = SmsDaemon::Instance().IsPhoneConnected();
+                std::wstring nowDev = SmsDaemon::Instance().GetConnectedDeviceName();
+                if (nowConn != g_lastPhoneConnected || nowDev != g_lastPhoneName) {
+                    RefreshConnectionUi(hwnd);
                 }
             }
             return 0;
@@ -2182,6 +2304,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     emptyMsg
                 );
             }
+
+            g_renderer.RenderConnectionIndicator(
+                totalWidth - 208.0f,
+                54.0f,
+                SmsDaemon::Instance().IsPhoneConnected()
+            );
 
             g_renderer.EndDraw();
 
@@ -2286,6 +2414,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             GetClientRect(hwnd, &rc);
             int width = rc.right - rc.left;
             int height = rc.bottom - rc.top;
+
+            // Click on green/red phone connection indicator icon in header -> broadcast/refresh status
+            RECT badgeRc = GetConnectionIndicatorRect(hwnd);
+            if (x >= badgeRc.left && x <= badgeRc.right && y >= badgeRc.top && y <= badgeRc.bottom) {
+                if (SmsDaemon::Instance().IsClientMode()) {
+                    SmsDaemon::Instance().RefreshClientStatus();
+                } else {
+                    SmsDaemon::Instance().GetProtocol().BroadcastIdentity();
+                }
+                SmsDaemon::Instance().RequestConversationsSync();
+                RefreshConnectionUi(hwnd);
+                return 0;
+            }
 
             // Click on [x] button inside the pending attachment preview bar
             if (!g_pendingAttachmentName.empty() &&
@@ -2643,7 +2784,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SaveWindowBoundsToIni(hwnd);
             KillTimer(hwnd, IDC_SYNC_TIMER);
             KillTimer(hwnd, IDC_DEBOUNCE_TIMER);
+            KillTimer(hwnd, IDC_CONN_POLL_TIMER);
             SmsDaemon::Instance().SetOnConversationsUpdated(nullptr);
+            SmsDaemon::Instance().SetOnConnectionChanged(nullptr);
+            ThemeManager::Instance().UnregisterCallback("ConnTooltip");
+            if (g_hwndConnTooltip) {
+                DestroyWindow(g_hwndConnTooltip);
+                g_hwndConnTooltip = nullptr;
+            }
             if (g_origComposerProc && g_hwndComposerEdit) {
                 SetWindowLongPtrW(g_hwndComposerEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_origComposerProc));
                 g_origComposerProc = nullptr;

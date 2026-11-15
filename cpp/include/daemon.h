@@ -13,6 +13,7 @@ namespace KDEConnect {
     class SmsDaemon {
     public:
         using ConversationsUpdatedCallback = std::function<void()>;
+        using ConnectionChangedCallback = std::function<void()>;
 
         static SmsDaemon& Instance();
 
@@ -41,10 +42,14 @@ namespace KDEConnect {
             const std::wstring& attachmentPath = L""
         );
 
-        // UI notification hook
+        // UI notification hooks
         void SetOnConversationsUpdated(ConversationsUpdatedCallback cb);
+        void SetOnConnectionChanged(ConnectionChangedCallback cb);
 
         // Status info for UI
+        bool IsPhoneConnected() const;
+        std::wstring GetConnectedDeviceName() const;
+        void RefreshClientStatus();
         std::wstring GetConnectionStatusText() const;
         std::wstring GetBoundEndpointSummary() const;
         std::wstring GetLastBindError() const;
@@ -104,9 +109,11 @@ namespace KDEConnect {
         void RefreshClientStatusFromDaemon();
         bool SendIpcCommand(const std::string& command, std::string* outResponse = nullptr);
         void NotifyConversationsUpdated();
+        void NotifyConnectionChanged();
 
         std::atomic<bool> m_running{false};
         std::atomic<bool> m_isClientMode{false};
+        std::atomic<bool> m_clientPhoneConnected{false};
         std::atomic<int64_t> m_ignoreWatcherUntilMs{0};
         int64_t m_startupEpochMs = 0;
         std::wstring m_watchDir;
@@ -119,6 +126,7 @@ namespace KDEConnect {
         mutable std::mutex m_netStatusMutex;
         std::wstring m_lastBindError;
         std::wstring m_clientBoundEndpoint;
+        std::wstring m_clientConnectedDeviceName;
         mutable std::mutex m_storageMutex;
         std::map<int64_t, Conversation> m_conversations;
         std::map<int64_t, std::wstring> m_threadFilePaths;
@@ -138,6 +146,7 @@ namespace KDEConnect {
 
         std::mutex m_callbackMutex;
         ConversationsUpdatedCallback m_onConversationsUpdated;
+        ConnectionChangedCallback m_onConnectionChanged;
     };
 
 } // namespace KDEConnect

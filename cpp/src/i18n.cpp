@@ -727,6 +727,33 @@ namespace KDEConnect {
                 L"Alle Dateien (*.*)",
                 L"Tutti i file (*.*)",
                 L"Todos os arquivos (*.*)"
+            },
+            {
+                "phone_status_connected",
+                L"T\u00e9l\u00e9phone connect\u00e9",
+                L"Phone connected",
+                L"Tel\u00e9fono conectado",
+                L"Telefon verbunden",
+                L"Telefono connesso",
+                L"Telefone conectado"
+            },
+            {
+                "phone_status_connected_named",
+                L"T\u00e9l\u00e9phone connect\u00e9 : {0}",
+                L"Phone connected: {0}",
+                L"Tel\u00e9fono conectado: {0}",
+                L"Telefon verbunden: {0}",
+                L"Telefono connesso: {0}",
+                L"Telefone conectado: {0}"
+            },
+            {
+                "phone_status_disconnected",
+                L"T\u00e9l\u00e9phone d\u00e9connect\u00e9",
+                L"Phone disconnected",
+                L"Tel\u00e9fono desconectado",
+                L"Telefon getrennt",
+                L"Telefono disconnesso",
+                L"Telefone desconectado"
             }
         };
 

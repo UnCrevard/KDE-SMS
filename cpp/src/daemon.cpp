@@ -985,11 +985,25 @@ namespace KDEConnect {
         m_onConversationsUpdated = std::move(cb);
     }
 
+    void SmsDaemon::SetOnConnectionChanged(ConnectionChangedCallback cb) {
+        std::lock_guard<std::mutex> lock(m_callbackMutex);
+        m_onConnectionChanged = std::move(cb);
+    }
+
     void SmsDaemon::NotifyConversationsUpdated() {
         ConversationsUpdatedCallback cb;
         {
             std::lock_guard<std::mutex> lock(m_callbackMutex);
             cb = m_onConversationsUpdated;
+        }
+        if (cb) cb();
+    }
+
+    void SmsDaemon::NotifyConnectionChanged() {
+        ConnectionChangedCallback cb;
+        {
+            std::lock_guard<std::mutex> lock(m_callbackMutex);
+            cb = m_onConnectionChanged;
         }
         if (cb) cb();
     }
@@ -1058,19 +1072,62 @@ namespace KDEConnect {
         return (err == ERROR_PIPE_BUSY);
     }
 
+    static int ExtractSimpleJsonIntField(const std::string& json, const std::string& field, int defaultVal = 0) {
+        std::string needle = "\"" + field + "\":";
+        size_t pos = json.find(needle);
+        if (pos == std::string::npos) return defaultVal;
+        size_t start = pos + needle.size();
+        while (start < json.size() && (json[start] == ' ' || json[start] == '\t')) ++start;
+        if (start >= json.size() || (json[start] != '-' && (json[start] < '0' || json[start] > '9'))) {
+            return defaultVal;
+        }
+        return std::atoi(json.c_str() + start);
+    }
+
+    void SmsDaemon::RefreshClientStatus() {
+        if (m_isClientMode) {
+            RefreshClientStatusFromDaemon();
+        }
+    }
+
     void SmsDaemon::RefreshClientStatusFromDaemon() {
         std::string resp;
-        if (!SendIpcCommand("STATUS\n", &resp)) return;
+        if (!SendIpcCommand("STATUS\n", &resp)) {
+            bool wasConnected = m_clientPhoneConnected.exchange(false);
+            {
+                std::lock_guard<std::mutex> lock(m_netStatusMutex);
+                m_clientConnectedDeviceName.clear();
+            }
+            if (wasConnected) {
+                NotifyConnectionChanged();
+            }
+            return;
+        }
+        int connCount = ExtractSimpleJsonIntField(resp, "connected", 0);
+        std::string devHex = ExtractSimpleJsonStringField(resp, "device");
         std::string bound = ExtractSimpleJsonStringField(resp, "bound");
         std::string errHex = ExtractSimpleJsonStringField(resp, "error");
-        std::lock_guard<std::mutex> lock(m_netStatusMutex);
-        if (!bound.empty()) {
-            m_clientBoundEndpoint = Utf8ToWide(bound);
+        bool isNowConnected = (connCount > 0);
+        bool wasConnected = m_clientPhoneConnected.exchange(isNowConnected);
+        std::wstring newDevName = devHex.empty() ? L"" : Utf8ToWide(HexDecode(devHex));
+        bool nameChanged = false;
+        {
+            std::lock_guard<std::mutex> lock(m_netStatusMutex);
+            if (m_clientConnectedDeviceName != newDevName) {
+                m_clientConnectedDeviceName = newDevName;
+                nameChanged = true;
+            }
+            if (!bound.empty()) {
+                m_clientBoundEndpoint = Utf8ToWide(bound);
+            }
+            if (!errHex.empty()) {
+                m_lastBindError = Utf8ToWide(HexDecode(errHex));
+            } else if (!bound.empty()) {
+                m_lastBindError.clear();
+            }
         }
-        if (!errHex.empty()) {
-            m_lastBindError = Utf8ToWide(HexDecode(errHex));
-        } else if (!bound.empty()) {
-            m_lastBindError.clear();
+        if (wasConnected != isNowConnected || nameChanged) {
+            NotifyConnectionChanged();
         }
     }
 
@@ -1187,8 +1244,13 @@ namespace KDEConnect {
             m_protocol.RequestAllConversations(dev);
         });
 
+        m_protocol.SetOnConnectionChanged([this]() {
+            NotifyConnectionChanged();
+        });
+
         // Start protocol handler directly on UDP 1716 and TCP 1716 using the configured BindIp
         m_isClientMode = false;
+        m_clientPhoneConnected = false;
         bool protocolStarted = m_protocol.Start(bindIp);
         if (!protocolStarted) {
             std::lock_guard<std::mutex> lock(m_netStatusMutex);
@@ -1484,10 +1546,17 @@ namespace KDEConnect {
                         }
                     } else if (cmd == "STATUS") {
                         auto connectedDevs = m_protocol.GetConnectedDevices();
+                        std::string devHex;
+                        if (!connectedDevs.empty()) {
+                            const auto& d = connectedDevs.front();
+                            std::wstring dName = d.deviceName.empty() ? d.ipAddress : d.deviceName;
+                            devHex = HexEncode(WideToUtf8(dName));
+                        }
                         std::string bound = WideToUtf8(m_protocol.GetBoundEndpointSummary());
                         std::string errHex = HexEncode(WideToUtf8(m_protocol.GetLastBindError()));
                         std::ostringstream ss;
                         ss << "{\"status\":\"ok\",\"connected\":" << connectedDevs.size()
+                           << ",\"device\":\"" << devHex << "\""
                            << ",\"bound\":\"" << bound << "\""
                            << ",\"error\":\"" << errHex << "\"}\n";
                         response = ss.str();
@@ -1542,12 +1611,37 @@ namespace KDEConnect {
         return m_protocol.RequestConversationMessages(devs.front(), threadId, -1);
     }
 
+    bool SmsDaemon::IsPhoneConnected() const {
+        if (m_isClientMode) {
+            return m_clientPhoneConnected.load();
+        }
+        return !m_protocol.GetConnectedDevices().empty();
+    }
+
+    std::wstring SmsDaemon::GetConnectedDeviceName() const {
+        if (m_isClientMode) {
+            std::lock_guard<std::mutex> lock(m_netStatusMutex);
+            return m_clientConnectedDeviceName;
+        }
+        auto devs = m_protocol.GetConnectedDevices();
+        if (devs.empty()) return L"";
+        const auto& d = devs.front();
+        return d.deviceName.empty() ? d.ipAddress : d.deviceName;
+    }
+
     std::wstring SmsDaemon::GetConnectionStatusText() const {
         if (m_isClientMode) {
             std::wstring bound = GetBoundEndpointSummary();
             std::wstring err = GetLastBindError();
             if (!err.empty()) {
                 return TrFmt("conn_ipc_err", err);
+            }
+            if (m_clientPhoneConnected.load()) {
+                std::wstring devName = GetConnectedDeviceName();
+                if (!devName.empty()) {
+                    return TrFmt("phone_status_connected_named", devName);
+                }
+                return Tr("phone_status_connected");
             }
             if (!bound.empty()) {
                 return TrFmt("conn_ipc_active_bound", bound);

@@ -56,6 +56,8 @@ namespace KDEConnect {
 
         void RenderEmptyState(float startX, float width, float height, const std::wstring& message);
 
+        void RenderConnectionIndicator(float rightX, float headerH, bool isConnected);
+
         // Attachment image management
         ID2D1Bitmap* LoadImageFromFile(const std::wstring& filePath);
 

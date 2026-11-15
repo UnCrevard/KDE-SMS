@@ -31,6 +31,7 @@ namespace KDEConnect {
         using PacketCallback = std::function<void(const DeviceInfo& device, const KDEPacket& packet)>;
         using DeviceDiscoveredCallback = std::function<void(const DeviceInfo& device)>;
         using DeviceReadyCallback = std::function<void(const DeviceInfo& device)>;
+        using ConnectionChangedCallback = std::function<void()>;
 
         ProtocolHandler();
         ~ProtocolHandler();
@@ -62,6 +63,7 @@ namespace KDEConnect {
         void SetOnPacketReceived(PacketCallback cb) { m_onPacketReceived = cb; }
         void SetOnDeviceDiscovered(DeviceDiscoveredCallback cb) { m_onDeviceDiscovered = cb; }
         void SetOnDeviceReady(DeviceReadyCallback cb) { m_onDeviceReady = cb; }
+        void SetOnConnectionChanged(ConnectionChangedCallback cb);
 
         std::vector<DeviceInfo> GetConnectedDevices() const;
         bool IsDevicePaired(const std::wstring& deviceId) const;
@@ -121,11 +123,15 @@ namespace KDEConnect {
         std::thread m_tcpThread;
         std::thread m_broadcastThread;
 
+        void NotifyConnectionChanged();
+
         mutable std::mutex m_identityMutex;
         DeviceInfo m_localIdentity;
         PacketCallback m_onPacketReceived;
         DeviceDiscoveredCallback m_onDeviceDiscovered;
         DeviceReadyCallback m_onDeviceReady;
+        mutable std::mutex m_connCbMutex;
+        ConnectionChangedCallback m_onConnectionChanged;
 
         mutable std::mutex m_devicesMutex;
         std::vector<DeviceInfo> m_knownDevices;
