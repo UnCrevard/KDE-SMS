@@ -1,5 +1,5 @@
 .aistudio/
-src/
+/src
 .env.example
 bun.lock
 *.html
