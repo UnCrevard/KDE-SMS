@@ -1,5 +1,7 @@
-/*
-
-!/cpp
-!.gitignore
-!Makefile
+.aistudio/
+src/
+.env.example
+bun.lock
+*.html
+*.json
+*.ts
