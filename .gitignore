@@ -1,7 +1,7 @@
-.aistudio/
+/.aistudio
 /src
-.env.example
-bun.lock
-*.html
-*.json
-*.ts
+/.env.example
+/bun.lock
+/*.html
+/*.json
+/*.ts
