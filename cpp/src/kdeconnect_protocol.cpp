@@ -111,6 +111,48 @@ namespace KDEConnect {
         return "";
     }
 
+    static std::string ExtractTopLevelPrimitiveField(const std::string& jsonObj, const std::string& keyName) {
+        size_t pos = SkipJsonWhitespace(jsonObj, 0);
+        if (pos >= jsonObj.size() || jsonObj[pos] != '{') return "";
+        ++pos;
+        while (pos < jsonObj.size()) {
+            pos = SkipJsonWhitespace(jsonObj, pos);
+            if (pos >= jsonObj.size() || jsonObj[pos] == '}') break;
+            if (jsonObj[pos] == ',') { ++pos; continue; }
+            if (jsonObj[pos] != '"') break;
+            size_t keyEnd = FindMatchingJsonStringEnd(jsonObj, pos);
+            if (keyEnd == std::string::npos) break;
+            std::string key = jsonObj.substr(pos + 1, keyEnd - pos - 1);
+            pos = SkipJsonWhitespace(jsonObj, keyEnd + 1);
+            if (pos >= jsonObj.size() || jsonObj[pos] != ':') break;
+            pos = SkipJsonWhitespace(jsonObj, pos + 1);
+            if (pos >= jsonObj.size()) break;
+
+            if (jsonObj[pos] == '"') {
+                size_t valEnd = FindMatchingJsonStringEnd(jsonObj, pos);
+                if (valEnd == std::string::npos) break;
+                if (key == keyName) {
+                    return jsonObj.substr(pos + 1, valEnd - pos - 1);
+                }
+                pos = valEnd + 1;
+            } else if (jsonObj[pos] == '{' || jsonObj[pos] == '[') {
+                size_t valEnd = FindMatchingJsonCompoundEnd(jsonObj, pos);
+                if (valEnd == std::string::npos) break;
+                pos = valEnd + 1;
+            } else {
+                size_t valEnd = jsonObj.find_first_of(",}\r\n", pos);
+                if (valEnd == std::string::npos) valEnd = jsonObj.size();
+                if (key == keyName) {
+                    std::string val = jsonObj.substr(pos, valEnd - pos);
+                    while (!val.empty() && (val.back() == ' ' || val.back() == '\t')) val.pop_back();
+                    return val;
+                }
+                pos = valEnd;
+            }
+        }
+        return "";
+    }
+
     static bool SendAllBytes(SOCKET sock, const char* data, int len) {
         int totalSent = 0;
         while (totalSent < len) {
@@ -1038,7 +1080,8 @@ namespace KDEConnect {
            << "\"kdeconnect.sms.request_attachment\","
            << "\"kdeconnect.sms.delete_conversation\","
            << "\"kdeconnect.contacts.request_all_uids_timestamps\","
-           << "\"kdeconnect.contacts.request_vcards_by_uid\""
+           << "\"kdeconnect.contacts.request_vcards_by_uid\","
+           << "\"kdeconnect.battery.request\""
            << "]"
            << "}";
         pkt.bodyJson = ss.str();
@@ -1715,6 +1758,29 @@ namespace KDEConnect {
                         pingReply.type = "kdeconnect.ping";
                         pingReply.bodyJson = "{}";
                         TlsSendAll(*session, pingReply.Serialize());
+                    } else if (pkt.type == "kdeconnect.battery") {
+                        std::string chargeStr = ExtractTopLevelPrimitiveField(pkt.bodyJson, "currentCharge");
+                        std::string chargingStr = ExtractTopLevelPrimitiveField(pkt.bodyJson, "isCharging");
+                        if (!chargeStr.empty()) {
+                            int level = std::atoi(chargeStr.c_str());
+                            if (level < 0) level = -1;
+                            if (level > 100) level = 100;
+                            bool charging = (chargingStr == "true" || chargingStr == "1");
+                            dev.batteryLevel = level;
+                            dev.isCharging = charging;
+                            {
+                                std::lock_guard<std::mutex> lock(m_devicesMutex);
+                                for (auto& d : m_knownDevices) {
+                                    if (d.deviceId == dev.deviceId) {
+                                        d.batteryLevel = level;
+                                        d.isCharging = charging;
+                                    }
+                                }
+                            }
+                            std::wcout << L"[Batterie] " << (dev.deviceName.empty() ? dev.ipAddress : dev.deviceName)
+                                       << L" : " << level << L"%" << (charging ? L" (En charge)" : L"") << std::endl;
+                            NotifyConnectionChanged();
+                        }
                     } else if (pkt.type.rfind("kdeconnect.sms", 0) == 0 ||
                                pkt.type.rfind("kdeconnect.contacts", 0) == 0 ||
                                pkt.type == "kdeconnect.telephony") {
@@ -1738,6 +1804,16 @@ namespace KDEConnect {
             if (it != m_activeSessions.end() && it->second == session) {
                 m_activeSessions.erase(it);
                 removedSession = true;
+            }
+        }
+        if (removedSession && !dev.deviceId.empty()) {
+            std::lock_guard<std::mutex> lock(m_devicesMutex);
+            for (auto& d : m_knownDevices) {
+                if (d.deviceId == dev.deviceId) {
+                    d.isReachable = false;
+                    d.batteryLevel = -1;
+                    d.isCharging = false;
+                }
             }
         }
         CleanupTlsSession(*session);
@@ -2008,6 +2084,14 @@ namespace KDEConnect {
         ss << "{\"part_id\":" << partId
            << ",\"unique_identifier\":\"" << EscapeJsonString(uniqueIdentifier) << "\"}";
         pkt.bodyJson = ss.str();
+        return SendPacket(device, pkt);
+    }
+
+    bool ProtocolHandler::RequestBatteryStatus(const DeviceInfo& device) {
+        KDEPacket pkt;
+        pkt.id = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        pkt.type = "kdeconnect.battery.request";
+        pkt.bodyJson = "{\"request\":true}";
         return SendPacket(device, pkt);
     }
 

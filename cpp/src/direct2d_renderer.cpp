@@ -452,7 +452,8 @@ namespace KDEConnect {
         float width,
         float height,
         float scrollOffset,
-        std::vector<BubbleLayout>& outBubbleLayouts
+        std::vector<BubbleLayout>& outBubbleLayouts,
+        float headerRightReserve
     ) {
         if (!m_renderTarget) return;
 
@@ -473,7 +474,7 @@ namespace KDEConnect {
             title += L"  (" + conversation.address + L")";
         }
         float titleLeft = startX + 64.0f;
-        float titleRight = std::max(titleLeft + 20.0f, startX + width - 252.0f);
+        float titleRight = std::max(titleLeft + 20.0f, startX + width - headerRightReserve);
         IDWriteTextLayout* titleLayout = nullptr;
         if (SUCCEEDED(m_dwriteFactory->CreateTextLayout(
                 title.c_str(), static_cast<UINT32>(title.length()),
@@ -700,11 +701,14 @@ namespace KDEConnect {
         );
     }
 
-    void Direct2DRenderer::RenderConnectionIndicator(float rightX, float headerH, bool isConnected) {
+    void Direct2DRenderer::RenderConnectionIndicator(float rightX, float headerH, bool isConnected, int batteryLevel, bool isCharging) {
         if (!m_renderTarget) return;
 
         const bool isDark = ThemeManager::Instance().IsDarkActive();
-        const float badgeW = 34.0f;
+        const bool hasBattery = (isConnected && batteryLevel >= 0 && batteryLevel <= 100);
+        const float badgeW = hasBattery
+            ? (isCharging ? (batteryLevel >= 100 ? 94.0f : 88.0f) : (batteryLevel >= 100 ? 84.0f : 78.0f))
+            : 34.0f;
         const float badgeH = 32.0f;
         const float left = rightX - badgeW;
         const float top = (headerH - badgeH) * 0.5f;
@@ -765,13 +769,71 @@ namespace KDEConnect {
             );
         }
 
-        // Green or Red LED dot on the right side of the badge
+        // Green or Red LED dot beside the smartphone icon
         D2D1_POINT_2F dotCenter = D2D1::Point2F(left + 25.0f, top + 11.5f);
         if (haloBrush) {
             m_renderTarget->FillEllipse(D2D1::Ellipse(dotCenter, 5.8f, 5.8f), haloBrush);
         }
         if (statusBrush) {
             m_renderTarget->FillEllipse(D2D1::Ellipse(dotCenter, 3.8f, 3.8f), statusBrush);
+        }
+
+        // Battery percentage (and charging bolt) beside the phone status icon
+        if (hasBattery && m_dwriteFactory && m_fontCaption) {
+            if (borderBrush) {
+                m_renderTarget->DrawLine(
+                    D2D1::Point2F(left + 33.5f, top + 7.0f),
+                    D2D1::Point2F(left + 33.5f, bottom - 7.0f),
+                    borderBrush,
+                    1.0f
+                );
+            }
+
+            float pctLeft = left + 37.0f;
+            if (isCharging) {
+                ID2D1SolidColorBrush* boltBrush = nullptr;
+                D2D1_COLOR_F boltColor = isDark
+                    ? D2D1::ColorF(0.980f, 0.800f, 0.082f, 1.0f)   // Warm amber-gold (#FACC15)
+                    : D2D1::ColorF(0.851f, 0.467f, 0.024f, 1.0f);  // Rich amber (#D97706)
+                m_renderTarget->CreateSolidColorBrush(boltColor, &boltBrush);
+                if (boltBrush) {
+                    float bx = pctLeft + 2.0f;
+                    float cy = top + 16.0f;
+                    m_renderTarget->DrawLine(D2D1::Point2F(bx + 4.5f, cy - 5.5f), D2D1::Point2F(bx + 0.5f, cy + 0.4f), boltBrush, 1.5f);
+                    m_renderTarget->DrawLine(D2D1::Point2F(bx + 0.5f, cy + 0.4f), D2D1::Point2F(bx + 4.2f, cy + 0.4f), boltBrush, 1.5f);
+                    m_renderTarget->DrawLine(D2D1::Point2F(bx + 4.2f, cy + 0.4f), D2D1::Point2F(bx + 1.5f, cy + 5.5f), boltBrush, 1.5f);
+                    SafeRelease(&boltBrush);
+                }
+                pctLeft += 10.0f;
+            }
+
+            std::wstring pctText = std::to_wstring(batteryLevel) + L"%";
+            float pctW = std::max(10.0f, (right - 5.0f) - pctLeft);
+            IDWriteTextLayout* pctLayout = nullptr;
+            if (SUCCEEDED(m_dwriteFactory->CreateTextLayout(
+                    pctText.c_str(), static_cast<UINT32>(pctText.length()),
+                    m_fontCaption, pctW, badgeH, &pctLayout)) && pctLayout) {
+                DWRITE_TEXT_RANGE fullRange{ 0, static_cast<UINT32>(pctText.length()) };
+                pctLayout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, fullRange);
+                pctLayout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                pctLayout->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+                ID2D1SolidColorBrush* textBrush = m_brushTextPrimary;
+                ID2D1SolidColorBrush* lowBattBrush = nullptr;
+                if (batteryLevel <= 15 && !isCharging) {
+                    m_renderTarget->CreateSolidColorBrush(D2D1::ColorF(0.937f, 0.267f, 0.267f, 1.0f), &lowBattBrush);
+                    if (lowBattBrush) textBrush = lowBattBrush;
+                }
+                if (textBrush) {
+                    m_renderTarget->DrawTextLayout(
+                        D2D1::Point2F(pctLeft, top),
+                        pctLayout,
+                        textBrush
+                    );
+                }
+                SafeRelease(&lowBattBrush);
+                pctLayout->Release();
+            }
         }
 
         SafeRelease(&bgBrush);

@@ -44,7 +44,8 @@ namespace KDEConnect {
             float width,
             float height,
             float scrollOffset,
-            std::vector<BubbleLayout>& outBubbleLayouts
+            std::vector<BubbleLayout>& outBubbleLayouts,
+            float headerRightReserve = 252.0f
         );
 
         void RenderPendingAttachmentBar(
@@ -56,7 +57,7 @@ namespace KDEConnect {
 
         void RenderEmptyState(float startX, float width, float height, const std::wstring& message);
 
-        void RenderConnectionIndicator(float rightX, float headerH, bool isConnected);
+        void RenderConnectionIndicator(float rightX, float headerH, bool isConnected, int batteryLevel = -1, bool isCharging = false);
 
         // Attachment image management
         ID2D1Bitmap* LoadImageFromFile(const std::wstring& filePath);

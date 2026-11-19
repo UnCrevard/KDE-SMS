@@ -1094,21 +1094,31 @@ namespace KDEConnect {
         std::string resp;
         if (!SendIpcCommand("STATUS\n", &resp)) {
             bool wasConnected = m_clientPhoneConnected.exchange(false);
+            int prevBatt = m_clientBatteryLevel.exchange(-1);
+            bool prevChg = m_clientBatteryCharging.exchange(false);
             {
                 std::lock_guard<std::mutex> lock(m_netStatusMutex);
                 m_clientConnectedDeviceName.clear();
             }
-            if (wasConnected) {
+            if (wasConnected || prevBatt != -1 || prevChg) {
                 NotifyConnectionChanged();
             }
             return;
         }
         int connCount = ExtractSimpleJsonIntField(resp, "connected", 0);
+        int battLevel = ExtractSimpleJsonIntField(resp, "battery", -1);
+        int chgInt = ExtractSimpleJsonIntField(resp, "charging", 0);
+        if (battLevel < 0) battLevel = -1;
+        if (battLevel > 100) battLevel = 100;
         std::string devHex = ExtractSimpleJsonStringField(resp, "device");
         std::string bound = ExtractSimpleJsonStringField(resp, "bound");
         std::string errHex = ExtractSimpleJsonStringField(resp, "error");
         bool isNowConnected = (connCount > 0);
+        bool isNowCharging = (isNowConnected && chgInt != 0);
+        if (!isNowConnected) battLevel = -1;
         bool wasConnected = m_clientPhoneConnected.exchange(isNowConnected);
+        int prevBatt = m_clientBatteryLevel.exchange(battLevel);
+        bool prevChg = m_clientBatteryCharging.exchange(isNowCharging);
         std::wstring newDevName = devHex.empty() ? L"" : Utf8ToWide(HexDecode(devHex));
         bool nameChanged = false;
         {
@@ -1126,7 +1136,7 @@ namespace KDEConnect {
                 m_lastBindError.clear();
             }
         }
-        if (wasConnected != isNowConnected || nameChanged) {
+        if (wasConnected != isNowConnected || nameChanged || prevBatt != battLevel || prevChg != isNowCharging) {
             NotifyConnectionChanged();
         }
     }
@@ -1239,7 +1249,8 @@ namespace KDEConnect {
 
         m_protocol.SetOnDeviceReady([this](const DeviceInfo& dev) {
             std::wcout << L"[SMS Sync] Appareil pret (" << (dev.deviceName.empty() ? dev.ipAddress : dev.deviceName)
-                       << L") -> Demande des contacts et conversations SMS..." << std::endl;
+                       << L") -> Demande des contacts, batterie et conversations SMS..." << std::endl;
+            m_protocol.RequestBatteryStatus(dev);
             m_protocol.RequestAllContacts(dev);
             m_protocol.RequestAllConversations(dev);
         });
@@ -1251,6 +1262,8 @@ namespace KDEConnect {
         // Start protocol handler directly on UDP 1716 and TCP 1716 using the configured BindIp
         m_isClientMode = false;
         m_clientPhoneConnected = false;
+        m_clientBatteryLevel = -1;
+        m_clientBatteryCharging = false;
         bool protocolStarted = m_protocol.Start(bindIp);
         if (!protocolStarted) {
             std::lock_guard<std::mutex> lock(m_netStatusMutex);
@@ -1547,16 +1560,22 @@ namespace KDEConnect {
                     } else if (cmd == "STATUS") {
                         auto connectedDevs = m_protocol.GetConnectedDevices();
                         std::string devHex;
+                        int battLevel = -1;
+                        int isCharging = 0;
                         if (!connectedDevs.empty()) {
                             const auto& d = connectedDevs.front();
                             std::wstring dName = d.deviceName.empty() ? d.ipAddress : d.deviceName;
                             devHex = HexEncode(WideToUtf8(dName));
+                            battLevel = d.batteryLevel;
+                            isCharging = d.isCharging ? 1 : 0;
                         }
                         std::string bound = WideToUtf8(m_protocol.GetBoundEndpointSummary());
                         std::string errHex = HexEncode(WideToUtf8(m_protocol.GetLastBindError()));
                         std::ostringstream ss;
                         ss << "{\"status\":\"ok\",\"connected\":" << connectedDevs.size()
                            << ",\"device\":\"" << devHex << "\""
+                           << ",\"battery\":" << battLevel
+                           << ",\"charging\":" << isCharging
                            << ",\"bound\":\"" << bound << "\""
                            << ",\"error\":\"" << errHex << "\"}\n";
                         response = ss.str();
@@ -1597,6 +1616,7 @@ namespace KDEConnect {
         }
         auto devs = m_protocol.GetConnectedDevices();
         if (devs.empty()) return false;
+        m_protocol.RequestBatteryStatus(devs.front());
         m_protocol.RequestAllContacts(devs.front());
         return m_protocol.RequestAllConversations(devs.front());
     }
@@ -1627,6 +1647,24 @@ namespace KDEConnect {
         if (devs.empty()) return L"";
         const auto& d = devs.front();
         return d.deviceName.empty() ? d.ipAddress : d.deviceName;
+    }
+
+    int SmsDaemon::GetPhoneBatteryLevel() const {
+        if (m_isClientMode) {
+            return m_clientPhoneConnected.load() ? m_clientBatteryLevel.load() : -1;
+        }
+        auto devs = m_protocol.GetConnectedDevices();
+        if (devs.empty()) return -1;
+        return devs.front().batteryLevel;
+    }
+
+    bool SmsDaemon::IsPhoneCharging() const {
+        if (m_isClientMode) {
+            return m_clientPhoneConnected.load() && m_clientBatteryCharging.load();
+        }
+        auto devs = m_protocol.GetConnectedDevices();
+        if (devs.empty()) return false;
+        return devs.front().isCharging;
     }
 
     std::wstring SmsDaemon::GetConnectionStatusText() const {

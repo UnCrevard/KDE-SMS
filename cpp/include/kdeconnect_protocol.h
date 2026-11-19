@@ -58,6 +58,7 @@ namespace KDEConnect {
         bool RequestAllContacts(const DeviceInfo& device = DeviceInfo{});
         bool RequestContactsVcards(const DeviceInfo& device, const std::vector<std::string>& uids);
         bool RequestAttachment(const DeviceInfo& device, int64_t partId, const std::string& uniqueIdentifier);
+        bool RequestBatteryStatus(const DeviceInfo& device = DeviceInfo{});
         bool DownloadPayloadToMemory(const std::wstring& ipAddress, uint16_t port, int64_t expectedSize, std::vector<uint8_t>& outBytes);
 
         void SetOnPacketReceived(PacketCallback cb) { m_onPacketReceived = cb; }

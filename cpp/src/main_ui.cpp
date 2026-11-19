@@ -50,6 +50,8 @@ static HMODULE g_hMsftEdit = nullptr;
 static bool g_composerIsRichEdit = false;
 static bool g_lastPhoneConnected = false;
 static std::wstring g_lastPhoneName;
+static int g_lastBatteryLevel = -1;
+static bool g_lastBatteryCharging = false;
 static HFONT g_hFont = nullptr;
 static HBRUSH g_editBrush = nullptr;
 static COLORREF g_editBrushColor = RGB(0, 0, 0);
@@ -610,22 +612,41 @@ static void UpdateMainWindowTitle(HWND hwnd) {
     SetWindowTextW(hwnd, title.c_str());
 }
 
+static int GetConnectionIndicatorWidth(bool isConnected, int batteryLevel, bool isCharging) {
+    bool hasBattery = (isConnected && batteryLevel >= 0 && batteryLevel <= 100);
+    if (!hasBattery) return 34;
+    if (isCharging) return (batteryLevel >= 100) ? 94 : 88;
+    return (batteryLevel >= 100) ? 84 : 78;
+}
+
 static RECT GetConnectionIndicatorRect(HWND hwnd) {
     RECT rc{};
     if (hwnd && IsWindow(hwnd)) {
         GetClientRect(hwnd, &rc);
     }
     int width = rc.right - rc.left;
-    return RECT{ width - 242, 11, width - 208, 43 };
+    int badgeW = GetConnectionIndicatorWidth(
+        SmsDaemon::Instance().IsPhoneConnected(),
+        SmsDaemon::Instance().GetPhoneBatteryLevel(),
+        SmsDaemon::Instance().IsPhoneCharging()
+    );
+    return RECT{ width - 208 - badgeW, 11, width - 208, 43 };
 }
 
 static std::wstring BuildConnectionTooltipText() {
     if (SmsDaemon::Instance().IsPhoneConnected()) {
         std::wstring devName = SmsDaemon::Instance().GetConnectedDeviceName();
-        if (!devName.empty()) {
-            return TrFmt("phone_status_connected_named", devName);
+        std::wstring text = !devName.empty()
+            ? TrFmt("phone_status_connected_named", devName)
+            : Tr("phone_status_connected");
+        int batt = SmsDaemon::Instance().GetPhoneBatteryLevel();
+        if (batt >= 0 && batt <= 100) {
+            std::wstring pctStr = std::to_wstring(batt);
+            text += L" \u2014 " + (SmsDaemon::Instance().IsPhoneCharging()
+                ? TrFmt("battery_pct_charging", pctStr)
+                : TrFmt("battery_pct", pctStr));
         }
-        return Tr("phone_status_connected");
+        return text;
     }
     return Tr("phone_status_disconnected");
 }
@@ -649,6 +670,8 @@ static void RefreshConnectionUi(HWND hwnd) {
     if (!hwnd || !IsWindow(hwnd)) return;
     g_lastPhoneConnected = SmsDaemon::Instance().IsPhoneConnected();
     g_lastPhoneName = SmsDaemon::Instance().GetConnectedDeviceName();
+    g_lastBatteryLevel = SmsDaemon::Instance().GetPhoneBatteryLevel();
+    g_lastBatteryCharging = SmsDaemon::Instance().IsPhoneCharging();
     UpdateMainWindowTitle(hwnd);
     UpdateConnectionTooltip(hwnd);
     if (g_allConversations.empty()) {
@@ -2048,6 +2071,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             SmsDaemon::Instance().Start(g_bindIp);
             g_lastPhoneConnected = SmsDaemon::Instance().IsPhoneConnected();
             g_lastPhoneName = SmsDaemon::Instance().GetConnectedDeviceName();
+            g_lastBatteryLevel = SmsDaemon::Instance().GetPhoneBatteryLevel();
+            g_lastBatteryCharging = SmsDaemon::Instance().IsPhoneCharging();
             UpdateMainWindowTitle(hwnd);
             if (!SmsDaemon::Instance().GetProtocol().IsListening()) {
                 PostMessageW(hwnd, WM_APP_BIND_ALERT, 0, 0);
@@ -2213,7 +2238,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SmsDaemon::Instance().RequestConversationsSync();
                 bool nowConn = SmsDaemon::Instance().IsPhoneConnected();
                 std::wstring nowDev = SmsDaemon::Instance().GetConnectedDeviceName();
-                if (nowConn != g_lastPhoneConnected || nowDev != g_lastPhoneName) {
+                int nowBatt = SmsDaemon::Instance().GetPhoneBatteryLevel();
+                bool nowChg = SmsDaemon::Instance().IsPhoneCharging();
+                if (nowConn != g_lastPhoneConnected || nowDev != g_lastPhoneName ||
+                    nowBatt != g_lastBatteryLevel || nowChg != g_lastBatteryCharging) {
                     RefreshConnectionUi(hwnd);
                 } else {
                     UpdateMainWindowTitle(hwnd);
@@ -2231,7 +2259,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 }
                 bool nowConn = SmsDaemon::Instance().IsPhoneConnected();
                 std::wstring nowDev = SmsDaemon::Instance().GetConnectedDeviceName();
-                if (nowConn != g_lastPhoneConnected || nowDev != g_lastPhoneName) {
+                int nowBatt = SmsDaemon::Instance().GetPhoneBatteryLevel();
+                bool nowChg = SmsDaemon::Instance().IsPhoneCharging();
+                if (nowConn != g_lastPhoneConnected || nowDev != g_lastPhoneName ||
+                    nowBatt != g_lastBatteryLevel || nowChg != g_lastBatteryCharging) {
                     RefreshConnectionUi(hwnd);
                 }
             }
@@ -2269,6 +2300,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_sidebarScroll
             );
 
+            bool phoneConnected = SmsDaemon::Instance().IsPhoneConnected();
+            int batteryLevel = SmsDaemon::Instance().GetPhoneBatteryLevel();
+            bool isCharging = SmsDaemon::Instance().IsPhoneCharging();
+            float indicatorW = static_cast<float>(GetConnectionIndicatorWidth(phoneConnected, batteryLevel, isCharging));
+            float headerRightReserve = 208.0f + indicatorW + 10.0f;
+
             // 2. Render Right Message Thread (Direct2D + Color Emoji)
             Conversation* activeConv = FindActiveConversation();
 
@@ -2283,7 +2320,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     threadWidth,
                     visibleThreadHeight,
                     g_threadScroll,
-                    g_currentBubbleLayouts
+                    g_currentBubbleLayouts,
+                    headerRightReserve
                 );
 
                 if (!g_pendingAttachmentName.empty()) {
@@ -2308,7 +2346,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_renderer.RenderConnectionIndicator(
                 totalWidth - 208.0f,
                 54.0f,
-                SmsDaemon::Instance().IsPhoneConnected()
+                phoneConnected,
+                batteryLevel,
+                isCharging
             );
 
             g_renderer.EndDraw();
