@@ -5,3 +5,7 @@
 /*.html
 /*.json
 /*.ts
+
+/obj
+*.ini
+build.bat
