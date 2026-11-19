@@ -754,6 +754,24 @@ namespace KDEConnect {
                 L"Telefon getrennt",
                 L"Telefono disconnesso",
                 L"Telefone desconectado"
+            },
+            {
+                "battery_pct",
+                L"Batterie : {0}%",
+                L"Battery: {0}%",
+                L"Bater\u00eda: {0}%",
+                L"Akku: {0}%",
+                L"Batteria: {0}%",
+                L"Bateria: {0}%"
+            },
+            {
+                "battery_pct_charging",
+                L"Batterie : {0}% (En charge)",
+                L"Battery: {0}% (Charging)",
+                L"Bater\u00eda: {0}% (Cargando)",
+                L"Akku: {0}% (Wird geladen)",
+                L"Batteria: {0}% (In carica)",
+                L"Bateria: {0}% (Carregando)"
             }
         };
 

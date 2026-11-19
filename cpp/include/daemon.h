@@ -49,6 +49,8 @@ namespace KDEConnect {
         // Status info for UI
         bool IsPhoneConnected() const;
         std::wstring GetConnectedDeviceName() const;
+        int GetPhoneBatteryLevel() const;
+        bool IsPhoneCharging() const;
         void RefreshClientStatus();
         std::wstring GetConnectionStatusText() const;
         std::wstring GetBoundEndpointSummary() const;
@@ -114,6 +116,8 @@ namespace KDEConnect {
         std::atomic<bool> m_running{false};
         std::atomic<bool> m_isClientMode{false};
         std::atomic<bool> m_clientPhoneConnected{false};
+        std::atomic<int> m_clientBatteryLevel{-1};
+        std::atomic<bool> m_clientBatteryCharging{false};
         std::atomic<int64_t> m_ignoreWatcherUntilMs{0};
         int64_t m_startupEpochMs = 0;
         std::wstring m_watchDir;
